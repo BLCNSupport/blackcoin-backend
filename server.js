@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -16,20 +17,17 @@ const connection = new Connection(
   "confirmed"
 );
 
+// 24h chart data
 let chartData = [];
+let lastPrice = 0;
 
-// Fetch live price and volume from pool
 async function recordPricePoint() {
   try {
     const poolPubKey = new PublicKey(poolAddress);
 
-    // Token balances
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(poolPubKey, {
-      mint: new PublicKey(tokenMint)
-    });
-    const solAccounts = await connection.getParsedTokenAccountsByOwner(poolPubKey, {
-      mint: new PublicKey(solMint)
-    });
+    // Get pool balances
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(poolPubKey, { mint: new PublicKey(tokenMint) });
+    const solAccounts = await connection.getParsedTokenAccountsByOwner(poolPubKey, { mint: new PublicKey(solMint) });
 
     const tokenBalance = tokenAccounts.value.reduce(
       (acc, acct) => acc + (acct.account.data.parsed.info.tokenAmount.uiAmount || 0),
@@ -40,44 +38,22 @@ async function recordPricePoint() {
       0
     );
 
-    // Price in USD
+    if (tokenBalance === 0) return;
+
+    // Get SOL/USD
     const solUSDResp = await fetch(
       "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
     );
     const solUSDData = await solUSDResp.json();
     const solUSD = solUSDData?.solana?.usd || 0;
-    const price = tokenBalance > 0 ? (solBalance / tokenBalance) * solUSD : 0;
 
-    // Compute 24h change
-    const lastPrice = chartData.length > 0 ? chartData[chartData.length - 1].price : price;
+    const price = (solBalance / tokenBalance) * solUSD;
     const change = lastPrice > 0 ? ((price - lastPrice) / lastPrice) * 100 : 0;
+    lastPrice = price;
 
-    // Fetch recent swap transactions from Helius for this pool
-    const swapResp = await fetch(`https://api.helius.xyz/v0/transactions?api-key=${heliusApiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        accounts: [poolAddress],
-        limit: 10
-      })
-    });
-    const swaps = await swapResp.json();
-
-    // Estimate volume in USD for this interval
-    let volume = 0;
-    for (const tx of swaps) {
-      if (!tx?.parsedInstructions) continue;
-      for (const instr of tx.parsedInstructions) {
-        if (instr.program === "spl-token" && instr.parsed?.type === "transfer") {
-          const amt = parseFloat(instr.parsed.info.amount || 0);
-          if (instr.parsed.info.mint === tokenMint) {
-            volume += amt * price; // BlackCoin -> USD
-          } else if (instr.parsed.info.mint === solMint) {
-            volume += amt * solUSD; // SOL -> USD
-          }
-        }
-      }
-    }
+    // Approximate 5s volume
+    const circulatingSupply = 1_000_000_000; // replace if known
+    const volume = Math.abs(price - lastPrice) * circulatingSupply;
 
     chartData.push({
       timestamp: new Date().toISOString(),
@@ -86,20 +62,19 @@ async function recordPricePoint() {
       volume
     });
 
-    // Keep only last 24h (~17,280 points for 5s interval)
+    // Keep only last 24h
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     chartData = chartData.filter(d => new Date(d.timestamp).getTime() >= cutoff);
-
-    console.log(`Recorded: $${price.toFixed(6)}, Vol: $${volume.toFixed(2)}`);
   } catch (err) {
     console.error("Error recording price:", err);
   }
 }
 
-setInterval(recordPricePoint, 5000);
+// Record every 5s
 recordPricePoint();
+setInterval(recordPricePoint, 5000);
 
+// Chart endpoint
 app.get("/api/chart", (req, res) => res.json(chartData));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log("Server running"));
