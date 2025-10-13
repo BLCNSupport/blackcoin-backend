@@ -16,40 +16,27 @@ const connection = new Connection(
   "confirmed"
 );
 
-let chartData = []; // last 24h data
+let chartData = []; // stores last 24h chart points
+let lastTxSignature = null; // track last transaction fetched
 
-// Helper: fetch all pool transactions in the last 24h
-async function fetchPoolTransactions() {
-  const allTxs = [];
-  let before = undefined;
-  const since = Math.floor(Date.now() / 1000) - 24 * 60 * 60; // 24h ago
+async function fetchNewTransactions() {
+  const body = { account: poolAddress, limit: 1000 };
+  if (lastTxSignature) body.before = lastTxSignature;
 
-  while (true) {
-    const body = { account: poolAddress, limit: 1000 };
-    if (before) body.before = before;
-
-    const resp = await fetch(`https://api.helius.xyz/v0/transactions?api-key=${heliusApiKey}`, {
+  const resp = await fetch(
+    `https://api.helius.xyz/v0/transactions?api-key=${heliusApiKey}`,
+    {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
-
-    const data = await resp.json();
-    if (!Array.isArray(data) || data.length === 0) break;
-
-    // Stop if oldest transaction is older than 24h
-    const oldest = new Date(data[data.length - 1].timestamp).getTime() / 1000;
-    if (oldest < since) {
-      allTxs.push(...data.filter(tx => new Date(tx.timestamp).getTime() / 1000 >= since));
-      break;
     }
+  );
 
-    allTxs.push(...data);
-    before = data[data.length - 1].signature;
-    if (data.length < 1000) break; // no more pages
-  }
+  const data = await resp.json();
+  if (!Array.isArray(data) || data.length === 0) return [];
 
-  return allTxs;
+  lastTxSignature = data[0].signature; // newest tx signature
+  return data.reverse(); // oldest to newest
 }
 
 async function fetchBlackCoinPrice() {
@@ -71,12 +58,22 @@ async function fetchBlackCoinPrice() {
 
     const priceSOL = solBalance / tokenBalance;
 
-    // Get SOL/USD
     const solUSDResp = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
     const solUSDData = await solUSDResp.json();
     const solUSD = solUSDData?.solana?.usd || 0;
 
     const priceUSD = priceSOL * solUSD;
+
+    // Fetch new transactions for volume
+    const newTxs = await fetchNewTransactions();
+    let volume = chartData.length > 0 ? chartData[chartData.length - 1].volume : 0;
+
+    for (const tx of newTxs) {
+      if (tx.changes && tx.changes[tokenMint]) {
+        const tokenAmount = tx.changes[tokenMint].diff?.uiAmount || 0;
+        volume += Math.abs(tokenAmount * priceUSD);
+      }
+    }
 
     // 24h % change
     const change =
@@ -84,21 +81,10 @@ async function fetchBlackCoinPrice() {
         ? ((priceUSD - chartData[chartData.length - 1].price) / chartData[chartData.length - 1].price) * 100
         : 0;
 
-    // 24h volume using Helius transactions
-    let volume = 0;
-    const txs = await fetchPoolTransactions();
-
-    for (const tx of txs) {
-      if (tx.changes && tx.changes[tokenMint]) {
-        const tokenAmount = tx.changes[tokenMint].diff?.uiAmount || 0;
-        volume += Math.abs(tokenAmount * priceUSD);
-      }
-    }
-
     const timestamp = new Date().toISOString();
     chartData.push({ timestamp, price: priceUSD, change, volume });
 
-    // Keep last 24h (~17,280 points for 5s intervals)
+    // Keep last 24h (~17280 points for 5s intervals)
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     chartData = chartData.filter(d => new Date(d.timestamp).getTime() >= cutoff);
   } catch (err) {
