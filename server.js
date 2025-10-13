@@ -7,34 +7,36 @@ app.use(cors());
 
 let chartData = [];
 
-// Function to fetch latest BlackCoin price from Helius
+// Replace with your Helius API key
+const HELIUS_API_KEY = "fc2112a6-6f31-4224-a92e-08165e6115e8";
+const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
+
+// Function to fetch the latest BlackCoin price from Helius
 async function fetchBlackCoinPrice() {
   try {
-    const res = await fetch(
-      "https://api.helius.xyz/v1/tokens/0xBLACKCOIN_ADDRESS?api-key=fc2112a6-6f31-4224-a92e-08165e6115e8"
-    );
+    const res = await fetch(`https://api.helius.xyz/v1/tokens/values?api-key=${HELIUS_API_KEY}&mint=${TOKEN_MINT}`);
     const data = await res.json();
 
-    // Helius returns an object with a 'result' array, not the root object
-    if (!data.result || !data.result.length) return;
+    if (!data || !data[0]) return; // Helius returns an array of token objects
+    const token = data[0];
 
-    const tokenInfo = data.result[0];
-    const price = parseFloat(tokenInfo.price || 0);
-    const volume = parseFloat(tokenInfo.volume || 0);
-    const change = parseFloat(tokenInfo.change || 0);
+    const price = parseFloat(token.priceUsd || 0);
+    const volume = parseFloat(token.volume || 0);
     const timestamp = new Date().toISOString();
 
-    chartData.push({ timestamp, price, volume, change });
+    chartData.push({ timestamp, price, volume });
 
-    // Keep last 24h (~17,280 points for 5s interval)
+    // Keep only last 24 hours (~17,280 points for 5s interval)
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    chartData = chartData.filter((d) => new Date(d.timestamp).getTime() >= cutoff);
+    chartData = chartData.filter(d => new Date(d.timestamp).getTime() >= cutoff);
+
   } catch (err) {
     console.error("Fetch error:", err);
   }
 }
 
 // Fetch every 5 seconds
+fetchBlackCoinPrice(); // initial fetch
 setInterval(fetchBlackCoinPrice, 5000);
 
 // Endpoint to get chart data
