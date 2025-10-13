@@ -6,6 +6,7 @@ const app = express();
 app.use(cors());
 
 let chartData = [];
+let lastPrice = 0;
 
 // Function to fetch the latest BlackCoin price
 async function fetchBlackCoinPrice() {
@@ -18,19 +19,30 @@ async function fetchBlackCoinPrice() {
 
     const pair = data.pairs[0];
     const price = parseFloat(pair.priceUsd || 0);
+    const volume = parseFloat(pair.volume?.h24 || 0);
     const timestamp = new Date().toISOString();
 
+    // Calculate % change since last price
+    let change = 0;
+    if (lastPrice > 0) {
+      change = ((price - lastPrice) / lastPrice) * 100;
+    }
+    lastPrice = price;
+
     // Push to chartData array
-    chartData.push({ time: timestamp, price });
+    chartData.push({ price, change, volume, timestamp });
 
     // Keep only last 24 hours (roughly 17,280 points for 5s intervals)
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    chartData = chartData.filter((d) => new Date(d.time).getTime() >= cutoff);
+    chartData = chartData.filter((d) => new Date(d.timestamp).getTime() >= cutoff);
+
   } catch (err) {
     console.error("Fetch error:", err);
   }
 }
 
+// Initial fetch to populate some data immediately
+fetchBlackCoinPrice();
 // Fetch every 5 seconds
 setInterval(fetchBlackCoinPrice, 5000);
 
