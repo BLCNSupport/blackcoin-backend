@@ -1,5 +1,5 @@
 import express from 'express';
-import fetch from 'node-fetch'; // if using Node 18+ fetch is global
+import fetch from 'node-fetch'; // Node 18+ fetch is global
 import cors from 'cors';
 
 const app = express();
@@ -13,9 +13,13 @@ let chartData = [];
 
 // Token info
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-const POOL_ADDRESS = "8apo3YBrRNvts9boFNLZ1NC1xWEy2snq3ctmYPto162c";
 
-// Fetch price, change, volume from DexScreener
+// Fetch interval (5 seconds)
+const FETCH_INTERVAL = 5000;
+
+// -------------------------
+// Fetch live data from DexScreener
+// -------------------------
 async function fetchLiveData() {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`);
@@ -35,23 +39,38 @@ async function fetchLiveData() {
       volume
     };
 
-    // Add to chart data
+    // Add new point
     chartData.push(point);
 
-    // Keep last 24 hours (~17,280 points if every 5s)
-    if (chartData.length > 17280) chartData.shift();
+    // -------------------------
+    // Rolling 24-hour window
+    // -------------------------
+    const now = Date.now();
+    const cutoff25h = new Date(now - 25*60*60*1000); // remove oldest hour if >24h
+    chartData = chartData.filter(p => new Date(p.timestamp) >= cutoff25h);
+
+    // Optional: max ~17,280 points (5s intervals for 24h)
+    if (chartData.length > 17280) chartData.splice(0, chartData.length - 17280);
+
   } catch (e) {
     console.error("Error fetching live data:", e);
   }
 }
 
-// Start fetching every 5 seconds
-setInterval(fetchLiveData, 5000);
-fetchLiveData(); // fetch immediately on start
+// -------------------------
+// Start fetching live data
+// -------------------------
+setInterval(fetchLiveData, FETCH_INTERVAL);
+fetchLiveData(); // fetch immediately on server start
 
+// -------------------------
 // API endpoint for frontend
+// -------------------------
 app.get('/api/chart', (req, res) => {
   res.json(chartData);
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// -------------------------
+// Start server
+// -------------------------
+app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
