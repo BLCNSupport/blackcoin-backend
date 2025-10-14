@@ -46,7 +46,7 @@ async function fetchLiveData() {
     // Rolling 24-hour window
     // -------------------------
     const now = Date.now();
-    const cutoff25h = new Date(now - 25*60*60*1000); // remove oldest hour if >24h
+    const cutoff25h = new Date(now - 25 * 60 * 60 * 1000); // remove oldest if >24h, with buffer
     chartData = chartData.filter(p => new Date(p.timestamp) >= cutoff25h);
 
     // Optional: max ~17,280 points (5s intervals for 24h)
@@ -67,7 +67,32 @@ fetchLiveData(); // fetch immediately on server start
 // API endpoint for frontend
 // -------------------------
 app.get('/api/chart', (req, res) => {
-  res.json(chartData);
+  let data = [...chartData]; // Copy to avoid mutating original
+  const interval = req.query.interval; // e.g., '1m', '5m', '30m', '1h', 'D'
+
+  if (interval) {
+    const now = Date.now();
+    let timeframeMs;
+    switch (interval) {
+      case '1m': timeframeMs = 1 * 60 * 1000; break;
+      case '5m': timeframeMs = 5 * 60 * 1000; break;
+      case '30m': timeframeMs = 30 * 60 * 1000; break;
+      case '1h': timeframeMs = 60 * 60 * 1000; break;
+      case 'D': timeframeMs = 24 * 60 * 60 * 1000; break;
+      default: timeframeMs = 24 * 60 * 60 * 1000;
+    }
+    const cutoff = new Date(now - timeframeMs);
+    data = data.filter(p => new Date(p.timestamp) >= cutoff);
+
+    // Downsample if too many points (aim for ~500 max for chart performance)
+    const maxPoints = 500;
+    if (data.length > maxPoints) {
+      const sampleRate = Math.ceil(data.length / maxPoints);
+      data = data.filter((_, i) => i % sampleRate === 0);
+    }
+  }
+
+  res.json(data);
 });
 
 // -------------------------
