@@ -58,13 +58,15 @@ async function fetchLiveData() {
 
     const point = { timestamp, price, change, volume };
 
+    // Save in memory cache
     memoryCache.push(point);
-    // keep last 24h only
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
+    memoryCache = memoryCache.filter(
+      p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000)
+    );
 
     await insertPoint(point);
 
-    // optional cleanup older than 24h
+    // Optional cleanup older than 24h
     const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
     await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
@@ -78,12 +80,13 @@ fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
 // -------------------------
-// Aggregate data by interval (price avg, change avg, volume sum)
+// Aggregate data function
 // -------------------------
 function aggregateData(data, intervalMs) {
   if (intervalMs <= 0 || data.length <= 1) return data;
 
   const buckets = {};
+
   data.forEach(d => {
     const t = new Date(d.timestamp).getTime();
     const bucket = Math.floor(t / intervalMs) * intervalMs;
@@ -93,9 +96,9 @@ function aggregateData(data, intervalMs) {
 
   return Object.keys(buckets).map(ts => {
     const points = buckets[ts];
-    const avgPrice = points.reduce((a,b) => a + b.price,0)/points.length;
-    const avgChange = points.reduce((a,b) => a + b.change,0)/points.length;
-    const sumVolume = points.reduce((a,b) => a + b.volume,0);
+    const avgPrice = points.reduce((a,b) => a + b.price, 0) / points.length;
+    const avgChange = points.reduce((a,b) => a + b.change, 0) / points.length;
+    const sumVolume = points.reduce((a,b) => a + b.volume, 0);
     return {
       timestamp: new Date(Number(ts)).toISOString(),
       price: avgPrice,
@@ -111,14 +114,15 @@ function aggregateData(data, intervalMs) {
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
   let timeframeMs = 24*60*60*1000;
-  let bucketMs = 60000; // default 1-minute aggregation
+  let bucketMs = 60*1000;
 
+  // Set proper timeframes and aggregation buckets
   switch(interval){
-    case '1m': timeframeMs = 24*60*60*1000; bucketMs = 60*1000; break;
-    case '5m': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;
-    case '30m': timeframeMs = 24*60*60*1000; bucketMs = 30*60*1000; break;
-    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break;
-    case 'D': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;
+    case '1m': timeframeMs = 60*60*1000; bucketMs = 60*1000; break;   // last 1 hour, 1m buckets
+    case '5m': timeframeMs = 3*60*60*1000; bucketMs = 5*60*1000; break; // last 3 hours, 5m buckets
+    case '30m': timeframeMs = 12*60*60*1000; bucketMs = 30*60*1000; break; // last 12 hours, 30m buckets
+    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break; // last 24h, 1h buckets
+    case 'D': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;   // downsample daily to 5m
   }
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
@@ -130,11 +134,14 @@ app.get('/api/chart', async (req, res) => {
       .gte('timestamp', cutoff)
       .order('timestamp', { ascending: true });
 
-    if (error || !data) data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+    if (error || !data || data.length === 0) {
+      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+    }
 
-    data = aggregateData(data, bucketMs);
+    // Aggregate to interval
+    const aggregated = aggregateData(data, bucketMs);
 
-    res.json(data);
+    res.json(aggregated);
 
   } catch (err) {
     console.error("Error fetching chart data:", err);
