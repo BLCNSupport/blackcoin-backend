@@ -1,10 +1,10 @@
-// server.js (CommonJS, ready for Render)
+// server.js (ES modules, ready for Render)
 
-const express = require('express');
-const fetch = require('node-fetch'); // Node 18+ has fetch built-in
-const cors = require('cors');
-const dotenv = require('dotenv');
-const { createClient } = require('@supabase/supabase-js');
+import express from 'express';
+import fetch from 'node-fetch';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -17,7 +17,10 @@ app.use(express.json());
 // -------------------------
 // Supabase setup (service_role key required for inserts)
 // -------------------------
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // -------------------------
 // Token info
@@ -50,20 +53,26 @@ async function fetchLiveData() {
 
       // Save in-memory cache (last 24h)
       memoryCache.push(point);
-      memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
+      memoryCache = memoryCache.filter(
+        (p) => new Date(p.timestamp) >= new Date(Date.now() - 24 * 60 * 60 * 1000)
+      );
 
       // Insert new point into Supabase
-      const { error: insertError } = await supabase.from('chart_data').insert([point]);
+      const { error: insertError } = await supabase
+        .from('chart_data')
+        .insert([point]);
       if (insertError) console.error("Supabase insert error:", insertError);
 
       // Delete old points from Supabase (>24h)
-      const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
-      const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { error: deleteError } = await supabase
+        .from('chart_data')
+        .delete()
+        .lt('timestamp', cutoff);
       if (deleteError) console.error("Supabase delete old points error:", deleteError);
 
       console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
     }
-
   } catch (err) {
     console.error("Error fetching live data:", err);
   }
@@ -82,12 +91,22 @@ app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
   let timeframeMs = 24 * 60 * 60 * 1000; // default 24h
 
-  switch(interval){
-    case '1m': timeframeMs = 60*1000; break;
-    case '5m': timeframeMs = 5*60*1000; break;
-    case '30m': timeframeMs = 30*60*1000; break;
-    case '1h': timeframeMs = 60*60*1000; break;
-    case 'D': timeframeMs = 24*60*60*1000; break;
+  switch (interval) {
+    case '1m':
+      timeframeMs = 60 * 1000;
+      break;
+    case '5m':
+      timeframeMs = 5 * 60 * 1000;
+      break;
+    case '30m':
+      timeframeMs = 30 * 60 * 1000;
+      break;
+    case '1h':
+      timeframeMs = 60 * 60 * 1000;
+      break;
+    case 'D':
+      timeframeMs = 24 * 60 * 60 * 1000;
+      break;
   }
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
@@ -102,7 +121,9 @@ app.get('/api/chart', async (req, res) => {
     if (error) {
       console.error("Supabase fetch error:", error);
       // fallback to memory cache
-      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+      data = memoryCache.filter(
+        (p) => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)
+      );
     }
 
     // Downsample to max 500 points
@@ -113,15 +134,18 @@ app.get('/api/chart', async (req, res) => {
     }
 
     res.json(data);
-
   } catch (err) {
     console.error("Error fetching chart data:", err);
     // fallback to memory cache
-    res.json(memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)));
+    res.json(memoryCache.filter(
+      (p) => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)
+    ));
   }
 });
 
 // -------------------------
 // Start server
 // -------------------------
-app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`BlackCoin backend running on port ${PORT}`)
+);
