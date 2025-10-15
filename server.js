@@ -13,9 +13,20 @@ app.use(cors());
 app.use(express.json());
 
 // -------------------------
-// Supabase setup (service_role key required for inserts)
+// Validate Supabase env vars
 // -------------------------
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('ERROR: SUPABASE_URL or SUPABASE_KEY is missing!');
+  process.exit(1);
+}
+
+// -------------------------
+// Supabase client
+// -------------------------
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // -------------------------
 // Token info
@@ -29,6 +40,24 @@ const FETCH_INTERVAL = 5000; // 5 seconds
 let memoryCache = [];
 
 // -------------------------
+// Insert with retry
+// -------------------------
+async function insertPoint(point, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const { data, error } = await supabase.from('chart_data').insert([point]).select();
+    if (!error) {
+      console.log("Supabase insert succeeded:", data);
+      return true;
+    } else {
+      console.warn(`Insert failed, attempt ${i + 1}:`, error);
+      await new Promise(r => setTimeout(r, 500)); // wait 500ms before retry
+    }
+  }
+  console.error("Insert permanently failed:", point);
+  return false;
+}
+
+// -------------------------
 // Fetch live data from DexScreener and save to Supabase
 // -------------------------
 async function fetchLiveData() {
@@ -38,27 +67,30 @@ async function fetchLiveData() {
     if (!data.pairs || !data.pairs[0]) return;
 
     const pair = data.pairs[0];
-    const price = parseFloat(pair.priceUsd || 0);
-    const change = parseFloat(pair.priceChange?.h24 || 0);
-    const volume = parseFloat(pair.volume?.h24 || 0);
-    const timestamp = new Date().toISOString();
+
+    // Ensure all numeric values
+    const price = parseFloat(pair.priceUsd) || 0;
+    const change = parseFloat(pair.priceChange?.h24) || 0;
+    const volume = parseFloat(pair.volume?.h24) || 0;
+
+    // Add microsecond random suffix to prevent timestamp collision
+    const timestamp = new Date().toISOString() + '.' + Math.floor(Math.random() * 1000);
 
     const point = { timestamp, price, change, volume };
 
-    // Save in-memory
+    // Save in-memory (last 24h)
     memoryCache.push(point);
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
+    memoryCache = memoryCache.filter(
+      p => new Date(p.timestamp) >= new Date(Date.now() - 24 * 60 * 60 * 1000)
+    );
 
-    // Insert new point into Supabase
-    const { error: insertError } = await supabase.from('chart_data').insert([point]);
-    if (insertError) console.error("Supabase insert error:", insertError);
+    console.log("Inserting point:", point);
+    await insertPoint(point);
 
-    // Delete old points from Supabase (>24h)
-    const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
+    // Optional: delete old points (>24h) from Supabase
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
     if (deleteError) console.error("Supabase delete old points error:", deleteError);
-
-    console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
 
   } catch (err) {
     console.error("Error fetching live data:", err);
@@ -76,7 +108,7 @@ fetchLiveData(); // immediate fetch
 // -------------------------
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
-  let timeframeMs = 24 * 60 * 60 * 1000; // default 24h
+  let timeframeMs = 24 * 60 * 60 * 1000;
 
   switch(interval){
     case '1m': timeframeMs = 60*1000; break;
@@ -97,14 +129,12 @@ app.get('/api/chart', async (req, res) => {
 
     if (error) {
       console.error("Supabase fetch error:", error);
-      // fallback to memory cache
       data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
     }
 
     // Downsample to max 500 points
-    const maxPoints = 500;
-    if (data.length > maxPoints) {
-      const sampleRate = Math.ceil(data.length / maxPoints);
+    if (data.length > 500) {
+      const sampleRate = Math.ceil(data.length / 500);
       data = data.filter((_, i) => i % sampleRate === 0);
     }
 
@@ -112,7 +142,6 @@ app.get('/api/chart', async (req, res) => {
 
   } catch (err) {
     console.error("Error fetching chart data:", err);
-    // fallback to memory cache
     res.json(memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)));
   }
 });
