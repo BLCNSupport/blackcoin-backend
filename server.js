@@ -1,4 +1,4 @@
-// server.js (CommonJS version)
+// server.js (CommonJS, ready for Render)
 
 const express = require('express');
 const fetch = require('node-fetch'); // Node 18+ has fetch built-in
@@ -48,7 +48,7 @@ async function fetchLiveData() {
     if (price > 0) {
       const point = { timestamp, price, change, volume };
 
-      // Save in-memory
+      // Save in-memory cache (last 24h)
       memoryCache.push(point);
       memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
 
@@ -76,7 +76,7 @@ setInterval(fetchLiveData, FETCH_INTERVAL);
 fetchLiveData(); // immediate fetch
 
 // -------------------------
-// API endpoint for frontend
+// API endpoint for frontend chart
 // -------------------------
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
@@ -125,4 +125,3 @@ app.get('/api/chart', async (req, res) => {
 // Start server
 // -------------------------
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
-
