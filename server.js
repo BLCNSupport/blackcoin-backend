@@ -1,8 +1,10 @@
-import express from 'express';
-import fetch from 'node-fetch';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
+// server.js (CommonJS version)
+
+const express = require('express');
+const fetch = require('node-fetch'); // Node 18+ has fetch built-in
+const cors = require('cors');
+const dotenv = require('dotenv');
+const { createClient } = require('@supabase/supabase-js');
 
 dotenv.config();
 
@@ -43,7 +45,7 @@ async function fetchLiveData() {
     const volume = parseFloat(pair.volume?.h24 || 0);
     const timestamp = new Date().toISOString();
 
-    if(price > 0){
+    if (price > 0) {
       const point = { timestamp, price, change, volume };
 
       // Save in-memory
@@ -123,3 +125,4 @@ app.get('/api/chart', async (req, res) => {
 // Start server
 // -------------------------
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+
