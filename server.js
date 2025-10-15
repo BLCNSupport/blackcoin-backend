@@ -15,7 +15,7 @@ app.use(express.json());
 // -------------------------
 // Supabase setup (service_role key required for inserts)
 // -------------------------
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // -------------------------
 // Token info
@@ -43,22 +43,24 @@ async function fetchLiveData() {
     const volume = parseFloat(pair.volume?.h24 || 0);
     const timestamp = new Date().toISOString();
 
-    const point = { timestamp, price, change, volume };
+    if(price > 0){
+      const point = { timestamp, price, change, volume };
 
-    // Save in-memory
-    memoryCache.push(point);
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
+      // Save in-memory
+      memoryCache.push(point);
+      memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
 
-    // Insert new point into Supabase
-    const { error: insertError } = await supabase.from('chart_data').insert([point]);
-    if (insertError) console.error("Supabase insert error:", insertError);
+      // Insert new point into Supabase
+      const { error: insertError } = await supabase.from('chart_data').insert([point]);
+      if (insertError) console.error("Supabase insert error:", insertError);
 
-    // Delete old points from Supabase (>24h)
-    const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
-    const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
-    if (deleteError) console.error("Supabase delete old points error:", deleteError);
+      // Delete old points from Supabase (>24h)
+      const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
+      const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
+      if (deleteError) console.error("Supabase delete old points error:", deleteError);
 
-    console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
+      console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
+    }
 
   } catch (err) {
     console.error("Error fetching live data:", err);
