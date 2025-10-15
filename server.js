@@ -1,3 +1,4 @@
+// server.js (ES Modules, Render safe)
 import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
@@ -13,7 +14,7 @@ app.use(cors());
 app.use(express.json());
 
 // -------------------------
-// Validate Supabase env vars
+// Supabase setup
 // -------------------------
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -23,9 +24,6 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// -------------------------
-// Supabase client
-// -------------------------
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // -------------------------
@@ -35,22 +33,22 @@ const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
 
 // -------------------------
-// In-memory cache for fallback
+// In-memory cache
 // -------------------------
 let memoryCache = [];
 
 // -------------------------
-// Insert with retry
+// Insert with retry (safe)
 // -------------------------
 async function insertPoint(point, retries = 3) {
   for (let i = 0; i < retries; i++) {
     const { data, error } = await supabase.from('chart_data').insert([point]).select();
     if (!error) {
-      console.log("Supabase insert succeeded:", data);
+      console.log(`Supabase insert succeeded: ${point.timestamp}`);
       return true;
     } else {
-      console.warn(`Insert failed, attempt ${i + 1}:`, error);
-      await new Promise(r => setTimeout(r, 500)); // wait 500ms before retry
+      console.warn(`Insert failed, attempt ${i + 1}:`, error.message);
+      await new Promise(r => setTimeout(r, 500));
     }
   }
   console.error("Insert permanently failed:", point);
@@ -58,7 +56,7 @@ async function insertPoint(point, retries = 3) {
 }
 
 // -------------------------
-// Fetch live data from DexScreener and save to Supabase
+// Fetch live data
 // -------------------------
 async function fetchLiveData() {
   try {
@@ -67,15 +65,12 @@ async function fetchLiveData() {
     if (!data.pairs || !data.pairs[0]) return;
 
     const pair = data.pairs[0];
-
-    // Ensure all numeric values
     const price = parseFloat(pair.priceUsd) || 0;
     const change = parseFloat(pair.priceChange?.h24) || 0;
     const volume = parseFloat(pair.volume?.h24) || 0;
 
-    // Add microsecond random suffix to prevent timestamp collision
-    const timestamp = new Date().toISOString() + '.' + Math.floor(Math.random() * 1000);
-
+    // Unique timestamp to avoid collisions
+    const timestamp = new Date().toISOString() + `.${Date.now() % 1000}`;
     const point = { timestamp, price, change, volume };
 
     // Save in-memory (last 24h)
@@ -87,15 +82,19 @@ async function fetchLiveData() {
     console.log("Inserting point:", point);
     await insertPoint(point);
 
-    // Optional: delete old points (>24h) from Supabase
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
-    if (deleteError) console.error("Supabase delete old points error:", deleteError);
-
   } catch (err) {
     console.error("Error fetching live data:", err);
   }
 }
+
+// -------------------------
+// Periodic cleanup of old points (once per hour)
+// -------------------------
+setInterval(async () => {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { error } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
+  if (error) console.error("Supabase delete old points error:", error.message);
+}, 60 * 60 * 1000); // every hour
 
 // -------------------------
 // Start fetching live data
@@ -128,11 +127,11 @@ app.get('/api/chart', async (req, res) => {
       .order('timestamp', { ascending: true });
 
     if (error) {
-      console.error("Supabase fetch error:", error);
+      console.error("Supabase fetch error:", error.message);
       data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
     }
 
-    // Downsample to max 500 points
+    // Downsample max 500 points
     if (data.length > 500) {
       const sampleRate = Math.ceil(data.length / 500);
       data = data.filter((_, i) => i % sampleRate === 0);
