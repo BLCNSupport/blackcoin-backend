@@ -1,10 +1,7 @@
 import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +12,10 @@ app.use(express.json());
 // -------------------------
 // Supabase setup
 // -------------------------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  console.error("SUPABASE_URL and SUPABASE_KEY must be set as environment variables!");
+  process.exit(1);
+}
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // -------------------------
@@ -22,6 +23,11 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // -------------------------
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
+
+// -------------------------
+// In-memory cache for fast frontend response
+// -------------------------
+let memoryCache = [];
 
 // -------------------------
 // Fetch live data from DexScreener and save to Supabase
@@ -38,16 +44,26 @@ async function fetchLiveData() {
     const volume = parseFloat(pair.volume?.h24 || 0);
     const timestamp = new Date().toISOString();
 
-    // Insert new point
-    await supabase.from('chart_data').insert([{ timestamp, price, change, volume }]);
+    const point = { timestamp, price, change, volume };
+
+    // Save to memory
+    memoryCache.push(point);
+
+    // Trim memoryCache to last 24h
+    const cutoffMem = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= cutoffMem);
+
+    // Insert into Supabase
+    const { error: insertError } = await supabase.from('chart_data').insert([point]);
+    if (insertError) console.error("Supabase insert error:", insertError);
+    else console.log(`Inserted point: $${price.toFixed(6)} at ${timestamp}`);
 
     // Remove points older than 24h
-    await supabase
+    const { error: deleteError } = await supabase
       .from('chart_data')
       .delete()
-      .lt('timestamp', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
-
-    console.log(`Inserted point: $${price.toFixed(6)} at ${timestamp}`);
+      .lt('timestamp', cutoffMem.toISOString());
+    if (deleteError) console.error("Supabase delete error:", deleteError);
 
   } catch (e) {
     console.error("Error fetching live data:", e);
@@ -77,26 +93,36 @@ app.get('/api/chart', async (req, res) => {
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
 
-  const { data, error } = await supabase
-    .from('chart_data')
-    .select('*')
-    .gte('timestamp', cutoff)
-    .order('timestamp', { ascending: true });
+  try {
+    const { data, error } = await supabase
+      .from('chart_data')
+      .select('*')
+      .gte('timestamp', cutoff)
+      .order('timestamp', { ascending: true });
 
-  if (error) {
-    console.error("Error fetching chart data:", error);
-    return res.status(500).json({ error: error.message });
+    if (error) {
+      console.error("Supabase fetch error:", error);
+      // fallback to memory cache
+      const fallback = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+      return res.json(fallback);
+    }
+
+    // Downsample if too many points
+    let result = data;
+    const maxPoints = 500;
+    if (result.length > maxPoints) {
+      const sampleRate = Math.ceil(result.length / maxPoints);
+      result = result.filter((_, i) => i % sampleRate === 0);
+    }
+
+    res.json(result);
+
+  } catch (err) {
+    console.error("Error fetching chart data:", err);
+    // fallback to memory cache
+    const fallback = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+    res.json(fallback);
   }
-
-  // Downsample if too many points (optional)
-  let result = data;
-  const maxPoints = 500;
-  if (result.length > maxPoints) {
-    const sampleRate = Math.ceil(result.length / maxPoints);
-    result = result.filter((_, i) => i % sampleRate === 0);
-  }
-
-  res.json(result);
 });
 
 // -------------------------
