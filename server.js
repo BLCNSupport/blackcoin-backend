@@ -24,12 +24,13 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
 
+// In-memory cache
 let memoryCache = [];
 
 // Insert data point with retry
 async function insertPoint(point, retries = 3) {
   for (let i = 0; i < retries; i++) {
-    const { data, error } = await supabase.from('chart_data').insert([point]).select();
+    const { error } = await supabase.from('chart_data').insert([point]);
     if (!error) return true;
     await new Promise(r => setTimeout(r, 500));
   }
@@ -45,20 +46,17 @@ async function fetchLiveData() {
 
     const pair = json.pairs[0];
     const price = parseFloat(pair.priceUsd) || 0;
-    const change = parseFloat(pair.priceChange?.h24) || 0; // keep h24 as fallback
-    const volume = pair.volume?.h24 ? parseFloat(pair.volume.h24) : 0;
+    const change = parseFloat(pair.priceChange?.h24) || 0;  // 24h %
+    const volume = parseFloat(pair.volume?.h24) || 0;        // 24h volume
     const timestamp = new Date().toISOString();
 
     const point = { timestamp, price, change, volume };
 
     memoryCache.push(point);
-    memoryCache = memoryCache.filter(
-      p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000)
-    );
+    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
 
     await insertPoint(point);
 
-    // Cleanup older than 24h
     const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
     await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
@@ -67,15 +65,15 @@ async function fetchLiveData() {
   }
 }
 
+// Start fetching
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// Aggregate data function
+// Aggregate function (price & volume, keep latest 24h change)
 function aggregateData(data, intervalMs) {
   if (intervalMs <= 0 || data.length <= 1) return data;
 
   const buckets = {};
-
   data.forEach(d => {
     const t = new Date(d.timestamp).getTime();
     const bucket = Math.floor(t / intervalMs) * intervalMs;
@@ -83,20 +81,17 @@ function aggregateData(data, intervalMs) {
     buckets[bucket].push(d);
   });
 
+  const latest24hChange = data[data.length - 1]?.change || 0;
+
   return Object.keys(buckets).map(ts => {
     const points = buckets[ts];
-    const firstPrice = points[0].price;
-    const lastPoint = points[points.length - 1];
-
     const avgPrice = points.reduce((a,b) => a + b.price, 0) / points.length;
-    const change = ((lastPoint.price - firstPrice) / firstPrice) * 100; // correct % change
-    const volume = lastPoint.volume; // take last reported volume
-
+    const sumVolume = points.reduce((a,b) => a + b.volume, 0);
     return {
       timestamp: new Date(Number(ts)).toISOString(),
       price: avgPrice,
-      change,
-      volume
+      volume: sumVolume,
+      change: latest24hChange
     };
   }).sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
 }
@@ -108,11 +103,11 @@ app.get('/api/chart', async (req, res) => {
   let bucketMs = 60*1000;
 
   switch(interval){
-    case '1m': timeframeMs = 60*60*1000; bucketMs = 60*1000; break;   // last 1 hour, 1m buckets
-    case '5m': timeframeMs = 3*60*60*1000; bucketMs = 5*60*1000; break; // last 3 hours, 5m buckets
-    case '30m': timeframeMs = 12*60*60*1000; bucketMs = 30*60*1000; break; // last 12 hours, 30m buckets
-    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break; // last 24h, 1h buckets
-    case 'D': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;   // daily downsample to 5m
+    case '1m': timeframeMs = 60*60*1000; bucketMs = 60*1000; break;
+    case '5m': timeframeMs = 3*60*60*1000; bucketMs = 5*60*1000; break;
+    case '30m': timeframeMs = 12*60*60*1000; bucketMs = 30*60*1000; break;
+    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break;
+    case 'D': bucketMs = 5*60*1000; break;
   }
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
@@ -129,7 +124,6 @@ app.get('/api/chart', async (req, res) => {
     }
 
     const aggregated = aggregateData(data, bucketMs);
-
     res.json(aggregated);
 
   } catch (err) {
