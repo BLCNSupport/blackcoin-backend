@@ -1,4 +1,4 @@
-// server.js (ES modules, safe for Render)
+// server.js (ES modules, safe for Render, trimmed env vars)
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -6,14 +6,21 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 
 // -------------------------
+// Sanitize and debug environment variables
+// -------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+
+console.log('Process.env keys:', Object.keys(process.env));
+console.log('SUPABASE_URL:', SUPABASE_URL ? 'SET' : 'NOT SET');
+console.log('SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'NOT SET');
+
+// -------------------------
 // Check required env vars
 // -------------------------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('ERROR: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing!');
-  console.error('Make sure these environment variables are set in Render.');
+  console.error('Make sure these environment variables are set in Render, with no extra spaces.');
   process.exit(1); // stop server from starting
 }
 
