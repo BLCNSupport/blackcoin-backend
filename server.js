@@ -1,42 +1,21 @@
-// server.js (ES modules, safe for Render, trimmed env vars)
-
 import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
+import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 
-// -------------------------
-// Sanitize and debug environment variables
-// -------------------------
-const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+dotenv.config();
 
-console.log('Process.env keys:', Object.keys(process.env));
-console.log('SUPABASE_URL:', SUPABASE_URL ? 'SET' : 'NOT SET');
-console.log('SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'NOT SET');
-
-// -------------------------
-// Check required env vars
-// -------------------------
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('ERROR: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing!');
-  console.error('Make sure these environment variables are set in Render, with no extra spaces.');
-  process.exit(1); // stop server from starting
-}
-
-// -------------------------
-// Supabase client
-// -------------------------
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-// -------------------------
-// Express setup
-// -------------------------
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// -------------------------
+// Supabase setup (service_role key required for inserts)
+// -------------------------
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // -------------------------
 // Token info
@@ -64,26 +43,23 @@ async function fetchLiveData() {
     const volume = parseFloat(pair.volume?.h24 || 0);
     const timestamp = new Date().toISOString();
 
-    if (price > 0) {
-      const point = { timestamp, price, change, volume };
+    const point = { timestamp, price, change, volume };
 
-      // Save in-memory cache (last 24h)
-      memoryCache.push(point);
-      memoryCache = memoryCache.filter(
-        (p) => new Date(p.timestamp) >= new Date(Date.now() - 24 * 60 * 60 * 1000)
-      );
+    // Save in-memory
+    memoryCache.push(point);
+    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
 
-      // Insert into Supabase
-      const { error: insertError } = await supabase.from('chart_data').insert([point]);
-      if (insertError) console.error("Supabase insert error:", insertError);
+    // Insert new point into Supabase
+    const { error: insertError } = await supabase.from('chart_data').insert([point]);
+    if (insertError) console.error("Supabase insert error:", insertError);
 
-      // Delete old points from Supabase (>24h)
-      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
-      if (deleteError) console.error("Supabase delete old points error:", deleteError);
+    // Delete old points from Supabase (>24h)
+    const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
+    const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
+    if (deleteError) console.error("Supabase delete old points error:", deleteError);
 
-      console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
-    }
+    console.log(`Inserted: $${price.toFixed(6)} at ${timestamp}`);
+
   } catch (err) {
     console.error("Error fetching live data:", err);
   }
@@ -96,18 +72,18 @@ setInterval(fetchLiveData, FETCH_INTERVAL);
 fetchLiveData(); // immediate fetch
 
 // -------------------------
-// API endpoint for frontend chart
+// API endpoint for frontend
 // -------------------------
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
   let timeframeMs = 24 * 60 * 60 * 1000; // default 24h
 
-  switch (interval) {
-    case '1m': timeframeMs = 60 * 1000; break;
-    case '5m': timeframeMs = 5 * 60 * 1000; break;
-    case '30m': timeframeMs = 30 * 60 * 1000; break;
-    case '1h': timeframeMs = 60 * 60 * 1000; break;
-    case 'D': timeframeMs = 24 * 60 * 60 * 1000; break;
+  switch(interval){
+    case '1m': timeframeMs = 60*1000; break;
+    case '5m': timeframeMs = 5*60*1000; break;
+    case '30m': timeframeMs = 30*60*1000; break;
+    case '1h': timeframeMs = 60*60*1000; break;
+    case 'D': timeframeMs = 24*60*60*1000; break;
   }
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
@@ -121,9 +97,8 @@ app.get('/api/chart', async (req, res) => {
 
     if (error) {
       console.error("Supabase fetch error:", error);
-      data = memoryCache.filter(
-        (p) => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)
-      );
+      // fallback to memory cache
+      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
     }
 
     // Downsample to max 500 points
@@ -134,17 +109,15 @@ app.get('/api/chart', async (req, res) => {
     }
 
     res.json(data);
+
   } catch (err) {
     console.error("Error fetching chart data:", err);
-    res.json(memoryCache.filter(
-      (p) => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)
-    ));
+    // fallback to memory cache
+    res.json(memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)));
   }
 });
 
 // -------------------------
 // Start server
 // -------------------------
-app.listen(PORT, () => {
-  console.log(`BlackCoin backend running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
