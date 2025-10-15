@@ -24,10 +24,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
 
-// In-memory cache
+// -------------------------
+// In-memory cache for fast access
+// -------------------------
 let memoryCache = [];
 
-// Insert data point with retry
+// -------------------------
+// Insert new point into Supabase
+// -------------------------
 async function insertPoint(point, retries = 3) {
   for (let i = 0; i < retries; i++) {
     const { error } = await supabase.from('chart_data').insert([point]);
@@ -37,7 +41,9 @@ async function insertPoint(point, retries = 3) {
   return false;
 }
 
-// Fetch live data
+// -------------------------
+// Fetch live data from DexScreener
+// -------------------------
 async function fetchLiveData() {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`);
@@ -46,89 +52,57 @@ async function fetchLiveData() {
 
     const pair = json.pairs[0];
     const price = parseFloat(pair.priceUsd) || 0;
-    const change = parseFloat(pair.priceChange?.h24) || 0;  // 24h %
-    const volume = parseFloat(pair.volume?.h24) || 0;        // 24h volume
+    const change = parseFloat(pair.priceChange?.h24) || 0; // 24h %
+    const volume = parseFloat(pair.volume?.h24) || 0;       // 24h volume
     const timestamp = new Date().toISOString();
 
     const point = { timestamp, price, change, volume };
 
     memoryCache.push(point);
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
-
     await insertPoint(point);
 
-    const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
-    await supabase.from('chart_data').delete().lt('timestamp', cutoff);
-
+    // Keep only last 48h in memory to prevent memory growth
+    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 48*60*60*1000));
   } catch (err) {
     console.error("Error fetching live data:", err);
   }
 }
 
-// Start fetching
+// Start fetching live data
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// Aggregate function (price & volume, keep latest 24h change)
-function aggregateData(data, intervalMs) {
-  if (intervalMs <= 0 || data.length <= 1) return data;
-
-  const buckets = {};
-  data.forEach(d => {
-    const t = new Date(d.timestamp).getTime();
-    const bucket = Math.floor(t / intervalMs) * intervalMs;
-    if (!buckets[bucket]) buckets[bucket] = [];
-    buckets[bucket].push(d);
-  });
-
-  const latest24hChange = data[data.length - 1]?.change || 0;
-
-  return Object.keys(buckets).map(ts => {
-    const points = buckets[ts];
-    const avgPrice = points.reduce((a,b) => a + b.price, 0) / points.length;
-    const sumVolume = points.reduce((a,b) => a + b.volume, 0);
-    return {
-      timestamp: new Date(Number(ts)).toISOString(),
-      price: avgPrice,
-      volume: sumVolume,
-      change: latest24hChange
-    };
-  }).sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
-}
-
-// API endpoint
+// -------------------------
+// API endpoint for frontend
+// -------------------------
 app.get('/api/chart', async (req, res) => {
-  const interval = req.query.interval || 'D';
-  let timeframeMs = 24*60*60*1000;
-  let bucketMs = 60*1000;
+  const interval = req.query.interval || 'D'; // 1m, 5m, 30m, 1h, D
+  let cutoff = new Date(Date.now() - 24*60*60*1000); // default last 24h
 
-  switch(interval){
-    case '1m': timeframeMs = 60*60*1000; bucketMs = 60*1000; break;
-    case '5m': timeframeMs = 3*60*60*1000; bucketMs = 5*60*1000; break;
-    case '30m': timeframeMs = 12*60*60*1000; bucketMs = 30*60*1000; break;
-    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break;
-    case 'D': bucketMs = 5*60*1000; break;
+  switch(interval) {
+    case '1m': cutoff = new Date(Date.now() - 60*60*1000); break;       // last 1h
+    case '5m': cutoff = new Date(Date.now() - 3*60*60*1000); break;     // last 3h
+    case '30m': cutoff = new Date(Date.now() - 12*60*60*1000); break;   // last 12h
+    case '1h': cutoff = new Date(Date.now() - 24*60*60*1000); break;    // last 24h
+    case 'D': cutoff = new Date(Date.now() - 24*60*60*1000); break;     // last 24h
   }
-
-  const cutoff = new Date(Date.now() - timeframeMs).toISOString();
 
   try {
     let { data, error } = await supabase
       .from('chart_data')
       .select('*')
-      .gte('timestamp', cutoff)
+      .gte('timestamp', cutoff.toISOString())
       .order('timestamp', { ascending: true });
 
     if (error || !data || data.length === 0) {
-      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
+      data = memoryCache.filter(p => new Date(p.timestamp) >= cutoff);
     }
 
-    const aggregated = aggregateData(data, bucketMs);
-    res.json(aggregated);
+    res.json(data);
 
   } catch (err) {
     console.error("Error fetching chart data:", err);
-    res.json(memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)));
+    res.json(memoryCache.filter(p => new Date(p.timestamp) >= cutoff));
   }
 });
 
