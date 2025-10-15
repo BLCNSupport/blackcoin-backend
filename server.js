@@ -27,7 +27,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 // Token info
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
-const MAX_POINTS = 1000; // Limit for performance
+const MAX_POINTS = 2000; // Covers ~2.8 hours at 5s intervals
 
 // In-memory cache for fallback
 let memoryCache = [];
@@ -130,7 +130,7 @@ app.get('/api/chart', async (req, res) => {
       .select('timestamp, price, change, volume')
       .gte('timestamp', cutoff)
       .order('timestamp', { ascending: true })
-      .limit(MAX_POINTS); // Limit to avoid overwhelming frontend
+      .limit(MAX_POINTS);
 
     if (error) {
       console.error("Supabase fetch error:", error);
@@ -142,10 +142,9 @@ app.get('/api/chart', async (req, res) => {
       data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
     }
 
-    // Calculate interval-specific metrics
+    // Aggregate for non-D intervals
     let aggregatedData = data;
     if (interval !== 'D') {
-      // Group by interval
       const grouped = {};
       for (const point of data) {
         const date = new Date(point.timestamp);
@@ -171,27 +170,35 @@ app.get('/api/chart', async (req, res) => {
           grouped[key] = {
             timestamp: key,
             price: point.price,
-            change: point.change,
             volume: point.volume,
-            count: 1
+            points: [{ price: point.price, timestamp: point.timestamp }]
           };
         } else {
-          grouped[key].price = point.price; // Use latest price
+          grouped[key].price = point.price; // Latest price
           grouped[key].volume += point.volume;
-          grouped[key].count += 1;
+          grouped[key].points.push({ price: point.price, timestamp: point.timestamp });
         }
       }
-      aggregatedData = Object.values(grouped).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    }
 
-    // Calculate % change for the interval
-    if (aggregatedData.length >= 2) {
-      const firstPrice = aggregatedData[0].price;
-      const lastPrice = aggregatedData[aggregatedData.length - 1].price;
-      const intervalChange = ((lastPrice - firstPrice) / firstPrice * 100) || 0;
-      aggregatedData.forEach(point => point.change = intervalChange);
-    } else if (aggregatedData.length === 1) {
-      aggregatedData[0].change = 0;
+      // Calculate change per bucket
+      aggregatedData = Object.values(grouped).map(bucket => ({
+        timestamp: bucket.timestamp,
+        price: bucket.price,
+        volume: bucket.volume,
+        change: bucket.points.length >= 2
+          ? ((bucket.points[bucket.points.length - 1].price - bucket.points[0].price) / bucket.points[0].price * 100)
+          : 0
+      })).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    } else {
+      // For D, recalculate change over entire timeframe
+      if (data.length >= 2) {
+        const firstPrice = data[0].price;
+        const lastPrice = data[data.length - 1].price;
+        const intervalChange = ((lastPrice - firstPrice) / firstPrice * 100) || 0;
+        data.forEach(point => point.change = intervalChange);
+      } else if (data.length === 1) {
+        data[0].change = 0;
+      }
     }
 
     console.log(`Returning ${aggregatedData.length} points for interval ${interval}`);
