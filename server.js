@@ -68,12 +68,12 @@ async function fetchLiveData() {
 
     const pair = data.pairs[0];
 
-    // Ensure all numeric values
+    // Ensure numeric values
     const price = parseFloat(pair.priceUsd) || 0;
     const change = parseFloat(pair.priceChange?.h24) || 0;
     const volume = parseFloat(pair.volume?.h24) || 0;
 
-    // Use a valid ISO string for timestamp
+    // Use proper ISO timestamp
     const timestamp = new Date().toISOString();
 
     const point = { timestamp, price, change, volume };
@@ -87,7 +87,7 @@ async function fetchLiveData() {
     console.log("Inserting point:", point);
     await insertPoint(point);
 
-    // Optional: delete old points (>24h) from Supabase
+    // Optional: delete old points (>24h)
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { error: deleteError } = await supabase.from('chart_data').delete().lt('timestamp', cutoff);
     if (deleteError) console.error("Supabase delete old points error:", deleteError);
