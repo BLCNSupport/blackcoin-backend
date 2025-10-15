@@ -22,15 +22,15 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-const FETCH_INTERVAL = 5000; // 5s live updates
+const FETCH_INTERVAL = 5000; // 5 seconds
 
 // -------------------------
-// In-memory cache
+// In-memory cache for fast startup
 // -------------------------
 let memoryCache = [];
 
 // -------------------------
-// Insert point with retry
+// Insert data point with retry
 // -------------------------
 async function insertPoint(point, retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -58,13 +58,13 @@ async function fetchLiveData() {
 
     const point = { timestamp, price, change, volume };
 
-    // Add to memory cache (last 24h)
     memoryCache.push(point);
+    // keep last 24h only
     memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24*60*60*1000));
 
     await insertPoint(point);
 
-    // Optional: delete points older than 24h
+    // optional cleanup older than 24h
     const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
     await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
@@ -78,7 +78,7 @@ fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
 // -------------------------
-// Aggregate data by interval
+// Aggregate data by interval (price avg, change avg, volume sum)
 // -------------------------
 function aggregateData(data, intervalMs) {
   if (intervalMs <= 0 || data.length <= 1) return data;
@@ -92,34 +92,33 @@ function aggregateData(data, intervalMs) {
   });
 
   return Object.keys(buckets).map(ts => {
-    const bucketPoints = buckets[ts];
-    const avgPrice = bucketPoints.reduce((a,b)=>a+parseFloat(b.price),0)/bucketPoints.length;
-    const avgChange = bucketPoints.reduce((a,b)=>a+parseFloat(b.change),0)/bucketPoints.length;
-    const totalVolume = bucketPoints.reduce((a,b)=>a+parseFloat(b.volume),0);
-
+    const points = buckets[ts];
+    const avgPrice = points.reduce((a,b) => a + b.price,0)/points.length;
+    const avgChange = points.reduce((a,b) => a + b.change,0)/points.length;
+    const sumVolume = points.reduce((a,b) => a + b.volume,0);
     return {
       timestamp: new Date(Number(ts)).toISOString(),
       price: avgPrice,
       change: avgChange,
-      volume: totalVolume
+      volume: sumVolume
     };
   }).sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
 }
 
 // -------------------------
-// API endpoint
+// API endpoint for frontend
 // -------------------------
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || 'D';
   let timeframeMs = 24*60*60*1000;
-  let bucketMs = 60000; // default 1m
+  let bucketMs = 60000; // default 1-minute aggregation
 
   switch(interval){
-    case '1m': bucketMs = 60000; break;
-    case '5m': bucketMs = 5*60*1000; break;
-    case '30m': bucketMs = 30*60*1000; break;
-    case '1h': bucketMs = 60*60*1000; break;
-    case 'D': bucketMs = 5*60*1000; break; // downsample daily to 5m
+    case '1m': timeframeMs = 24*60*60*1000; bucketMs = 60*1000; break;
+    case '5m': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;
+    case '30m': timeframeMs = 24*60*60*1000; bucketMs = 30*60*1000; break;
+    case '1h': timeframeMs = 24*60*60*1000; bucketMs = 60*60*1000; break;
+    case 'D': timeframeMs = 24*60*60*1000; bucketMs = 5*60*1000; break;
   }
 
   const cutoff = new Date(Date.now() - timeframeMs).toISOString();
@@ -127,36 +126,20 @@ app.get('/api/chart', async (req, res) => {
   try {
     let { data, error } = await supabase
       .from('chart_data')
-      .select('timestamp, price, change, volume')
+      .select('*')
       .gte('timestamp', cutoff)
       .order('timestamp', { ascending: true });
 
     if (error || !data) data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
 
-    // Aggregate by bucket
     data = aggregateData(data, bucketMs);
-
-    // Downsample to max 500 points
-    if (data.length > 500) {
-      const sampleRate = Math.ceil(data.length / 500);
-      data = data.filter((_, i) => i % sampleRate === 0);
-    }
 
     res.json(data);
 
   } catch (err) {
     console.error("Error fetching chart data:", err);
-    const fallback = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs));
-    res.json(fallback.map(p => ({
-      timestamp: p.timestamp,
-      price: parseFloat(p.price),
-      change: parseFloat(p.change),
-      volume: parseFloat(p.volume)
-    })));
+    res.json(memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - timeframeMs)));
   }
 });
 
-// -------------------------
-// Start server
-// -------------------------
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
