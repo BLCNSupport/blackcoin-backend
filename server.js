@@ -8,228 +8,99 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
 
-// Validate Supabase env vars
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('ERROR: SUPABASE_URL or SUPABASE_KEY is missing!');
+  console.error('Supabase env vars missing!');
   process.exit(1);
 }
 
-// Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Token info
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000; // 5 seconds
-const MAX_POINTS = 2000; // Covers ~2.8 hours at 5s intervals
-
-// In-memory cache for fallback
+const MAX_POINTS = 20000; // ~24h at 5s intervals
 let memoryCache = [];
 
-// Insert with retry
-async function insertPoint(point, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const { data, error } = await supabase.from('chart_data').insert([point]).select();
-      if (!error) {
-        console.log("Supabase insert succeeded:", data);
-        return true;
-      } else {
-        console.warn(`Insert failed, attempt ${i + 1}:`, error);
-        await new Promise(r => setTimeout(r, 500));
-      }
-    } catch (err) {
-      console.warn(`Insert attempt ${i + 1} threw exception:`, err);
-    }
+// Insert with fallback
+async function insertPoint(point) {
+  try {
+    await supabase.from('chart_data').insert([point]);
+  } catch (err) {
+    console.warn('Supabase insert failed, storing in memory cache:', err);
+    memoryCache.push(point);
   }
-  console.error("Insert permanently failed:", point);
-  return false;
 }
 
-// Fetch live data from DexScreener with retry
-async function fetchLiveData(retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`, {
-        headers: { 'Cache-Control': 'no-cache' }
-      });
-      if (!res.ok) {
-        throw new Error(`DexScreener HTTP error! Status: ${res.status}`);
-      }
-      const data = await res.json();
+async function fetchLiveData() {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`, {
+      headers: { 'Cache-Control': 'no-cache' }
+    });
+    const data = await res.json();
+    const pair = data.pairs?.[0];
+    if (!pair) return;
 
-      if (!data.pairs || !data.pairs[0]) {
-        console.warn("No pairs found in DexScreener response:", data);
-        return;
-      }
+    const price = parseFloat(pair.priceUsd);
+    const change = parseFloat(pair.priceChange?.h24);
+    const volume = parseFloat(pair.volume?.h24);
+    if ([price, change, volume].some(v => isNaN(v))) return;
 
-      const pair = data.pairs[0];
-      const price = parseFloat(pair.priceUsd);
-      const change = parseFloat(pair.priceChange?.h24);
-      const volume = parseFloat(pair.volume?.h24);
+    const timestamp = Date.now(); // numeric ms
+    const point = { timestamp, price, change, volume };
 
-      if (isNaN(price) || isNaN(change) || isNaN(volume)) {
-        console.warn("Invalid data from DexScreener:", { price, change, volume });
-        return;
-      }
+    // Save to Supabase
+    await insertPoint(point);
 
-      const timestamp = new Date().toISOString();
-      const point = { timestamp, price, change, volume };
+    // Keep in-memory cache for fallback
+    memoryCache.push(point);
+    memoryCache = memoryCache.filter(p => p.timestamp >= Date.now() - 24*60*60*1000);
 
-      memoryCache.push(point);
-      memoryCache = memoryCache.filter(
-        p => new Date(p.timestamp) >= new Date(Date.now() - 24 * 60 * 60 * 1000)
-      );
+    // Remove old data from Supabase
+    const cutoff = new Date(Date.now() - 24*60*60*1000).toISOString();
+    await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
-      console.log("Inserting point:", point);
-      await insertPoint(point);
-
-      // Delete data older than 24 hours
-      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const { error: deleteError } = await supabase
-        .from('chart_data')
-        .delete()
-        .lt('timestamp', cutoff);
-      if (deleteError) console.error("Supabase delete error:", deleteError);
-
-      return; // Success
-
-    } catch (err) {
-      console.error(`fetchLiveData attempt ${i + 1} failed:`, err);
-      if (i < retries - 1) await new Promise(r => setTimeout(r, 1000));
-    }
+  } catch (err) {
+    console.error("fetchLiveData error:", err);
   }
-  console.error("fetchLiveData permanently failed after retries");
 }
 
-// Start fetching live data
+// Start interval fetch
 setInterval(fetchLiveData, FETCH_INTERVAL);
 fetchLiveData();
 
-// API endpoint for frontend chart
+// API endpoint
 app.get('/api/chart', async (req, res) => {
-  const interval = req.query.interval || 'D';
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // Always 24h rolling window
-
+  const cutoff = Date.now() - 24*60*60*1000;
   try {
     let { data, error } = await supabase
       .from('chart_data')
       .select('timestamp, price, change, volume')
-      .gte('timestamp', cutoff)
+      .gte('timestamp', new Date(cutoff).toISOString())
       .order('timestamp', { ascending: true })
       .limit(MAX_POINTS);
 
-    if (error) {
-      console.error("Supabase fetch error:", error);
-      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
-    }
-
-    if (!data || !data.length) {
-      console.warn("No data found for interval:", interval);
-      data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
-    }
-
-    // Aggregate for non-D intervals over 24h
-    let aggregatedData = data;
-    if (interval !== 'D') {
-      // Generate all possible bucket timestamps over 24h
-      const buckets = {};
-      const intervalMs = { '1m': 60*1000, '5m': 5*60*1000, '30m': 30*60*1000, '1h': 60*60*1000 }[interval];
-      const startTime = new Date(cutoff);
-      for (let time = startTime; time <= new Date(); time.setTime(time.getTime() + intervalMs)) {
-        const bucketTime = new Date(time);
-        if (interval === '1m') bucketTime.setSeconds(0, 0);
-        else if (interval === '5m') {
-          bucketTime.setSeconds(0, 0);
-          bucketTime.setMinutes(Math.floor(bucketTime.getMinutes() / 5) * 5);
-        } else if (interval === '30m') {
-          bucketTime.setSeconds(0, 0);
-          bucketTime.setMinutes(Math.floor(bucketTime.getMinutes() / 30) * 30);
-        } else if (interval === '1h') {
-          bucketTime.setSeconds(0, 0);
-          bucketTime.setMinutes(0, 0);
-        }
-        const key = bucketTime.toISOString();
-        buckets[key] = { timestamp: key, price: null, volume: 0, points: [] };
-      }
-
-      // Fill buckets with data
-      for (const point of data) {
-        const date = new Date(point.timestamp);
-        let key;
-        if (interval === '1m') {
-          date.setSeconds(0, 0);
-          key = date.toISOString();
-        } else if (interval === '5m') {
-          date.setSeconds(0, 0);
-          date.setMinutes(Math.floor(date.getSeconds() / 5) * 5);
-          key = date.toISOString();
-        } else if (interval === '30m') {
-          date.setSeconds(0, 0);
-          date.setMinutes(Math.floor(date.getMinutes() / 30) * 30);
-          key = date.toISOString();
-        } else if (interval === '1h') {
-          date.setSeconds(0, 0);
-          date.setMinutes(0, 0);
-          key = date.toISOString();
-        }
-
-        if (buckets[key]) {
-          buckets[key].price = point.price; // Latest price
-          buckets[key].volume += point.volume;
-          buckets[key].points.push(point);
-        }
-      }
-
-      // Fill gaps with previous price and 0 volume
-      let prevPrice = null;
-      aggregatedData = [];
-      Object.keys(buckets).sort().forEach(key => {
-        const bucket = buckets[key];
-        if (bucket.price === null && prevPrice !== null) {
-          bucket.price = prevPrice;
-        } else if (bucket.price !== null) {
-          prevPrice = bucket.price;
-        }
-        if (bucket.price !== null) { // Only include populated or filled buckets
-          bucket.change = bucket.points.length >= 2
-            ? ((bucket.points[bucket.points.length - 1].price - bucket.points[0].price) / bucket.points[0].price * 100)
-            : 0;
-          aggregatedData.push(bucket);
-        }
-      });
-
-      // Deduplicate final list
-      aggregatedData = aggregatedData.filter((p, i) => i === aggregatedData.findIndex(q => q.timestamp === p.timestamp));
+    // Convert ISO to numeric ms if Supabase stores ISO
+    if (data?.length) {
+      data = data.map(p => ({
+        timestamp: typeof p.timestamp === 'string' ? new Date(p.timestamp).getTime() : p.timestamp,
+        price: p.price,
+        change: p.change,
+        volume: p.volume
+      }));
     } else {
-      // For D, recalculate change over entire timeframe
-      if (data.length >= 2) {
-        const firstPrice = data[0].price;
-        const lastPrice = data[data.length - 1].price;
-        const intervalChange = ((lastPrice - firstPrice) / firstPrice * 100) || 0;
-        data.forEach(point => point.change = intervalChange);
-      } else if (data.length === 1) {
-        data[0].change = 0;
-      }
-      aggregatedData = data;
+      data = memoryCache;
     }
 
-    console.log(`Returning ${aggregatedData.length} points for interval ${interval}`);
-    res.json(aggregatedData);
+    res.json(data);
 
   } catch (err) {
-    console.error("Error fetching chart data:", err);
-    const fallbackData = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
-    console.log(`Returning ${fallbackData.length} cached points for interval ${interval}`);
-    res.json(fallbackData);
+    console.error("API fetch error:", err);
+    res.json(memoryCache);
   }
 });
 
-// Start server
-app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
