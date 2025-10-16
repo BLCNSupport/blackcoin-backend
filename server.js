@@ -59,11 +59,9 @@ async function fetchLiveData(retries = 3) {
       const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`, {
         headers: { 'Cache-Control': 'no-cache' }
       });
-      if (!res.ok) {
-        throw new Error(`DexScreener HTTP error! Status: ${res.status}`);
-      }
-      const data = await res.json();
+      if (!res.ok) throw new Error(`DexScreener HTTP error! Status: ${res.status}`);
 
+      const data = await res.json();
       if (!data.pairs || !data.pairs[0]) {
         console.warn("No pairs found in DexScreener response:", data);
         return;
@@ -112,10 +110,18 @@ async function fetchLiveData(retries = 3) {
 setInterval(fetchLiveData, FETCH_INTERVAL);
 fetchLiveData();
 
-// API endpoint for frontend chart
+// ===============================
+//     API ENDPOINT FOR FRONTEND
+// ===============================
 app.get('/api/chart', async (req, res) => {
+  // 🔒 Prevent all caching (Render, CDN, browser)
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+
   const interval = req.query.interval || 'D';
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // Always 24h rolling window
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // 24h rolling window
 
   try {
     let { data, error } = await supabase
@@ -135,19 +141,24 @@ app.get('/api/chart', async (req, res) => {
       data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
     }
 
-    // Aggregate for non-D intervals over 24h
+    // ---- Interval Aggregation ----
     let aggregatedData = data;
     if (interval !== 'D') {
-      // Generate all possible bucket timestamps over 24h
       const buckets = {};
-      const intervalMs = { '1m': 60*1000, '5m': 5*60*1000, '30m': 30*60*1000, '1h': 60*60*1000 }[interval];
+      const intervalMs = {
+        '1m': 60 * 1000,
+        '5m': 5 * 60 * 1000,
+        '30m': 30 * 60 * 1000,
+        '1h': 60 * 60 * 1000
+      }[interval];
+
       const startTime = new Date(cutoff);
       for (let time = startTime; time <= new Date(); time.setTime(time.getTime() + intervalMs)) {
         const bucketTime = new Date(time);
         if (interval === '1m') bucketTime.setSeconds(0, 0);
         else if (interval === '5m') {
           bucketTime.setSeconds(0, 0);
-          bucketTime.setMinutes(Math.floor(bucketTime.getMinutes() / 5) * 5);
+          bucketTime.setMinutes(Math.floor(bucketTime.getMinutes() / 5) * 5); // ✅ fixed
         } else if (interval === '30m') {
           bucketTime.setSeconds(0, 0);
           bucketTime.setMinutes(Math.floor(bucketTime.getMinutes() / 30) * 30);
@@ -159,7 +170,6 @@ app.get('/api/chart', async (req, res) => {
         buckets[key] = { timestamp: key, price: null, volume: 0, points: [] };
       }
 
-      // Fill buckets with data
       for (const point of data) {
         const date = new Date(point.timestamp);
         let key;
@@ -168,7 +178,7 @@ app.get('/api/chart', async (req, res) => {
           key = date.toISOString();
         } else if (interval === '5m') {
           date.setSeconds(0, 0);
-          date.setMinutes(Math.floor(date.getSeconds() / 5) * 5);
+          date.setMinutes(Math.floor(date.getMinutes() / 5) * 5); // ✅ fixed
           key = date.toISOString();
         } else if (interval === '30m') {
           date.setSeconds(0, 0);
@@ -181,23 +191,20 @@ app.get('/api/chart', async (req, res) => {
         }
 
         if (buckets[key]) {
-          buckets[key].price = point.price; // Latest price
+          buckets[key].price = point.price;
           buckets[key].volume += point.volume;
           buckets[key].points.push(point);
         }
       }
 
-      // Fill gaps with previous price and 0 volume
       let prevPrice = null;
       aggregatedData = [];
       Object.keys(buckets).sort().forEach(key => {
         const bucket = buckets[key];
-        if (bucket.price === null && prevPrice !== null) {
-          bucket.price = prevPrice;
-        } else if (bucket.price !== null) {
-          prevPrice = bucket.price;
-        }
-        if (bucket.price !== null) { // Only include populated or filled buckets
+        if (bucket.price === null && prevPrice !== null) bucket.price = prevPrice;
+        else if (bucket.price !== null) prevPrice = bucket.price;
+
+        if (bucket.price !== null) {
           bucket.change = bucket.points.length >= 2
             ? ((bucket.points[bucket.points.length - 1].price - bucket.points[0].price) / bucket.points[0].price * 100)
             : 0;
@@ -205,15 +212,14 @@ app.get('/api/chart', async (req, res) => {
         }
       });
 
-      // Deduplicate final list
       aggregatedData = aggregatedData.filter((p, i) => i === aggregatedData.findIndex(q => q.timestamp === p.timestamp));
     } else {
-      // For D, recalculate change over entire timeframe
+      // Daily interval — recalc change over entire window
       if (data.length >= 2) {
         const firstPrice = data[0].price;
         const lastPrice = data[data.length - 1].price;
         const intervalChange = ((lastPrice - firstPrice) / firstPrice * 100) || 0;
-        data.forEach(point => point.change = intervalChange);
+        data.forEach(p => p.change = intervalChange);
       } else if (data.length === 1) {
         data[0].change = 0;
       }
@@ -221,6 +227,7 @@ app.get('/api/chart', async (req, res) => {
     }
 
     console.log(`Returning ${aggregatedData.length} points for interval ${interval}`);
+    console.log("Latest DB timestamp:", aggregatedData[aggregatedData.length - 1]?.timestamp);
     res.json(aggregatedData);
 
   } catch (err) {
@@ -232,4 +239,4 @@ app.get('/api/chart', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ BlackCoin backend running on port ${PORT}`));
