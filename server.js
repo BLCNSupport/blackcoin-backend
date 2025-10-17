@@ -56,12 +56,11 @@ async function fetchLiveData() {
     if ([point.price, point.change, point.volume].some(v => isNaN(v))) return;
 
     memoryCache.push(point);
-    const cutoffMs = Date.now() - 24*60*60*1000;
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
-
     await insertPoint(point);
 
-    // Cleanup Supabase old points
+    // Optional cleanup: keep last 7 days in memory
+    const cutoffMs = Date.now() - 7*24*60*60*1000;
+    memoryCache = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
     await supabase.from('chart_data').delete().lt('timestamp', new Date(cutoffMs).toISOString());
 
   } catch (err) {
@@ -73,22 +72,22 @@ async function fetchLiveData() {
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// API endpoint for frontend with interval aggregation
+// API endpoint for frontend
 app.get('/api/chart', async (req, res) => {
   const interval = req.query.interval || '1m';
-  const cutoffMs = Date.now() - 24*60*60*1000;
 
   try {
+    // Fetch all historical points from Supabase
     let { data, error } = await supabase
       .from('chart_data')
       .select('timestamp, price, change, volume')
-      .gte('timestamp', new Date(cutoffMs).toISOString())
       .order('timestamp', { ascending: true })
-      .limit(5000); // fetch full 24h history
+      .limit(20000); // fetch enough points for full history
 
     if (error) { console.error('Supabase fetch error:', error); data = []; }
-    if (!data?.length) data = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
+    if (!data?.length) data = memoryCache;
 
+    // Aggregate/group by interval
     const grouped = {};
     const intervalMs = {
       '1m': 60*1000,
@@ -118,15 +117,12 @@ app.get('/api/chart', async (req, res) => {
     })).sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     const latest = memoryCache[memoryCache.length-1] || points[points.length-1] || null;
-
     res.json({ points, latest });
 
   } catch (err) {
-    console.error('Error fetching chart data:', err);
-    const latest = memoryCache[memoryCache.length-1] || null;
-    res.json({ points: memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs), latest });
+    console.error(err);
+    res.json({ points: memoryCache, latest: memoryCache[memoryCache.length-1] || null });
   }
 });
 
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
-
