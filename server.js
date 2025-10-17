@@ -25,6 +25,7 @@ const MAX_POINTS = 2000;
 
 let memoryCache = [];
 
+// Insert a new tick into Supabase
 async function insertPoint(point) {
   try {
     const { data, error } = await supabase.from('chart_data').insert([point]).select();
@@ -35,6 +36,7 @@ async function insertPoint(point) {
   }
 }
 
+// Fetch latest data from Dex Screener
 async function fetchLiveData() {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`, { headers: { 'Cache-Control': 'no-cache' } });
@@ -57,7 +59,7 @@ async function fetchLiveData() {
 
     await insertPoint(point);
 
-    // Cleanup old points
+    // Cleanup Supabase old points
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
@@ -66,10 +68,11 @@ async function fetchLiveData() {
   }
 }
 
+// Start fetching
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// API endpoint
+// API endpoint for frontend
 app.get('/api/chart', async (req, res) => {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   try {
@@ -81,7 +84,7 @@ app.get('/api/chart', async (req, res) => {
 
     if (error || !data?.length) data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
 
-    const latest = data[data.length - 1];
+    const latest = memoryCache[memoryCache.length - 1]; // ensure latest tick is correct
     res.json({ points: data, latest });
   } catch (err) {
     console.error('Error fetching chart data:', err);
