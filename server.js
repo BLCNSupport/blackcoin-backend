@@ -37,7 +37,7 @@ async function insertPoint(point) {
   }
 }
 
-// Fetch latest data from Dex Screener
+// Fetch live data from Dex Screener
 async function fetchLiveData() {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`, { headers: { 'Cache-Control': 'no-cache' } });
@@ -56,8 +56,6 @@ async function fetchLiveData() {
     if ([point.price, point.change, point.volume].some(v => isNaN(v))) return;
 
     memoryCache.push(point);
-
-    // Keep last 24h in memory
     const cutoffMs = Date.now() - 24*60*60*1000;
     memoryCache = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
 
@@ -71,13 +69,13 @@ async function fetchLiveData() {
   }
 }
 
-// Start fetching
+// Start fetching live data
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// API endpoint for frontend with aggregation
+// API endpoint for frontend with interval aggregation
 app.get('/api/chart', async (req, res) => {
-  const interval = req.query.interval || '1m'; // 1m,5m,30m,1h,D
+  const interval = req.query.interval || '1m';
   const cutoffMs = Date.now() - 24*60*60*1000;
 
   try {
@@ -85,18 +83,12 @@ app.get('/api/chart', async (req, res) => {
       .from('chart_data')
       .select('timestamp, price, change, volume')
       .gte('timestamp', new Date(cutoffMs).toISOString())
-      .order('timestamp', { ascending: true });
+      .order('timestamp', { ascending: true })
+      .limit(5000); // fetch full 24h history
 
-    if (error) {
-      console.error('Supabase fetch error:', error);
-      data = [];
-    }
+    if (error) { console.error('Supabase fetch error:', error); data = []; }
+    if (!data?.length) data = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
 
-    if (!data?.length) {
-      data = memoryCache.filter(p => new Date(p.timestamp).getTime() >= cutoffMs);
-    }
-
-    // Aggregate by interval
     const grouped = {};
     const intervalMs = {
       '1m': 60*1000,
@@ -137,3 +129,4 @@ app.get('/api/chart', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+
