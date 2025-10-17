@@ -3,8 +3,12 @@ import fetch from 'node-fetch';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc.js';
 
 dotenv.config();
+dayjs.extend(utc);
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -55,12 +59,12 @@ async function fetchLiveData() {
     if ([point.price, point.change, point.volume].some(v => isNaN(v))) return;
 
     memoryCache.push(point);
-    memoryCache = memoryCache.filter(p => new Date(p.timestamp) >= new Date(Date.now() - 24 * 60 * 60 * 1000));
+    memoryCache = memoryCache.filter(p => dayjs(p.timestamp).isAfter(dayjs().subtract(24, 'hour')));
 
     await insertPoint(point);
 
     // Cleanup Supabase old points
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = dayjs().subtract(24, 'hour').toISOString();
     await supabase.from('chart_data').delete().lt('timestamp', cutoff);
 
   } catch (err) {
@@ -72,9 +76,11 @@ async function fetchLiveData() {
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// API endpoint for frontend
+// API endpoint for frontend with interval aggregation
 app.get('/api/chart', async (req, res) => {
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const interval = req.query.interval || '1m'; // 1m,5m,30m,1h,D
+  const cutoff = dayjs().subtract(24, 'hour').toISOString();
+
   try {
     let { data, error } = await supabase
       .from('chart_data')
@@ -82,15 +88,52 @@ app.get('/api/chart', async (req, res) => {
       .gte('timestamp', cutoff)
       .order('timestamp', { ascending: true });
 
-    if (error || !data?.length) data = memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
+    if (error) {
+      console.error('Supabase fetch error:', error);
+      data = [];
+    }
 
-    const latest = memoryCache[memoryCache.length - 1]; // ensure latest tick is correct
-    res.json({ points: data, latest });
-  } catch (err) {
+    if (!data?.length) data = memoryCache.filter(p => dayjs(p.timestamp).isAfter(dayjs().subtract(24, 'hour')));
+
+    // Aggregate data by interval
+    const grouped = {};
+    const intervalMs = {
+      '1m': 60*1000,
+      '5m': 5*60*1000,
+      '30m': 30*60*1000,
+      '1h': 60*60*1000,
+      'D': 24*60*60*1000
+    }[interval] || 60*1000;
+
+    data.forEach(p => {
+      const t = new Date(p.timestamp).getTime();
+      const bucket = Math.floor(t / intervalMs) * intervalMs;
+      if (!grouped[bucket]) grouped[bucket] = { price: p.price, change: p.change, volume: p.volume, count: 1 };
+      else {
+        grouped[bucket].price = (grouped[bucket].price * grouped[bucket].count + p.price) / (grouped[bucket].count + 1);
+        grouped[bucket].change = (grouped[bucket].change * grouped[bucket].count + p.change) / (grouped[bucket].count + 1);
+        grouped[bucket].volume += p.volume;
+        grouped[bucket].count += 1;
+      }
+    });
+
+    const points = Object.keys(grouped).map(ts => ({
+      timestamp: new Date(parseInt(ts)).toISOString(),
+      price: grouped[ts].price,
+      change: grouped[ts].change,
+      volume: grouped[ts].volume
+    })).sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    const latest = memoryCache[memoryCache.length-1] || points[points.length-1] || null;
+
+    res.json({ points, latest });
+
+  } catch(err) {
     console.error('Error fetching chart data:', err);
-    const latest = memoryCache[memoryCache.length - 1];
-    res.json({ points: memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff)), latest });
+    const latest = memoryCache[memoryCache.length-1] || null;
+    res.json({ points: memoryCache.filter(p => dayjs(p.timestamp).isAfter(dayjs().subtract(24, 'hour'))), latest });
   }
 });
 
 app.listen(PORT, () => console.log(`BlackCoin backend running on port ${PORT}`));
+
