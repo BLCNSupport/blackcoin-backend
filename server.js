@@ -54,7 +54,7 @@ async function fetchLiveData() {
       volume: parseFloat(pair.volume?.h24),
     };
 
-    if ([point.price, point.change, point.volume].some(v => isNaN(v))) return;
+    if ([point.price, point.change, point.volume].some((v) => isNaN(v))) return;
     memoryCache.push(point);
     if (memoryCache.length > 10000) memoryCache.shift();
 
@@ -69,18 +69,26 @@ setInterval(fetchLiveData, FETCH_INTERVAL);
 // === Chart endpoints ===
 function bucketMs(interval) {
   switch (interval) {
-    case "1m": return 60 * 1000;
-    case "5m": return 5 * 60 * 1000;
-    case "30m": return 30 * 60 * 1000;
-    case "1h": return 60 * 60 * 1000;
-    case "D": return 24 * 60 * 60 * 1000;
-    default: return 60 * 1000;
+    case "1m":
+      return 60 * 1000;
+    case "5m":
+      return 5 * 60 * 1000;
+    case "30m":
+      return 30 * 60 * 1000;
+    case "1h":
+      return 60 * 60 * 1000;
+    case "D":
+      return 24 * 60 * 60 * 1000;
+    default:
+      return 60 * 1000;
   }
 }
 function getWindow(interval) {
   const now = Date.now();
-  if (interval === "D")  return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
-  if (interval === "1h") return new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  if (interval === "D")
+    return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+  if (interval === "1h")
+    return new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
   return new Date(now - 24 * 60 * 60 * 1000).toISOString();
 }
 function floorToBucketUTC(tsISO, interval) {
@@ -92,7 +100,9 @@ function bucketize(rows, interval) {
   const byKey = new Map();
   for (const r of rows) {
     const key = floorToBucketUTC(r.timestamp, interval).toISOString();
-    const price = +r.price, change = +r.change, vol = +r.volume;
+    const price = +r.price,
+      change = +r.change,
+      vol = +r.volume;
     if (!byKey.has(key))
       byKey.set(key, { timestamp: key, price, change, volume: 0 });
     const b = byKey.get(key);
@@ -125,7 +135,7 @@ app.get("/api/chart", async (req, res) => {
 
     const raw = data?.length
       ? data
-      : memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
+      : memoryCache.filter((p) => new Date(p.timestamp) >= new Date(cutoff));
 
     const points = bucketize(raw, interval);
     const latest = raw.length ? raw[raw.length - 1] : memoryCache.at(-1);
@@ -135,7 +145,9 @@ app.get("/api/chart", async (req, res) => {
     res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
   } catch (err) {
     console.error("Error /api/chart:", err);
-    res.status(500).json({ error: "Failed to fetch chart data", message: err.message });
+    res
+      .status(500)
+      .json({ error: "Failed to fetch chart data", message: err.message });
   }
 });
 
@@ -197,7 +209,8 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
   try {
     const { wallet } = req.body;
     const file = req.file;
-    if (!wallet || !file) return res.status(400).json({ error: "Missing fields" });
+    if (!wallet || !file)
+      return res.status(400).json({ error: "Missing fields" });
 
     const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
     const { error: uploadErr } = await supabase.storage
@@ -258,36 +271,64 @@ app.get("/api/broadcasts", async (req, res) => {
   }
 });
 
-// === 5. Log refund transaction ===
+// === 5. Log refund transaction (enhanced, with replication buffer) ===
 app.post("/api/refund", async (req, res) => {
   try {
     const { wallet, token, rent, tx, status } = req.body;
-    if (!wallet || !tx)
-      return res.status(400).json({ error: "Missing fields" });
+    if (!wallet || !tx) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
 
     const record = {
       wallet,
-      token,
-      rent,
+      token: token || "UNKNOWN",
+      rent_reclaimed: rent ?? 0,
       tx,
       status: status || "Success",
       created_at: new Date().toISOString(),
     };
-    const { error } = await supabase.from("hub_refund_history").insert([record]);
+
+    // 🧾 Insert into Supabase
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .insert([record])
+      .select();
+
     if (error) throw error;
 
-    res.json({ success: true });
+    console.log(`✅ Logged refund for ${wallet}: ${token} ${rent} SOL`);
+
+    // 🕒 Wait for Supabase replication
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // 🧩 Verify visibility
+    const { data: verifyRows, error: verifyErr } = await supabase
+      .from("hub_refund_history")
+      .select("id, wallet, tx, created_at")
+      .eq("wallet", wallet)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (verifyErr)
+      console.warn("⚠️ Verification query failed:", verifyErr.message);
+    else if (verifyRows?.length > 0)
+      console.log("🧩 Verified new refund visible:", verifyRows[0]);
+    else console.warn("⚠️ Verification: no rows yet (still syncing).");
+
+    res.json({ success: true, inserted: data });
   } catch (err) {
-    console.error("Error /api/refund:", err);
+    console.error("❌ Error inserting refund:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === 5b. Fetch refund history for a wallet ===
+// === 5b. Fetch refund history for a wallet (fresh + consistent) ===
 app.get("/api/refund-history", async (req, res) => {
   try {
     const { wallet } = req.query;
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+    res.set("Cache-Control", "no-store");
 
     const { data, error } = await supabase
       .from("hub_refund_history")
@@ -297,10 +338,10 @@ app.get("/api/refund-history", async (req, res) => {
       .limit(50);
 
     if (error) throw error;
-    res.json({ success: true, data });
+    res.json(data || []);
   } catch (err) {
     console.error("Error /api/refund-history:", err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
