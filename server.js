@@ -1,4 +1,4 @@
-// server.js — BlackCoin backend (UTC version + Operator Hub extensions)
+// server.js — BlackCoin backend (UTC version + Operator Hub extensions, DEV/MOD roles)
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -10,10 +10,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// === Supabase ===
+// === Supabase (service_role) ===
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -22,7 +22,23 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// === Chart data poller ===
+// === Role lists (DEV + placeholder MODs) ===
+const DEV_WALLET = "94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru";
+const MOD_WALLETS = [
+  "MOD_WALLET_1_PLACEHOLDER",
+  "MOD_WALLET_2_PLACEHOLDER",
+  "MOD_WALLET_3_PLACEHOLDER",
+];
+function walletRole(wallet) {
+  if (!wallet) return null;
+  if (wallet === DEV_WALLET) return "DEV";
+  if (MOD_WALLETS.includes(wallet)) return "MOD";
+  return null;
+}
+
+/* ======================================================
+   === Dex chart poller (unchanged) ===
+   ====================================================== */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 const FETCH_INTERVAL = 5000;
 let memoryCache = [];
@@ -66,29 +82,21 @@ async function fetchLiveData() {
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// === Chart endpoints ===
+// Helpers for chart API
 function bucketMs(interval) {
   switch (interval) {
-    case "1m":
-      return 60 * 1000;
-    case "5m":
-      return 5 * 60 * 1000;
-    case "30m":
-      return 30 * 60 * 1000;
-    case "1h":
-      return 60 * 60 * 1000;
-    case "D":
-      return 24 * 60 * 60 * 1000;
-    default:
-      return 60 * 1000;
+    case "1m": return 60 * 1000;
+    case "5m": return 5 * 60 * 1000;
+    case "30m": return 30 * 60 * 1000;
+    case "1h": return 60 * 60 * 1000;
+    case "D": return 24 * 60 * 60 * 1000;
+    default: return 60 * 1000;
   }
 }
 function getWindow(interval) {
   const now = Date.now();
-  if (interval === "D")
-    return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
-  if (interval === "1h")
-    return new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  if (interval === "D")  return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+  if (interval === "1h") return new Date(now - 7  * 24 * 60 * 60 * 1000).toISOString();
   return new Date(now - 24 * 60 * 60 * 1000).toISOString();
 }
 function floorToBucketUTC(tsISO, interval) {
@@ -100,9 +108,7 @@ function bucketize(rows, interval) {
   const byKey = new Map();
   for (const r of rows) {
     const key = floorToBucketUTC(r.timestamp, interval).toISOString();
-    const price = +r.price,
-      change = +r.change,
-      vol = +r.volume;
+    const price = +r.price, change = +r.change, vol = +r.volume;
     if (!byKey.has(key))
       byKey.set(key, { timestamp: key, price, change, volume: 0 });
     const b = byKey.get(key);
@@ -145,14 +151,11 @@ app.get("/api/chart", async (req, res) => {
     res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
   } catch (err) {
     console.error("Error /api/chart:", err);
-    res
-      .status(500)
-      .json({ error: "Failed to fetch chart data", message: err.message });
+    res.status(500).json({ error: "Failed to fetch chart data", message: err.message });
   }
 });
 
-// === Latest tick ===
-app.get("/api/latest", async (req, res) => {
+app.get("/api/latest", async (_req, res) => {
   try {
     let latest = memoryCache.at(-1);
     if (!latest) {
@@ -203,7 +206,7 @@ app.post("/api/profile", async (req, res) => {
   }
 });
 
-// === 2. Avatar upload ===
+// === 2. Avatar upload (storage: hub_avatars) ===
 const upload = multer({ storage: multer.memoryStorage() });
 app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
   try {
@@ -237,14 +240,26 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
   }
 });
 
-// === 3. Post new broadcast ===
+// === 3. Post new broadcast (DEV/MOD only) ===
 app.post("/api/broadcast", async (req, res) => {
   try {
-    const { wallet, message } = req.body;
+    const { wallet, message, type } = req.body || {};
     if (!wallet || !message)
       return res.status(400).json({ error: "Missing fields" });
 
-    const entry = { wallet, message, time: new Date().toISOString() };
+    const role = walletRole(wallet);
+    if (!role) {
+      return res.status(403).json({ error: "Only DEV or MOD can post." });
+    }
+
+    const entry = {
+      wallet,
+      message: String(message).slice(0, 500),
+      type: "broadcast",           // force type
+      role,                        // DEV / MOD
+      created_at: new Date().toISOString(),
+    };
+
     const { error } = await supabase.from("hub_broadcasts").insert([entry]);
     if (error) throw error;
 
@@ -255,23 +270,61 @@ app.post("/api/broadcast", async (req, res) => {
   }
 });
 
-// === 4. Fetch broadcasts (latest 50) ===
-app.get("/api/broadcasts", async (req, res) => {
+// === 3b. Delete broadcast (own posts only; DEV or MOD) ===
+app.delete("/api/broadcast/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { wallet } = req.body || {};
+    if (!id || !wallet) {
+      return res.status(400).json({ error: "Missing id or wallet" });
+    }
+    const role = walletRole(wallet);
+    if (!role) {
+      return res.status(403).json({ error: "Only DEV or MOD can delete." });
+    }
+
+    // Verify ownership (only delete own post)
+    const { data: row, error: selErr } = await supabase
+      .from("hub_broadcasts")
+      .select("id,wallet")
+      .eq("id", id)
+      .maybeSingle();
+    if (selErr) throw selErr;
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (row.wallet !== wallet) {
+      return res.status(403).json({ error: "Can only delete own broadcasts." });
+    }
+
+    const { error: delErr } = await supabase
+      .from("hub_broadcasts")
+      .delete()
+      .eq("id", id);
+    if (delErr) throw delErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error DELETE /api/broadcast/:id", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 4. Fetch broadcasts (latest 50) — optional ===
+app.get("/api/broadcasts", async (_req, res) => {
   try {
     const { data, error } = await supabase
       .from("hub_broadcasts")
       .select("*")
-      .order("time", { ascending: false })
+      .order("created_at", { ascending: false })
       .limit(50);
     if (error) throw error;
-    res.json(data);
+    res.json(data || []);
   } catch (err) {
     console.error("Error /api/broadcasts:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === 5. Log refund transaction (enhanced, with replication buffer) ===
+// === 5. Log refund transaction (same behavior) ===
 app.post("/api/refund", async (req, res) => {
   try {
     const { wallet, token, rent, tx, status } = req.body;
@@ -288,41 +341,19 @@ app.post("/api/refund", async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
-    // 🧾 Insert into Supabase
     const { data, error } = await supabase
       .from("hub_refund_history")
       .insert([record])
       .select();
 
     if (error) throw error;
-
-    console.log(`✅ Logged refund for ${wallet}: ${token} ${rent} SOL`);
-
-    // 🕒 Wait for Supabase replication
-    await new Promise((r) => setTimeout(r, 1500));
-
-    // 🧩 Verify visibility
-    const { data: verifyRows, error: verifyErr } = await supabase
-      .from("hub_refund_history")
-      .select("id, wallet, tx, created_at")
-      .eq("wallet", wallet)
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    if (verifyErr)
-      console.warn("⚠️ Verification query failed:", verifyErr.message);
-    else if (verifyRows?.length > 0)
-      console.log("🧩 Verified new refund visible:", verifyRows[0]);
-    else console.warn("⚠️ Verification: no rows yet (still syncing).");
-
     res.json({ success: true, inserted: data });
   } catch (err) {
-    console.error("❌ Error inserting refund:", err);
+    console.error("Error inserting refund:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === 5b. Fetch refund history for a wallet (fresh + consistent) ===
 app.get("/api/refund-history", async (req, res) => {
   try {
     const { wallet } = req.query;
@@ -345,7 +376,7 @@ app.get("/api/refund-history", async (req, res) => {
   }
 });
 
-// === 6. Fetch wallet summary (placeholder) ===
+// === 6. Wallet summary (placeholder) ===
 app.get("/api/wallet", async (req, res) => {
   try {
     const addr = req.query.addr;
@@ -362,8 +393,6 @@ app.get("/api/wallet", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-/* ====================================================== */
 
 app.listen(PORT, () =>
   console.log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
