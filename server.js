@@ -1,46 +1,423 @@
-// server.js — BlackCoin backend (UTC version + Operator Hub extensions, DEV/MOD roles)
+/**
+ * server.js — BlackCoin Shared Backend (Full Featured)
+ * FINAL RULES ENFORCED
+ * - Broadcasts: DEV/MOD can post; regular users read-only
+ * - No delete endpoint; deletions are manual in Supabase and stream to clients via SSE
+ * - Realtime SSE: /api/realtime (INSERT + DELETE on hub_broadcasts)
+ * - Profiles: avatar + handle saved; avatar uploaded to Supabase Storage (hub_avatars)
+ * - Wallet helpers: balances (SOL + SPL), refund scan/claim placeholder
+ * - Charts: live poller + /api/chart + /api/latest
+ *
+ * Tables used:
+ *   hub_profiles (wallet TEXT PK, handle TEXT, avatar_url TEXT, updated_at TIMESTAMPTZ)
+ *   hub_broadcasts (id BIGINT IDENTITY PK, wallet TEXT, message TEXT, time TIMESTAMPTZ)
+ *   hub_refund_history (id BIGINT IDENTITY PK, wallet TEXT, token TEXT, rent_reclaimed NUMERIC, tx TEXT, status TEXT, created_at TIMESTAMPTZ)
+ *
+ * Storage bucket:
+ *   hub_avatars  (public read)
+ */
+
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
+import fetchOrig from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+// ---------- Middleware ----------
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
 
-// === Supabase (service_role) ===
+// Multer for avatar uploads
+const upload = multer({ storage: multer.memoryStorage() });
+
+// ---------- Env & Supabase ----------
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("SUPABASE_URL or SUPABASE_KEY missing");
+const SUPABASE_SERVICE_ROLE =
+  process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_KEY; // support either name
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE");
   process.exit(1);
 }
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// === Role lists (DEV + placeholder MODs) ===
-const DEV_WALLET = "94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru";
-const MOD_WALLETS = [
-  "MOD_WALLET_1_PLACEHOLDER",
-  "MOD_WALLET_2_PLACEHOLDER",
-  "MOD_WALLET_3_PLACEHOLDER",
-];
-function walletRole(wallet) {
-  if (!wallet) return null;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+  auth: { persistSession: false },
+  global: { fetch: fetchOrig }
+});
+
+// Table/bucket names (fixed to your schema)
+const T_PROFILES = "hub_profiles";
+const T_BROADCASTS = "hub_broadcasts";
+const T_REFUNDS = "hub_refund_history";
+const AVATAR_BUCKET = "hub_avatars";
+
+// Roles (server-side enforcement)
+const DEV_WALLET =
+  process.env.DEV_WALLET || "94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru";
+const MOD_WALLETS = (process.env.MOD_WALLETS ||
+  "ModWallet1111111111111111111111111111111111111111,ModWallet2222222222222222222222222222222222222222,ModWallet3333333333333333333333333333333333333333").split(",");
+
+function roleOf(wallet) {
+  if (!wallet) return "USER";
   if (wallet === DEV_WALLET) return "DEV";
   if (MOD_WALLETS.includes(wallet)) return "MOD";
-  return null;
+  return "USER";
+}
+function ensureCanPost(wallet) {
+  const r = roleOf(wallet);
+  if (r === "DEV" || r === "MOD") return r;
+  const e = new Error("Forbidden: read-only");
+  e.status = 403;
+  throw e;
 }
 
+// Small health endpoint (optional)
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
 /* ======================================================
-   === Dex chart poller (unchanged) ===
+   =============  Broadcasts (FINAL RULES)  =============
    ====================================================== */
-const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-const FETCH_INTERVAL = 5000;
+
+// GET broadcasts — oldest → newest, enriched with profile and role
+app.get("/api/broadcasts", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from(T_BROADCASTS)
+      .select("*")
+      .order("time", { ascending: true })
+      .limit(300);
+    if (error) throw error;
+
+    const wallets = Array.from(
+      new Set((data || []).map((r) => r.wallet).filter(Boolean))
+    );
+    let profiles = [];
+    if (wallets.length) {
+      const { data: profs, error: pErr } = await supabase
+        .from(T_PROFILES)
+        .select("wallet, handle, avatar_url")
+        .in("wallet", wallets);
+      if (pErr) throw pErr;
+      profiles = profs || [];
+    }
+    const byWallet = new Map(profiles.map((p) => [p.wallet, p]));
+    const rows = (data || []).map((row) => ({
+      ...row,
+      handle: byWallet.get(row.wallet)?.handle || row.handle || "@Operator",
+      avatar_url: byWallet.get(row.wallet)?.avatar_url || row.avatar_url || null,
+      role: roleOf(row.wallet),
+      type: "broadcast"
+    }));
+
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /api/broadcasts error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST broadcast — server-side role enforcement; no delete endpoint exists
+app.post("/api/broadcasts", async (req, res) => {
+  try {
+    const { wallet, message } = req.body || {};
+    if (!wallet || !message)
+      return res.status(400).json({ error: "Missing wallet or message" });
+
+    ensureCanPost(wallet);
+
+    const entry = {
+      wallet,
+      message,
+      time: new Date().toISOString()
+      // type: 'broadcast'  // not needed in DB; we add at read-time
+    };
+    const { error } = await supabase.from(T_BROADCASTS).insert([entry]);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/broadcasts error:", err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// Legacy compatibility
+app.post("/api/broadcast", async (req, res) => {
+  try {
+    const { wallet, message } = req.body || {};
+    if (!wallet || !message)
+      return res.status(400).json({ error: "Missing wallet or message" });
+    ensureCanPost(wallet);
+    const entry = { wallet, message, time: new Date().toISOString() };
+    const { error } = await supabase.from(T_BROADCASTS).insert([entry]);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/broadcast error:", err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   =====================  Profiles  =====================
+   ====================================================== */
+
+// Save/Update profile (handle + avatar_url)
+app.post("/api/profile", async (req, res) => {
+  try {
+    const { wallet, handle, avatar_url } = req.body || {};
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+    const up = {
+      wallet,
+      handle: handle ?? null,
+      avatar_url: avatar_url ?? null,
+      updated_at: new Date().toISOString()
+    };
+
+    const { error } = await supabase
+      .from(T_PROFILES)
+      .upsert(up, { onConflict: "wallet" });
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Avatar upload to Supabase Storage (hub_avatars)
+app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
+  try {
+    const file = req.file;
+    const wallet = req.body?.wallet;
+    if (!file || !wallet)
+      return res.status(400).json({ error: "Missing avatar or wallet" });
+
+    const ext = (file.originalname.split(".").pop() || "jpg").toLowerCase();
+    const filePath = `${wallet}/${Date.now()}.${ext}`;
+
+    const { error: upErr } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(filePath, file.buffer, {
+        upsert: true,
+        contentType: file.mimetype
+      });
+    if (upErr) throw upErr;
+
+    const { data: pub } = supabase.storage
+      .from(AVATAR_BUCKET)
+      .getPublicUrl(filePath);
+
+    // Save to profile
+    await supabase
+      .from(T_PROFILES)
+      .upsert({ wallet, avatar_url: pub.publicUrl, updated_at: new Date().toISOString() }, { onConflict: "wallet" });
+
+    res.json({ ok: true, url: pub.publicUrl });
+  } catch (err) {
+    console.error("POST /api/avatar-upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   =====================  SSE Realtime  =================
+   Streams INSERT + DELETE on hub_broadcasts.
+   ====================================================== */
+
+const sseClients = new Set();
+
+app.get("/api/realtime", async (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+  res.write("\n");
+  sseClients.add(res);
+  req.on("close", () => sseClients.delete(res));
+});
+
+// Subscribe once for the whole server
+const channel = supabase
+  .channel("realtime-broadcasts")
+  .on(
+    "postgres_changes",
+    { event: "INSERT", schema: "public", table: T_BROADCASTS },
+    (payload) => {
+      const out = JSON.stringify({
+        type: "INSERT",
+        new: {
+          ...payload.new,
+          role: roleOf(payload.new.wallet),
+          type: "broadcast"
+        }
+      });
+      for (const c of sseClients) c.write(`data: ${out}\n\n`);
+    }
+  )
+  .on(
+    "postgres_changes",
+    { event: "DELETE", schema: "public", table: T_BROADCASTS },
+    (payload) => {
+      const out = JSON.stringify({ type: "DELETE", old: payload.old });
+      for (const c of sseClients) c.write(`data: ${out}\n\n`);
+    }
+  )
+  .subscribe((status) => console.log("Realtime status:", status));
+
+/* ======================================================
+   =====================  Wallet/Refund  =================
+   ====================================================== */
+
+const HELIUS_KEY = process.env.HELIUS_KEY || "";
+const RPC_URL =
+  process.env.RPC_URL ||
+  (HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}` : "");
+
+app.get("/api/wallet/:addr/balances", async (req, res) => {
+  const addr = req.params.addr;
+  if (!addr || !RPC_URL)
+    return res.status(400).json({ error: "Missing addr or RPC_URL" });
+  try {
+    // SOL balance
+    const bal = await fetchOrig(RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getBalance",
+        params: [addr]
+      })
+    }).then((r) => r.json());
+    const lamports = bal?.result?.value ?? 0;
+    const sol = (lamports / 1_000_000_000).toFixed(4);
+
+    // SPL accounts
+    const tok = await fetchOrig(RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "getTokenAccountsByOwner",
+        params: [
+          addr,
+          { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
+          { encoding: "jsonParsed" }
+        ]
+      })
+    }).then((r) => r.json());
+
+    const spl_tokens = (tok?.result?.value || []).map((v) => {
+      const info = v?.account?.data?.parsed?.info;
+      const mint = info?.mint;
+      const ata = v?.pubkey;
+      const amount = info?.tokenAmount?.uiAmount || 0;
+      return { mint, ata, amount };
+    });
+
+    res.json({ sol, spl_tokens });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "RPC failed" });
+  }
+});
+
+// Refund scan: list zero-balance ATAs (rent reclaim candidates)
+app.post("/api/refund/scan", async (req, res) => {
+  const { wallet } = req.body || {};
+  if (!wallet || !RPC_URL)
+    return res.status(400).json({ error: "Missing wallet or RPC_URL" });
+  try {
+    const tok = await fetchOrig(RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "getTokenAccountsByOwner",
+        params: [
+          wallet,
+          { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
+          { encoding: "jsonParsed" }
+        ]
+      })
+    }).then((r) => r.json());
+
+    const accounts = [];
+    for (const v of tok?.result?.value || []) {
+      const info = v?.account?.data?.parsed?.info;
+      const amount = info?.tokenAmount?.uiAmount || 0;
+      if (amount === 0) {
+        const rentLamports = 2039280; // typical ATA rent; may vary
+        accounts.push({
+          mint: info?.mint,
+          ata: v?.pubkey,
+          balance: 0,
+          rent_sol: (rentLamports / 1_000_000_000).toFixed(6)
+        });
+      }
+    }
+    res.json({ accounts });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "scan failed" });
+  }
+});
+
+// Refund claim placeholder: user signs client-side
+app.post("/api/refund/claim", async (req, res) => {
+  const { wallet, atas } = req.body || {};
+  if (!wallet || !Array.isArray(atas))
+    return res
+      .status(400)
+      .json({ error: "wallet and atas[] required" });
+  res.json({
+    ok: true,
+    message:
+      "Construct and sign closeAccount transactions client-side. Placeholder endpoint."
+  });
+});
+
+// Log a refund result (kept for your history table)
+app.post("/api/refund", async (req, res) => {
+  try {
+    const { wallet, token, rent, tx, status } = req.body || {};
+    if (!wallet || !tx)
+      return res.status(400).json({ error: "Missing wallet or tx" });
+
+    const record = {
+      wallet,
+      token: token || "UNKNOWN",
+      rent_reclaimed: rent ?? 0,
+      tx,
+      status: status || "Success",
+      created_at: new Date().toISOString()
+    };
+    const { data, error } = await supabase.from(T_REFUNDS).insert([record]).select();
+    if (error) throw error;
+    res.json({ success: true, inserted: data });
+  } catch (err) {
+    console.error("POST /api/refund error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   =======================  Charts  ======================
+   ====================================================== */
+
+const TOKEN_MINT =
+  process.env.TOKEN_MINT || "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
+const FETCH_INTERVAL = parseInt(process.env.FETCH_INTERVAL || "5000", 10);
 let memoryCache = [];
 
 async function insertPoint(point) {
@@ -51,10 +428,9 @@ async function insertPoint(point) {
     console.error("Supabase insert exception:", err);
   }
 }
-
 async function fetchLiveData() {
   try {
-    const res = await fetch(
+    const res = await fetchOrig(
       `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,
       { headers: { "Cache-Control": "no-cache" } }
     );
@@ -67,13 +443,13 @@ async function fetchLiveData() {
       timestamp: new Date().toISOString(),
       price: parseFloat(pair.priceUsd),
       change: parseFloat(pair.priceChange?.h24),
-      volume: parseFloat(pair.volume?.h24),
+      volume: parseFloat(pair.volume?.h24)
     };
+    if ([point.price, point.change, point.volume].some((v) => isNaN(v)))
+      return;
 
-    if ([point.price, point.change, point.volume].some((v) => isNaN(v))) return;
     memoryCache.push(point);
     if (memoryCache.length > 10000) memoryCache.shift();
-
     await insertPoint(point);
   } catch (err) {
     console.error("fetchLiveData failed:", err);
@@ -82,22 +458,27 @@ async function fetchLiveData() {
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// Helpers for chart API
 function bucketMs(interval) {
   switch (interval) {
-    case "1m": return 60 * 1000;
-    case "5m": return 5 * 60 * 1000;
-    case "30m": return 30 * 60 * 1000;
-    case "1h": return 60 * 60 * 1000;
-    case "D": return 24 * 60 * 60 * 1000;
-    default: return 60 * 1000;
+    case "1m":
+      return 60_000;
+    case "5m":
+      return 300_000;
+    case "30m":
+      return 1_800_000;
+    case "1h":
+      return 3_600_000;
+    case "D":
+      return 86_400_000;
+    default:
+      return 60_000;
   }
 }
 function getWindow(interval) {
   const now = Date.now();
-  if (interval === "D")  return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
-  if (interval === "1h") return new Date(now - 7  * 24 * 60 * 60 * 1000).toISOString();
-  return new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  if (interval === "D") return new Date(now - 30 * 86_400_000).toISOString();
+  if (interval === "1h") return new Date(now - 7 * 86_400_000).toISOString();
+  return new Date(now - 86_400_000).toISOString();
 }
 function floorToBucketUTC(tsISO, interval) {
   const ms = bucketMs(interval);
@@ -108,9 +489,10 @@ function bucketize(rows, interval) {
   const byKey = new Map();
   for (const r of rows) {
     const key = floorToBucketUTC(r.timestamp, interval).toISOString();
-    const price = +r.price, change = +r.change, vol = +r.volume;
-    if (!byKey.has(key))
-      byKey.set(key, { timestamp: key, price, change, volume: 0 });
+    const price = +r.price,
+      change = +r.change,
+      vol = +r.volume;
+    if (!byKey.has(key)) byKey.set(key, { timestamp: key, price, change, volume: 0 });
     const b = byKey.get(key);
     b.price = price;
     b.change = change;
@@ -121,7 +503,6 @@ function bucketize(rows, interval) {
   );
 }
 
-// === Chart API ===
 app.get("/api/chart", async (req, res) => {
   try {
     const interval = req.query.interval || "D";
@@ -136,7 +517,6 @@ app.get("/api/chart", async (req, res) => {
       .gte("timestamp", cutoff)
       .order("timestamp", { ascending: true })
       .range(offset, offset + limit - 1);
-
     if (error) throw error;
 
     const raw = data?.length
@@ -150,12 +530,14 @@ app.get("/api/chart", async (req, res) => {
 
     res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
   } catch (err) {
-    console.error("Error /api/chart:", err);
-    res.status(500).json({ error: "Failed to fetch chart data", message: err.message });
+    console.error("GET /api/chart error:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch chart data", message: err.message });
   }
 });
 
-app.get("/api/latest", async (_req, res) => {
+app.get("/api/latest", async (req, res) => {
   try {
     let latest = memoryCache.at(-1);
     if (!latest) {
@@ -170,230 +552,15 @@ app.get("/api/latest", async (_req, res) => {
     if (!latest) return res.status(404).json({ error: "No data" });
     res.json(latest);
   } catch (err) {
-    console.error("Error /api/latest:", err);
+    console.error("GET /api/latest error:", err);
     res.status(500).json({ error: "Failed" });
   }
 });
 
 /* ======================================================
-   === Operator Hub / Terminal API Extensions ===
+   =======================  Start  ======================
    ====================================================== */
 
-// === 1. Save or update user profile ===
-app.post("/api/profile", async (req, res) => {
-  try {
-    const { wallet, handle, avatar_url } = req.body;
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-
-    const { data, error } = await supabase
-      .from("hub_profiles")
-      .upsert(
-        {
-          wallet,
-          handle: handle || "@Operator",
-          avatar_url: avatar_url || null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "wallet" }
-      )
-      .select();
-
-    if (error) throw error;
-    res.json({ success: true, data });
-  } catch (err) {
-    console.error("Error /api/profile:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 2. Avatar upload (storage: hub_avatars) ===
-const upload = multer({ storage: multer.memoryStorage() });
-app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
-  try {
-    const { wallet } = req.body;
-    const file = req.file;
-    if (!wallet || !file)
-      return res.status(400).json({ error: "Missing fields" });
-
-    const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
-    const { error: uploadErr } = await supabase.storage
-      .from("hub_avatars")
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: true,
-      });
-    if (uploadErr) throw uploadErr;
-
-    const { data: publicURL } = supabase.storage
-      .from("hub_avatars")
-      .getPublicUrl(fileName);
-
-    await supabase
-      .from("hub_profiles")
-      .update({ avatar_url: publicURL.publicUrl })
-      .eq("wallet", wallet);
-
-    res.json({ success: true, url: publicURL.publicUrl });
-  } catch (err) {
-    console.error("Error /api/avatar-upload:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 3. Post new broadcast (DEV/MOD only) ===
-app.post("/api/broadcast", async (req, res) => {
-  try {
-    const { wallet, message, type } = req.body || {};
-    if (!wallet || !message)
-      return res.status(400).json({ error: "Missing fields" });
-
-    const role = walletRole(wallet);
-    if (!role) {
-      return res.status(403).json({ error: "Only DEV or MOD can post." });
-    }
-
-    const entry = {
-      wallet,
-      message: String(message).slice(0, 500),
-      type: "broadcast",           // force type
-      role,                        // DEV / MOD
-      created_at: new Date().toISOString(),
-    };
-
-    const { error } = await supabase.from("hub_broadcasts").insert([entry]);
-    if (error) throw error;
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Error /api/broadcast:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 3b. Delete broadcast (own posts only; DEV or MOD) ===
-app.delete("/api/broadcast/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { wallet } = req.body || {};
-    if (!id || !wallet) {
-      return res.status(400).json({ error: "Missing id or wallet" });
-    }
-    const role = walletRole(wallet);
-    if (!role) {
-      return res.status(403).json({ error: "Only DEV or MOD can delete." });
-    }
-
-    // Verify ownership (only delete own post)
-    const { data: row, error: selErr } = await supabase
-      .from("hub_broadcasts")
-      .select("id,wallet")
-      .eq("id", id)
-      .maybeSingle();
-    if (selErr) throw selErr;
-    if (!row) return res.status(404).json({ error: "Not found" });
-    if (row.wallet !== wallet) {
-      return res.status(403).json({ error: "Can only delete own broadcasts." });
-    }
-
-    const { error: delErr } = await supabase
-      .from("hub_broadcasts")
-      .delete()
-      .eq("id", id);
-    if (delErr) throw delErr;
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Error DELETE /api/broadcast/:id", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 4. Fetch broadcasts (latest 50) — optional ===
-app.get("/api/broadcasts", async (_req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("hub_broadcasts")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(50);
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    console.error("Error /api/broadcasts:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 5. Log refund transaction (same behavior) ===
-app.post("/api/refund", async (req, res) => {
-  try {
-    const { wallet, token, rent, tx, status } = req.body;
-    if (!wallet || !tx) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    const record = {
-      wallet,
-      token: token || "UNKNOWN",
-      rent_reclaimed: rent ?? 0,
-      tx,
-      status: status || "Success",
-      created_at: new Date().toISOString(),
-    };
-
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .insert([record])
-      .select();
-
-    if (error) throw error;
-    res.json({ success: true, inserted: data });
-  } catch (err) {
-    console.error("Error inserting refund:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/refund-history", async (req, res) => {
-  try {
-    const { wallet } = req.query;
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-
-    res.set("Cache-Control", "no-store");
-
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .select("*")
-      .eq("wallet", wallet)
-      .order("created_at", { ascending: false })
-      .limit(50);
-
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    console.error("Error /api/refund-history:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === 6. Wallet summary (placeholder) ===
-app.get("/api/wallet", async (req, res) => {
-  try {
-    const addr = req.query.addr;
-    if (!addr) return res.status(400).json({ error: "Missing addr" });
-    res.json({
-      address: addr,
-      balances: [
-        { name: "SOL", amount: 12.34, value: 12.34 * 305 },
-        { name: "BlackCoin", amount: 1000000, value: 187.5 },
-      ],
-    });
-  } catch (err) {
-    console.error("Error /api/wallet:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.listen(PORT, () =>
-  console.log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
+  console.log(`✅ BlackCoin Server (Full Featured) running on :${PORT}`)
 );
