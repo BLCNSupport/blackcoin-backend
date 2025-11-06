@@ -1,87 +1,26 @@
-javascript
+// server.js — BlackCoin backend (UTC version + Operator Hub extensions)
+import express from "express";
+import fetch from "node-fetch";
+import cors from "cors";
+import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
+import multer from "multer";
 
-/* server.js — BlackCoin Operator Hub API (Render-ready)
-   -------------------------------------------------------------
-   Endpoints:
-   - GET  /api/health
-   - GET  /api/can-post?wallet=...
-   - GET  /api/broadcast?limit=100
-   - POST /api/broadcast              (DEV-only)
-   - POST /api/profile                (upsert hub_profiles)
-   - POST /api/avatar-upload          (upload to Storage bucket: hub_avatars)
-   - GET  /api/chart?interval=D&page=1&limit=10000
-   - GET  /api/latest
-   - POST /api/refund
-   - GET  /api/refund-history?wallet=...
-   - GET  /api/wallet?addr=...
-
-   Env required (Render → Environment Variables):
-   - PORT (auto on Render)
-   - SUPABASE_URL=https://filozevjygowqajmqznc.supabase.co
-   - SUPABASE_SERVICE_ROLE=<your service role key>
-   - DEV_WALLET=94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru
-   - MOD_WALLETS= (optional, comma-separated)
-*/
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-const multer = require('multer');
-const crypto = require('crypto');
-const path = require('path');
-const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch');
-
-// ----------- Config -----------
+dotenv.config();
+const app = express();
 const PORT = process.env.PORT || 3000;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
-const DEV_WALLET = (process.env.DEV_WALLET || '').trim();
-const MOD_WALLETS = (process.env.MOD_WALLETS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
 
-// Fail fast on missing env:
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  console.error('[FATAL] SUPABASE_URL and SUPABASE_SERVICE_ROLE are required env vars.');
+app.use(cors());
+app.use(express.json());
+
+// === Supabase ===
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("SUPABASE_URL or SUPABASE_KEY missing");
   process.exit(1);
 }
-
-// Supabase (Service Role for secure writes from server)
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
-
-// Express app
-const app = express();
-app.set('trust proxy', true);
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan('tiny'));
-
-// Memory storage for multer (we push the buffer to Supabase Storage)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
-
-// ----------- Helpers -----------
-function isDev(wallet) {
-  return wallet && DEV_WALLET && wallet === DEV_WALLET;
-}
-function isMod(wallet) {
-  return wallet && MOD_WALLETS.includes(wallet);
-}
-function roleOf(wallet) {
-  if (isDev(wallet)) return 'DEV';
-  if (isMod(wallet)) return 'MOD';
-  return null;
-}
-function safeStr(x, max = 2000) {
-  if (typeof x !== 'string') return '';
-  return x.slice(0, max).trim();
-}
-function uniqueKey(prefix) {
-  const ts = Date.now();
-  const rand = crypto.randomBytes(6).toString('hex');
-  return `${prefix}/${ts}-${rand}`;
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // === Chart data poller ===
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
@@ -127,7 +66,7 @@ async function fetchLiveData() {
 fetchLiveData();
 setInterval(fetchLiveData, FETCH_INTERVAL);
 
-// === Chart helpers ===
+// === Chart endpoints ===
 function bucketMs(interval) {
   switch (interval) {
     case "1m":
@@ -175,140 +114,6 @@ function bucketize(rows, interval) {
     (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
   );
 }
-
-// ----------- Routes -----------
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'BlackCoin Operator Hub API', time: new Date().toISOString() });
-});
-
-// Can the given wallet post?
-app.get('/api/can-post', (req, res) => {
-  const wallet = safeStr(req.query.wallet || '', 128);
-  const role = roleOf(wallet);
-  // As per spec: posting is DEV-only (even though MOD role exists we return canPost=false for MOD)
-  const canPost = role === 'DEV';
-  return res.json({ wallet, role, canPost });
-});
-
-// Fetch broadcasts
-app.get('/api/broadcast', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 300);
-  try {
-    const { data, error } = await supabase
-      .from('hub_broadcasts')
-      .select('*')
-      .order('created_at', { ascending: false }) // Changed to descending to match old behavior
-      .limit(limit);
-
-    if (error) throw error;
-    res.json({ ok: true, rows: data || [] });
-  } catch (e) {
-    console.error('[broadcast:list] error', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// Create broadcast — DEV only
-app.post('/api/broadcast', async (req, res) => {
-  try {
-    const wallet = safeStr(req.body.wallet || '', 128);
-    const message = safeStr(req.body.message || '', 2000);
-    const type = safeStr(req.body.type || 'broadcast', 32) || 'broadcast';
-
-    if (!wallet || !message) {
-      return res.status(400).json({ ok: false, error: 'wallet and message are required' });
-    }
-    if (!isDev(wallet)) {
-      return res.status(403).json({ ok: false, error: 'Only DEV wallet may post broadcasts.' });
-    }
-
-    const row = {
-      wallet,
-      message,
-      role: 'DEV',
-      type,
-      created_at: new Date().toISOString(),
-    };
-
-    const { data, error } = await supabase.from('hub_broadcasts').insert(row).select().single();
-    if (error) throw error;
-
-    res.json({ ok: true, row: data });
-  } catch (e) {
-    console.error('[broadcast:create] error', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// Upsert profile (wallet, handle, optional avatar_url)
-app.post('/api/profile', async (req, res) => {
-  try {
-    const wallet = safeStr(req.body.wallet || '', 128);
-    const handle = safeStr(req.body.handle || '', 64);
-    const avatar_url = safeStr(req.body.avatar_url || '', 1024);
-
-    if (!wallet) {
-      return res.status(400).json({ ok: false, error: 'wallet is required' });
-    }
-
-    const patch = {
-      wallet,
-      updated_at: new Date().toISOString(),
-    };
-    if (handle) patch.handle = handle;
-    if (avatar_url) patch.avatar_url = avatar_url;
-
-    const { data, error } = await supabase
-      .from('hub_profiles')
-      .upsert(patch, { onConflict: 'wallet' })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ ok: true, row: data });
-  } catch (e) {
-    console.error('[profile:upsert] error', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// Avatar upload → Supabase Storage (bucket: hub_avatars) then update profile
-app.post('/api/avatar-upload', upload.single('avatar'), async (req, res) => {
-  try {
-    const wallet = safeStr(req.body.wallet || '', 128);
-    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet is required' });
-    if (!req.file) return res.status(400).json({ ok: false, error: 'avatar file is required' });
-
-    const ext = path.extname(req.file.originalname || '').toLowerCase() || '.png';
-    const key = uniqueKey(wallet) + ext; // e.g., <wallet>/<ts>-<rand>.png
-
-    // Upload to Storage
-    const { data: up, error: upErr } = await supabase.storage
-      .from('hub_avatars')
-      .upload(key, req.file.buffer, {
-        contentType: req.file.mimetype || 'image/png',
-        upsert: true,
-      });
-    if (upErr) throw upErr;
-
-    // Build a public URL (bucket must be public; otherwise use signed URL)
-    const { data: pub } = supabase.storage.from('hub_avatars').getPublicUrl(up.path);
-    const avatar_url = pub?.publicUrl;
-
-    // Update profile with avatar_url
-    const { data: profile, error: pErr } = await supabase
-      .from('hub_profiles')
-      .upsert({ wallet, avatar_url, updated_at: new Date().toISOString() }, { onConflict: 'wallet' })
-      .select()
-      .single();
-    if (pErr) throw pErr;
-
-    res.json({ ok: true, url: avatar_url, row: profile });
-  } catch (e) {
-    console.error('[avatar-upload] error', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
 
 // === Chart API ===
 app.get("/api/chart", async (req, res) => {
@@ -367,12 +172,111 @@ app.get("/api/latest", async (req, res) => {
   }
 });
 
-// === Log refund transaction (enhanced, with replication buffer) ===
+/* ======================================================
+   === Operator Hub / Terminal API Extensions ===
+   ====================================================== */
+
+// === 1. Save or update user profile ===
+app.post("/api/profile", async (req, res) => {
+  try {
+    const { wallet, handle, avatar_url } = req.body;
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+    const { data, error } = await supabase
+      .from("hub_profiles")
+      .upsert(
+        {
+          wallet,
+          handle: handle || "@Operator",
+          avatar_url: avatar_url || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "wallet" }
+      )
+      .select();
+
+    if (error) throw error;
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("Error /api/profile:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 2. Avatar upload ===
+const upload = multer({ storage: multer.memoryStorage() });
+app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
+  try {
+    const { wallet } = req.body;
+    const file = req.file;
+    if (!wallet || !file)
+      return res.status(400).json({ error: "Missing fields" });
+
+    const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
+    const { error: uploadErr } = await supabase.storage
+      .from("hub_avatars")
+      .upload(fileName, file.buffer, {
+        contentType: file.mimetype,
+        upsert: true,
+      });
+    if (uploadErr) throw uploadErr;
+
+    const { data: publicURL } = supabase.storage
+      .from("hub_avatars")
+      .getPublicUrl(fileName);
+
+    await supabase
+      .from("hub_profiles")
+      .update({ avatar_url: publicURL.publicUrl })
+      .eq("wallet", wallet);
+
+    res.json({ success: true, url: publicURL.publicUrl });
+  } catch (err) {
+    console.error("Error /api/avatar-upload:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 3. Post new broadcast ===
+app.post("/api/broadcast", async (req, res) => {
+  try {
+    const { wallet, message } = req.body;
+    if (!wallet || !message)
+      return res.status(400).json({ error: "Missing fields" });
+
+    const entry = { wallet, message, time: new Date().toISOString() };
+    const { error } = await supabase.from("hub_broadcasts").insert([entry]);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error /api/broadcast:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 4. Fetch broadcasts (latest 50) ===
+app.get("/api/broadcasts", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("*")
+      .order("time", { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error /api/broadcasts:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 5. Log refund transaction (enhanced, with replication buffer) ===
 app.post("/api/refund", async (req, res) => {
   try {
     const { wallet, token, rent, tx, status } = req.body;
     if (!wallet || !tx) {
-      return res.status(400).json({ ok: false, error: "Missing required fields" });
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
     const record = {
@@ -411,18 +315,18 @@ app.post("/api/refund", async (req, res) => {
       console.log("🧩 Verified new refund visible:", verifyRows[0]);
     else console.warn("⚠️ Verification: no rows yet (still syncing).");
 
-    res.json({ ok: true, inserted: data });
+    res.json({ success: true, inserted: data });
   } catch (err) {
     console.error("❌ Error inserting refund:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// === Fetch refund history for a wallet (fresh + consistent) ===
+// === 5b. Fetch refund history for a wallet (fresh + consistent) ===
 app.get("/api/refund-history", async (req, res) => {
   try {
     const { wallet } = req.query;
-    if (!wallet) return res.status(400).json({ ok: false, error: "Missing wallet" });
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
     res.set("Cache-Control", "no-store");
 
@@ -437,15 +341,15 @@ app.get("/api/refund-history", async (req, res) => {
     res.json(data || []);
   } catch (err) {
     console.error("Error /api/refund-history:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// === Fetch wallet summary (placeholder) ===
+// === 6. Fetch wallet summary (placeholder) ===
 app.get("/api/wallet", async (req, res) => {
   try {
     const addr = req.query.addr;
-    if (!addr) return res.status(400).json({ ok: false, error: "Missing addr" });
+    if (!addr) return res.status(400).json({ error: "Missing addr" });
     res.json({
       address: addr,
       balances: [
@@ -455,19 +359,12 @@ app.get("/api/wallet", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/wallet:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Root
-app.get('/', (_req, res) => {
-  res.type('text/plain').send('BlackCoin Operator Hub API is running.');
-});
+/* ====================================================== */
 
-// Start
-app.listen(PORT, () => {
-  console.log(`[server] listening on :${PORT}`);
-  console.log(`- DEV wallet: ${DEV_WALLET || '(not set)'}`);
-  console.log(`- MOD wallets: ${MOD_WALLETS.join(', ') || '(none)'}`);
-});
-
+app.listen(PORT, () =>
+  console.log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
+);
