@@ -141,6 +141,117 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
   }catch(e){ err("Error /api/avatar-upload:",e); res.status(500).json({error:e.message}); }
 });
 
+/* ---------- Balances (Helius Enhanced + prices) ---------- */
+const HELIUS_KEY = process.env.HELIUS_API_KEY;
+if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
+
+const DEX_PRICE_CACHE = new Map(); // mint -> {priceUsd, ts}
+const SOL_PRICE_CACHE = { priceUsd: null, ts: 0 };
+const PRICE_TTL_MS = 25_000;
+
+async function getSolUsd() {
+  const now = Date.now();
+  if (SOL_PRICE_CACHE.priceUsd && (now - SOL_PRICE_CACHE.ts) < PRICE_TTL_MS) {
+    return SOL_PRICE_CACHE.priceUsd;
+  }
+  try {
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { headers: { "Cache-Control": "no-cache" }});
+    const j = await r.json();
+    const p = Number(j?.solana?.usd) || 0;
+    if (p > 0) {
+      SOL_PRICE_CACHE.priceUsd = p;
+      SOL_PRICE_CACHE.ts = now;
+      return p;
+    }
+  } catch {}
+  return SOL_PRICE_CACHE.priceUsd ?? 0;
+}
+
+async function getTokenUsd(mint) {
+  const now = Date.now();
+  const cached = DEX_PRICE_CACHE.get(mint);
+  if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached.priceUsd;
+
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`, { headers: { "Cache-Control": "no-cache" }});
+    const j = await r.json();
+    const price = Number(j?.pairs?.[0]?.priceUsd) || 0;
+    if (price > 0) {
+      DEX_PRICE_CACHE.set(mint, { priceUsd: price, ts: now });
+      return price;
+    }
+  } catch {}
+  return 0;
+}
+
+/**
+ * POST /api/balances
+ * body: { wallet: string }
+ * returns: {
+ *   sol: number,
+ *   solUsd: number,
+ *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd }]
+ * }
+ */
+app.post("/api/balances", async (req, res) => {
+  try {
+    const wallet = (req.body?.wallet || "").trim();
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    if (!HELIUS_KEY) return res.status(500).json({ error: "Backend missing HELIUS_API_KEY" });
+
+    const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
+    const r = await fetch(url, { headers: { "Cache-Control": "no-cache" }});
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(502).json({ error: `Helius ${r.status}`, body: t });
+    }
+    const data = await r.json();
+
+    const lamports =
+      Number(data?.nativeBalance?.lamports) ||
+      Number(data?.native?.lamports) ||
+      0;
+    const sol = lamports / 1e9;
+
+    const rawTokens =
+      Array.isArray(data?.tokens) ? data.tokens :
+      Array.isArray(data?.tokenBalances) ? data.tokenBalances :
+      [];
+
+    const tokensBase = rawTokens
+      .map(t => ({
+        mint: t.mint || t.tokenMint || "",
+        amount: Number(t.amount ?? t.uiAmount ?? 0),
+        decimals: Number(t.decimals ?? t.tokenAmount?.decimals ?? 0),
+        symbol: t.symbol || t.tokenSymbol || t.info?.symbol || "",
+        name: t.name || t.tokenName || t.info?.name || "",
+        logo: t.logo || t.image || t.info?.image || ""
+      }))
+      .filter(t => t.mint && t.amount > 0);
+
+    const solUsd = await getSolUsd();
+
+    const priced = await Promise.allSettled(tokensBase.map(async t => {
+      const priceUsd = await getTokenUsd(t.mint);
+      return { ...t, priceUsd, usd: priceUsd * t.amount };
+    }));
+
+    const tokens = priced
+      .map(p => p.status === "fulfilled" ? p.value : null)
+      .filter(Boolean)
+      .sort((a, b) => (b.usd || 0) - (a.usd || 0));
+
+    res.json({
+      sol,
+      solUsd,
+      tokens
+    });
+  } catch (e) {
+    err("Error /api/balances:", e);
+    res.status(500).json({ error: e.message || "Failed to load balances" });
+  }
+});
+
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso)=>{ try{ const d=new Date(iso); return d.toTimeString().slice(0,5);}catch{return "";} };
 
