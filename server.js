@@ -7,6 +7,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
+import http from "http";
+import { WebSocketServer } from "ws";
 
 dotenv.config();
 const app = express();
@@ -277,6 +279,26 @@ app.post("/api/profile", async (req, res) => {
     const { wallet, handle, avatar_url } = req.body;
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
+// === 1b. Get user profile by wallet ===
+app.get("/api/profile", async (req, res) => {
+  try {
+    const wallet = req.query.wallet;
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    const { data, error } = await supabase
+      .from("hub_profiles")
+      .select("*")
+      .eq("wallet", wallet)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Not found" });
+    res.json(data);
+  } catch (e) {
+    err("Error /api/profile [GET]:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
     const { data, error } = await supabase
       .from("hub_profiles")
       .upsert(
@@ -333,6 +355,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 });
 
 // === 3. Post new broadcast ===
+
 app.post("/api/broadcast", async (req, res) => {
   try {
     const { wallet, message } = req.body;
@@ -340,10 +363,14 @@ app.post("/api/broadcast", async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
 
     const entry = { wallet, message, time: new Date().toISOString() };
-    const { error } = await supabase.from("hub_broadcasts").insert([entry]);
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .insert([entry])
+      .select()
+      .maybeSingle();
     if (error) throw error;
 
-    res.json({ success: true });
+    res.json({ success: true, data });
   } catch (e) {
     err("Error /api/broadcast:", e);
     res.status(500).json({ error: e.message });
@@ -460,6 +487,75 @@ app.get("/api/wallet", async (req, res) => {
 
 /* ====================================================== */
 
-app.listen(PORT, () =>
+
+// ======================================================
+// === Realtime WebSocket Relay for hub_broadcasts (path: /ws)
+// ======================================================
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
+const clients = new Set();
+
+wss.on("connection", async (ws) => {
+  clients.add(ws);
+  log("🟢 WS client connected. Total:", clients.size);
+
+  ws.on("close", () => {
+    clients.delete(ws);
+    log("🔴 WS client disconnected. Total:", clients.size);
+  });
+
+  // Send last 25 broadcasts on connect
+  try {
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("*")
+      .order("time", { ascending: false })
+      .limit(25);
+    if (!error && data) {
+      ws.send(JSON.stringify({ type: "hello", rows: data }));
+    }
+  } catch (e) {
+    warn("WS hello failed:", e?.message || e);
+  }
+});
+
+function wsBroadcast(payloadObj) {
+  const msg = JSON.stringify(payloadObj);
+  for (const ws of clients) {
+    if (ws.readyState === 1) {
+      ws.send(msg);
+    }
+  }
+}
+
+// Supabase realtime: INSERT + DELETE on hub_broadcasts
+const channel = supabase
+  .channel("realtime:hub_broadcasts")
+  .on(
+    "postgres_changes",
+    { event: "INSERT", schema: "public", table: "hub_broadcasts" },
+    (payload) => {
+      const row = payload?.new || payload?.record || null;
+      if (!row) return;
+      wsBroadcast({ type: "insert", row });
+    }
+  )
+  .on(
+    "postgres_changes",
+    { event: "DELETE", schema: "public", table: "hub_broadcasts" },
+    (payload) => {
+      const old = payload?.old || payload?.record || null;
+      const id = old?.id || old?.uuid || old?._id || null;
+      if (!id) {
+        const maybe = { wallet: old?.wallet, message: old?.message, time: old?.time };
+        wsBroadcast({ type: "delete", id: null, match: maybe });
+      } else {
+        wsBroadcast({ type: "delete", id });
+      }
+    }
+  )
+  .subscribe((status) => log("🔔 Supabase realtime status:", status));
+
+server.listen(PORT, () =>
   log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
 );
