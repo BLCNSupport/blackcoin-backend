@@ -1,5 +1,6 @@
 // server.js — BlackCoin backend (UTC version + Operator Hub extensions)
 // Smart Backoff polling (20s → 60s on 429), no-overlap protection, timestamped logs
+// Realtime WebSocket relay for hub_broadcasts (INSERT/DELETE) at /ws (ESM-compatible)
 
 import express from "express";
 import fetch from "node-fetch";
@@ -8,7 +9,8 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
 import http from "http";
-import { WebSocketServer } from "ws";
+import pkg from "ws";            // ESM-safe import of ws (CommonJS)
+const { WebSocketServer } = pkg;
 
 dotenv.config();
 const app = express();
@@ -279,26 +281,6 @@ app.post("/api/profile", async (req, res) => {
     const { wallet, handle, avatar_url } = req.body;
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
-// === 1b. Get user profile by wallet ===
-app.get("/api/profile", async (req, res) => {
-  try {
-    const wallet = req.query.wallet;
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-    const { data, error } = await supabase
-      .from("hub_profiles")
-      .select("*")
-      .eq("wallet", wallet)
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: "Not found" });
-    res.json(data);
-  } catch (e) {
-    err("Error /api/profile [GET]:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
     const { data, error } = await supabase
       .from("hub_profiles")
       .upsert(
@@ -316,6 +298,25 @@ app.get("/api/profile", async (req, res) => {
     res.json({ success: true, data });
   } catch (e) {
     err("Error /api/profile:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// === 1b. Get user profile by wallet ===
+app.get("/api/profile", async (req, res) => {
+  try {
+    const wallet = req.query.wallet;
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    const { data, error } = await supabase
+      .from("hub_profiles")
+      .select("*")
+      .eq("wallet", wallet)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Not found" });
+    res.json(data);
+  } catch (e) {
+    err("Error /api/profile [GET]:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -355,7 +356,6 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 });
 
 // === 3. Post new broadcast ===
-
 app.post("/api/broadcast", async (req, res) => {
   try {
     const { wallet, message } = req.body;
@@ -377,14 +377,14 @@ app.post("/api/broadcast", async (req, res) => {
   }
 });
 
-// === 4. Fetch broadcasts (latest 50) ===
+// === 4. Fetch broadcasts (latest 25) ===
 app.get("/api/broadcasts", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("hub_broadcasts")
       .select("*")
       .order("time", { ascending: false })
-      .limit(50);
+      .limit(25);
     if (error) throw error;
     res.json(data);
   } catch (e) {
@@ -485,12 +485,10 @@ app.get("/api/wallet", async (req, res) => {
   }
 });
 
-/* ====================================================== */
+/* ======================================================
+   === Realtime WebSocket Relay for hub_broadcasts =======
+   ====================================================== */
 
-
-// ======================================================
-// === Realtime WebSocket Relay for hub_broadcasts (path: /ws)
-// ======================================================
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const clients = new Set();
@@ -504,7 +502,7 @@ wss.on("connection", async (ws) => {
     log("🔴 WS client disconnected. Total:", clients.size);
   });
 
-  // Send last 25 broadcasts on connect
+  // Send last 25 on connect
   try {
     const { data, error } = await supabase
       .from("hub_broadcasts")
@@ -544,13 +542,15 @@ const channel = supabase
     "postgres_changes",
     { event: "DELETE", schema: "public", table: "hub_broadcasts" },
     (payload) => {
+      // Table has PK 'id' (confirmed by user)
       const old = payload?.old || payload?.record || null;
-      const id = old?.id || old?.uuid || old?._id || null;
-      if (!id) {
+      const id = old?.id || null;
+      if (id) {
+        wsBroadcast({ type: "delete", id });
+      } else {
+        // Fallback (shouldn't trigger if PK exists)
         const maybe = { wallet: old?.wallet, message: old?.message, time: old?.time };
         wsBroadcast({ type: "delete", id: null, match: maybe });
-      } else {
-        wsBroadcast({ type: "delete", id });
       }
     }
   )
