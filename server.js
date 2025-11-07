@@ -5,7 +5,7 @@
 // - Avatar upload to Supabase Storage + profile update
 // - Broadcasts: insert + list (DESC, 25)
 // - Refund: insert + list
-// - WebSocket server on /ws broadcasting realtime INSERT/DELETE from hub_broadcasts
+// - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -35,6 +35,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   err("SUPABASE_URL or SUPABASE_KEY missing"); process.exit(1);
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+/* ---------- Health ---------- */
+app.get("/healthz", (_req,res)=>res.json({ ok:true, time:new Date().toISOString() }));
 
 /* ---------- Chart poller (unchanged) ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
@@ -88,7 +91,7 @@ app.get("/api/chart",async(req,res)=>{
     res.json({points,latest,page,nextPage,hasMore:Boolean(nextPage)});
   }catch(e){ err("Error /api/chart:",e); res.status(500).json({error:"Failed to fetch chart data",message:e.message}); }
 });
-app.get("/api/latest",async(req,res)=>{
+app.get("/api/latest",async(_req,res)=>{
   try{
     let latest=memoryCache.at(-1);
     if(!latest){ const {data}=await supabase.from("chart_data").select("timestamp, price, change, volume").order("timestamp",{ascending:false}).limit(1).maybeSingle(); latest=data; }
@@ -104,7 +107,10 @@ app.post("/api/profile", async (req,res)=>{
     if(!wallet) return res.status(400).json({error:"Missing wallet"});
     if(typeof handle==="string") handle=handle.trim();
     if(!handle) handle="@Operator";
-    const { data, error } = await supabase.from("hub_profiles").upsert({ wallet, handle, avatar_url: avatar_url ?? null, updated_at:new Date().toISOString() }, { onConflict:"wallet" }).select();
+    const { data, error } = await supabase.from("hub_profiles").upsert(
+      { wallet, handle, avatar_url: avatar_url ?? null, updated_at:new Date().toISOString() },
+      { onConflict:"wallet" }
+    ).select();
     if(error) throw error;
     res.json({ success:true, data });
   }catch(e){ err("Error /api/profile:",e); res.status(500).json({error:e.message}); }
@@ -138,21 +144,42 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso)=>{ try{ const d=new Date(iso); return d.toTimeString().slice(0,5);}catch{return "";} };
 
+// Normalize DB row into a stable payload for clients
+function normRow(r){
+  if(!r) return null;
+  return {
+    id: r.id,
+    wallet: r.wallet,
+    message: r.message,
+    created_at: r.created_at,
+    display_time: hhmm(r.created_at)
+  };
+}
+
 app.post("/api/broadcast", async (req,res)=>{
   try{
     const { wallet, message } = req.body;
     if(!wallet || !message) return res.status(400).json({error:"Missing fields"});
     const { data, error } = await supabase.from("hub_broadcasts").insert([{ wallet, message }]).select().maybeSingle();
     if(error) throw error;
-    const row = data ? { ...data, display_time: hhmm(data.created_at) } : null;
+    const row = normRow(data);
+
+    // Instant echo so the poster sees it immediately (others still get realtime)
+    wsBroadcast({ type:"insert", row });
+
     res.json({ success:true, data: row });
   }catch(e){ err("Error /api/broadcast:",e); res.status(500).json({error:e.message}); }
 });
-app.get("/api/broadcasts", async (req,res)=>{
+
+app.get("/api/broadcasts", async (_req,res)=>{
   try{
-    const { data, error } = await supabase.from("hub_broadcasts").select("id, wallet, message, created_at").order("created_at",{ascending:false}).limit(25);
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("id, wallet, message, created_at")
+      .order("created_at",{ascending:false})
+      .limit(25);
     if(error) throw error;
-    const rows = (data||[]).map(r=>({ ...r, display_time: hhmm(r.created_at) }));
+    const rows = (data||[]).map(normRow);
     res.json(rows);
   }catch(e){ err("Error /api/broadcasts:",e); res.status(500).json({error:e.message}); }
 });
@@ -173,7 +200,12 @@ app.get("/api/refund-history", async (req,res)=>{
     const { wallet } = req.query;
     if(!wallet) return res.status(400).json({error:"Missing wallet"});
     res.set("Cache-Control","no-store");
-    const { data, error } = await supabase.from("hub_refund_history").select("*").eq("wallet",wallet).order("created_at",{ascending:false}).limit(50);
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .select("*")
+      .eq("wallet",wallet)
+      .order("created_at",{ascending:false})
+      .limit(50);
     if(error) throw error;
     res.json(data||[]);
   }catch(e){ err("Error /api/refund-history:",e); res.status(500).json({error:e.message}); }
@@ -191,11 +223,15 @@ wss.on("connection", async (socket)=>{
   socket.on("close", ()=> clients.delete(socket));
   socket.on("error", (e)=> err("WS error:", e?.message||e));
 
-  // send last 25 on connect
+  // send last 25 on connect (DESC -> client sorts; or show as-is)
   try{
-    const { data, error } = await supabase.from("hub_broadcasts").select("id, wallet, message, created_at").order("created_at",{ascending:false}).limit(25);
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("id, wallet, message, created_at")
+      .order("created_at",{ascending:false})
+      .limit(25);
     if(!error && data){
-      const rows = data.map(r=>({ ...r, display_time: hhmm(r.created_at) }));
+      const rows = (data||[]).map(normRow);
       socket.send(JSON.stringify({ type:"hello", rows }));
     }
   }catch(e){ err("WS hello failed:", e?.message||e); }
@@ -213,21 +249,56 @@ function wsBroadcast(o){
   for(const s of clients){ if(s.readyState===s.OPEN) s.send(msg); }
 }
 
-// Supabase realtime: INSERT + DELETE bridge
-const channel = supabase
-  .channel("rt:hub_broadcasts")
-  .on("postgres_changes", { event:"INSERT", schema:"public", table:"hub_broadcasts" }, (payload)=>{
-    const row = payload?.new || payload?.record || null;
-    if(row) wsBroadcast({ type:"insert", row: { ...row, display_time: hhmm(row.created_at) } });
-  })
-  .on("postgres_changes", { event:"DELETE", schema:"public", table:"hub_broadcasts" }, (payload)=>{
-    const old = payload?.old || payload?.record || null;
-    if(old?.id) wsBroadcast({ type:"delete", id: old.id });
-  })
-  .subscribe((status)=>{
-    if(status==="SUBSCRIBED") log("Realtime subscribed: hub_broadcasts");
-    else if(status==="CLOSED") warn("Realtime channel closed");
-    else if(status==="CHANNEL_ERROR") err("Realtime channel error");
-  });
+/* ---------- Supabase Realtime: resilient subscription ---------- */
+// we wrap the subscription logic so we can re-subscribe on failures
+let rtChannel = null;
+function subscribeToBroadcasts() {
+  try {
+    if (rtChannel) {
+      try { supabase.removeChannel(rtChannel); } catch {}
+      rtChannel = null;
+    }
+
+    rtChannel = supabase
+      .channel("rt:hub_broadcasts", {
+        config: { broadcast: { ack: true }, presence: { key: "server" } }
+      })
+      .on("postgres_changes",
+        { event: "INSERT", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const row = normRow(payload?.new || payload?.record);
+          log("🔔 INSERT hub_broadcasts id=", row?.id);
+          if (row) wsBroadcast({ type:"insert", row });
+        }
+      )
+      .on("postgres_changes",
+        { event: "UPDATE", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const row = normRow(payload?.new || payload?.record);
+          log("🔧 UPDATE hub_broadcasts id=", row?.id);
+          if (row) wsBroadcast({ type:"update", row });
+        }
+      )
+      .on("postgres_changes",
+        { event: "DELETE", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const old = payload?.old || payload?.record || null;
+          const id = old?.id;
+          log("🗑️  DELETE hub_broadcasts id=", id);
+          if (id) wsBroadcast({ type:"delete", id });
+        }
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") log("✅ Realtime subscribed: hub_broadcasts");
+        else if (status === "CHANNEL_ERROR") { err("❌ Realtime CHANNEL_ERROR — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+        else if (status === "TIMED_OUT") { warn("⚠️ Realtime TIMED_OUT — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+        else if (status === "CLOSED") { warn("⚠️ Realtime CLOSED — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+      });
+  } catch (e) {
+    err("Realtime subscribe failed:", e?.message || e);
+    setTimeout(subscribeToBroadcasts, 2000);
+  }
+}
+subscribeToBroadcasts();
 
 server.listen(PORT, ()=> log(`✅ BlackCoin backend running on port ${PORT}`));
