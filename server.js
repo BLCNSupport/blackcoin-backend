@@ -9,8 +9,8 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
 import http from "http";
-import pkg from "ws";            // ESM-safe import of ws (CommonJS)
-const { WebSocketServer } = pkg;
+import wsModule from "ws";             // universal-safe import for ESM/CJS builds
+const WebSocketServer = wsModule.WebSocketServer || wsModule;
 
 dotenv.config();
 const app = express();
@@ -25,15 +25,9 @@ function ts() {
   // Local server time [HH:MM:SS]
   return `[${d.toTimeString().slice(0, 8)}]`;
 }
-function log(...args) {
-  console.log(ts(), ...args);
-}
-function warn(...args) {
-  console.warn(ts(), ...args);
-}
-function err(...args) {
-  console.error(ts(), ...args);
-}
+function log(...args) { console.log(ts(), ...args); }
+function warn(...args) { console.warn(ts(), ...args); }
+function err(...args) { console.error(ts(), ...args); }
 
 // === Supabase ===
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -418,24 +412,11 @@ app.post("/api/refund", async (req, res) => {
 
     if (error) throw error;
 
-    log(`✅ Logged refund for ${wallet}: ${token} ${rent} SOL`);
+    // Normal logging: only success summary (no verbose row dump)
+    log(`✅ Logged refund for ${wallet} — ${token} ${rent} SOL`);
 
-    // 🕒 Wait for Supabase replication
-    await new Promise((r) => setTimeout(r, 1500));
-
-    // 🧩 Verify visibility
-    const { data: verifyRows, error: verifyErr } = await supabase
-      .from("hub_refund_history")
-      .select("id, wallet, tx, created_at")
-      .eq("wallet", wallet)
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    if (verifyErr)
-      warn("⚠️ Verification query failed:", verifyErr.message);
-    else if (verifyRows?.length > 0)
-      log("🧩 Verified new refund visible:", verifyRows[0]);
-    else warn("⚠️ Verification: no rows yet (still syncing).");
+    // Small replication wait
+    await new Promise((r) => setTimeout(r, 1200));
 
     res.json({ success: true, inserted: data });
   } catch (e) {
@@ -495,11 +476,15 @@ const clients = new Set();
 
 wss.on("connection", async (ws) => {
   clients.add(ws);
-  log("🟢 WS client connected. Total:", clients.size);
+  log("WS connect — clients:", clients.size);
 
   ws.on("close", () => {
     clients.delete(ws);
-    log("🔴 WS client disconnected. Total:", clients.size);
+    log("WS close — clients:", clients.size);
+  });
+
+  ws.on("error", (e) => {
+    err("WS error:", e?.message || e);
   });
 
   // Send last 25 on connect
@@ -513,7 +498,7 @@ wss.on("connection", async (ws) => {
       ws.send(JSON.stringify({ type: "hello", rows: data }));
     }
   } catch (e) {
-    warn("WS hello failed:", e?.message || e);
+    err("WS hello failed:", e?.message || e);
   }
 });
 
@@ -542,20 +527,26 @@ const channel = supabase
     "postgres_changes",
     { event: "DELETE", schema: "public", table: "hub_broadcasts" },
     (payload) => {
-      // Table has PK 'id' (confirmed by user)
+      // Table has PK 'id' (confirmed). Prefer id for precise delete.
       const old = payload?.old || payload?.record || null;
       const id = old?.id || null;
       if (id) {
         wsBroadcast({ type: "delete", id });
       } else {
-        // Fallback (shouldn't trigger if PK exists)
+        // Fallback (shouldn't happen if REPLICA IDENTITY FULL is set)
         const maybe = { wallet: old?.wallet, message: old?.message, time: old?.time };
         wsBroadcast({ type: "delete", id: null, match: maybe });
       }
     }
   )
-  .subscribe((status) => log("🔔 Supabase realtime status:", status));
+  .subscribe((status) => {
+    if (status === "SUBSCRIBED") {
+      log("WS realtime: subscribed to hub_broadcasts");
+    } else if (status === "CLOSED") {
+      warn("WS realtime: closed");
+    } else if (status === "CHANNEL_ERROR") {
+      err("WS realtime: channel error");
+    }
+  });
 
-server.listen(PORT, () =>
-  log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
-);
+server.listen(PORT, () => log(`✅ BlackCoin backend running (UTC) on port ${PORT}`));
