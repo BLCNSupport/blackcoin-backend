@@ -1,4 +1,6 @@
 // server.js — BlackCoin backend (UTC version + Operator Hub extensions)
+// Smart Backoff polling (20s → 60s on 429), no-overlap protection, timestamped logs
+
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -13,39 +15,85 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+/* ============ Logging Helpers (L2, TS1, TZ1) ============ */
+function ts() {
+  const d = new Date();
+  // Local server time [HH:MM:SS]
+  return `[${d.toTimeString().slice(0, 8)}]`;
+}
+function log(...args) {
+  console.log(ts(), ...args);
+}
+function warn(...args) {
+  console.warn(ts(), ...args);
+}
+function err(...args) {
+  console.error(ts(), ...args);
+}
+
 // === Supabase ===
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("SUPABASE_URL or SUPABASE_KEY missing");
+  err("SUPABASE_URL or SUPABASE_KEY missing");
   process.exit(1);
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // === Chart data poller ===
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-const FETCH_INTERVAL = 5000;
+
+// Smart Backoff profile B3: Safe
+let FETCH_INTERVAL = 20000;            // 20s normal
+const BACKOFF_INTERVAL = 60000;        // 60s after 429
+let isBackoff = false;
+let fetchInProgress = false;
+let pollTimer = null;
+
 let memoryCache = [];
 
 async function insertPoint(point) {
   try {
     const { error } = await supabase.from("chart_data").insert([point]);
-    if (error) console.error("Supabase insert failed:", error.message);
-  } catch (err) {
-    console.error("Supabase insert exception:", err);
+    if (error) err("Supabase insert failed:", error.message);
+  } catch (e) {
+    err("Supabase insert exception:", e);
   }
 }
 
-async function fetchLiveData() {
+/**
+ * Fetch one tick from Dexscreener with guard rails.
+ * Returns:
+ *   "ok"       -> success, normal schedule
+ *   "backoff"  -> 429 hit, enter backoff schedule
+ *   "softfail" -> non-429 failure; keep normal schedule (so we don't stall forever)
+ */
+async function fetchOneTick() {
+  fetchInProgress = true;
+  log("⏱️  Polling Dexscreener...");
+
   try {
     const res = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,
       { headers: { "Cache-Control": "no-cache" } }
     );
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    if (res.status === 429) {
+      warn("⚠️  429 rate limit hit — entering backoff:", `${BACKOFF_INTERVAL / 1000}s`);
+      return "backoff";
+    }
+
+    if (!res.ok) {
+      warn(`⚠️  Upstream returned ${res.status} — keeping normal cadence`);
+      return "softfail";
+    }
+
     const json = await res.json();
     const pair = json.pairs?.[0];
-    if (!pair) return;
+    if (!pair) {
+      warn("⚠️  No pairs in response — keeping normal cadence");
+      return "softfail";
+    }
 
     const point = {
       timestamp: new Date().toISOString(),
@@ -54,17 +102,64 @@ async function fetchLiveData() {
       volume: parseFloat(pair.volume?.h24),
     };
 
-    if ([point.price, point.change, point.volume].some((v) => isNaN(v))) return;
+    if ([point.price, point.change, point.volume].some((v) => isNaN(v))) {
+      warn("⚠️  Invalid numeric fields in response — skipping insert");
+      return "softfail";
+    }
+
     memoryCache.push(point);
     if (memoryCache.length > 10000) memoryCache.shift();
 
     await insertPoint(point);
-  } catch (err) {
-    console.error("fetchLiveData failed:", err);
+    log("✅ Data stored at", point.timestamp);
+    return "ok";
+  } catch (e) {
+    err("fetchLiveData failed:", e);
+    return "softfail";
+  } finally {
+    fetchInProgress = false;
   }
 }
-fetchLiveData();
-setInterval(fetchLiveData, FETCH_INTERVAL);
+
+function scheduleNext(ms) {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  pollTimer = setTimeout(pollLoop, ms);
+}
+
+async function pollLoop() {
+  // Avoid overlapping fetches (e.g., slow upstream response)
+  if (fetchInProgress) {
+    warn("⏸️  Previous fetch still running — skipping this cycle");
+    return scheduleNext(isBackoff ? BACKOFF_INTERVAL : FETCH_INTERVAL);
+  }
+
+  const result = await fetchOneTick();
+
+  if (result === "backoff") {
+    // Enter backoff mode and schedule the next attempt after BACKOFF_INTERVAL
+    if (!isBackoff) {
+      isBackoff = true;
+    }
+    log("⏸️  Backoff active — delaying next fetch...");
+    return scheduleNext(BACKOFF_INTERVAL);
+  }
+
+  if (isBackoff && result === "ok") {
+    // Successful fetch after being rate-limited — resume normal cadence immediately (R2)
+    isBackoff = false;
+    log("⏳  Backoff ended — resuming normal polling");
+    return scheduleNext(FETCH_INTERVAL);
+  }
+
+  // For ok or softfail while not in backoff, keep normal cadence
+  scheduleNext(FETCH_INTERVAL);
+}
+
+// Kick off the polling loop
+pollLoop();
 
 // === Chart endpoints ===
 function bucketMs(interval) {
@@ -143,11 +238,11 @@ app.get("/api/chart", async (req, res) => {
     const nextPage = offset + limit < totalCount ? page + 1 : null;
 
     res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
-  } catch (err) {
-    console.error("Error /api/chart:", err);
+  } catch (e) {
+    err("Error /api/chart:", e);
     res
       .status(500)
-      .json({ error: "Failed to fetch chart data", message: err.message });
+      .json({ error: "Failed to fetch chart data", message: e.message });
   }
 });
 
@@ -166,8 +261,8 @@ app.get("/api/latest", async (req, res) => {
     }
     if (!latest) return res.status(404).json({ error: "No data" });
     res.json(latest);
-  } catch (err) {
-    console.error("Error /api/latest:", err);
+  } catch (e) {
+    err("Error /api/latest:", e);
     res.status(500).json({ error: "Failed" });
   }
 });
@@ -197,9 +292,9 @@ app.post("/api/profile", async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, data });
-  } catch (err) {
-    console.error("Error /api/profile:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/profile:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -231,9 +326,9 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
       .eq("wallet", wallet);
 
     res.json({ success: true, url: publicURL.publicUrl });
-  } catch (err) {
-    console.error("Error /api/avatar-upload:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/avatar-upload:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -249,9 +344,9 @@ app.post("/api/broadcast", async (req, res) => {
     if (error) throw error;
 
     res.json({ success: true });
-  } catch (err) {
-    console.error("Error /api/broadcast:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/broadcast:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -265,9 +360,9 @@ app.get("/api/broadcasts", async (req, res) => {
       .limit(50);
     if (error) throw error;
     res.json(data);
-  } catch (err) {
-    console.error("Error /api/broadcasts:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/broadcasts:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -296,7 +391,7 @@ app.post("/api/refund", async (req, res) => {
 
     if (error) throw error;
 
-    console.log(`✅ Logged refund for ${wallet}: ${token} ${rent} SOL`);
+    log(`✅ Logged refund for ${wallet}: ${token} ${rent} SOL`);
 
     // 🕒 Wait for Supabase replication
     await new Promise((r) => setTimeout(r, 1500));
@@ -310,15 +405,15 @@ app.post("/api/refund", async (req, res) => {
       .limit(1);
 
     if (verifyErr)
-      console.warn("⚠️ Verification query failed:", verifyErr.message);
+      warn("⚠️ Verification query failed:", verifyErr.message);
     else if (verifyRows?.length > 0)
-      console.log("🧩 Verified new refund visible:", verifyRows[0]);
-    else console.warn("⚠️ Verification: no rows yet (still syncing).");
+      log("🧩 Verified new refund visible:", verifyRows[0]);
+    else warn("⚠️ Verification: no rows yet (still syncing).");
 
     res.json({ success: true, inserted: data });
-  } catch (err) {
-    console.error("❌ Error inserting refund:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("❌ Error inserting refund:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -339,9 +434,9 @@ app.get("/api/refund-history", async (req, res) => {
 
     if (error) throw error;
     res.json(data || []);
-  } catch (err) {
-    console.error("Error /api/refund-history:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/refund-history:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -357,14 +452,14 @@ app.get("/api/wallet", async (req, res) => {
         { name: "BlackCoin", amount: 1000000, value: 187.5 },
       ],
     });
-  } catch (err) {
-    console.error("Error /api/wallet:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    err("Error /api/wallet:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
 /* ====================================================== */
 
 app.listen(PORT, () =>
-  console.log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
+  log(`✅ BlackCoin backend running (UTC) on port ${PORT}`)
 );
