@@ -1,6 +1,6 @@
 // server.js — BlackCoin backend (UTC version + Operator Hub extensions)
 // Smart Backoff polling (20s → 60s on 429), no-overlap protection, timestamped logs
-// Realtime WebSocket relay for hub_broadcasts (INSERT/DELETE) at /ws (ESM-compatible)
+// Realtime WebSocket relay for hub_broadcasts (INSERT/DELETE) at /ws — ESM-safe + heartbeat
 
 import express from "express";
 import fetch from "node-fetch";
@@ -9,8 +9,8 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
 import http from "http";
-import wsModule from "ws";             // universal-safe import for ESM/CJS builds
-const WebSocketServer = wsModule.WebSocketServer || wsModule;
+import * as ws from "ws";            // ESM-safe: namespace import from CJS
+const { WebSocketServer } = ws;      // <-- server class only; NO client usage
 
 dotenv.config();
 const app = express();
@@ -387,7 +387,7 @@ app.get("/api/broadcasts", async (req, res) => {
   }
 });
 
-// === 5. Log refund transaction (enhanced, with replication buffer) ===
+// === 5. Log refund transaction (enhanced) ===
 app.post("/api/refund", async (req, res) => {
   try {
     const { wallet, token, rent, tx, status } = req.body;
@@ -404,7 +404,6 @@ app.post("/api/refund", async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
-    // 🧾 Insert into Supabase
     const { data, error } = await supabase
       .from("hub_refund_history")
       .insert([record])
@@ -412,7 +411,6 @@ app.post("/api/refund", async (req, res) => {
 
     if (error) throw error;
 
-    // Normal logging: only success summary (no verbose row dump)
     log(`✅ Logged refund for ${wallet} — ${token} ${rent} SOL`);
 
     // Small replication wait
@@ -425,7 +423,7 @@ app.post("/api/refund", async (req, res) => {
   }
 });
 
-// === 5b. Fetch refund history for a wallet (fresh + consistent) ===
+// === 5b. Fetch refund history for a wallet ===
 app.get("/api/refund-history", async (req, res) => {
   try {
     const { wallet } = req.query;
@@ -474,7 +472,24 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const clients = new Set();
 
+// Heartbeat (keep connections alive behind proxies)
+function heartbeat() { this.isAlive = true; }
+const PING_MS = 30000; // 30s
+const pingInterval = setInterval(() => {
+  for (const ws of clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch(e) { /* ignore */ }
+  }
+}, PING_MS);
+
 wss.on("connection", async (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+
   clients.add(ws);
   log("WS connect — clients:", clients.size);
 
@@ -505,7 +520,7 @@ wss.on("connection", async (ws) => {
 function wsBroadcast(payloadObj) {
   const msg = JSON.stringify(payloadObj);
   for (const ws of clients) {
-    if (ws.readyState === 1) {
+    if (ws.readyState === ws.OPEN) {
       ws.send(msg);
     }
   }
@@ -527,26 +542,20 @@ const channel = supabase
     "postgres_changes",
     { event: "DELETE", schema: "public", table: "hub_broadcasts" },
     (payload) => {
-      // Table has PK 'id' (confirmed). Prefer id for precise delete.
       const old = payload?.old || payload?.record || null;
       const id = old?.id || null;
-      if (id) {
-        wsBroadcast({ type: "delete", id });
-      } else {
-        // Fallback (shouldn't happen if REPLICA IDENTITY FULL is set)
-        const maybe = { wallet: old?.wallet, message: old?.message, time: old?.time };
-        wsBroadcast({ type: "delete", id: null, match: maybe });
-      }
+      if (id) wsBroadcast({ type: "delete", id });
+      else wsBroadcast({ type: "delete", id: null, match: { wallet: old?.wallet, message: old?.message, time: old?.time } });
     }
   )
   .subscribe((status) => {
-    if (status === "SUBSCRIBED") {
-      log("WS realtime: subscribed to hub_broadcasts");
-    } else if (status === "CLOSED") {
-      warn("WS realtime: closed");
-    } else if (status === "CHANNEL_ERROR") {
-      err("WS realtime: channel error");
-    }
+    if (status === "SUBSCRIBED")      log("WS realtime: subscribed to hub_broadcasts");
+    else if (status === "CLOSED")     warn("WS realtime: closed");
+    else if (status === "CHANNEL_ERROR") err("WS realtime: channel error");
   });
+
+process.on("SIGTERM", () => {
+  clearInterval(pingInterval);
+});
 
 server.listen(PORT, () => log(`✅ BlackCoin backend running (UTC) on port ${PORT}`));
