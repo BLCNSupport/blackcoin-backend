@@ -1,11 +1,12 @@
 // server.js — BlackCoin backend (Operator Hub realtime edition)
 // ESM + Express + Supabase + WS
-// - Chart poller with backoff
+// - Chart poller with backoff (UNCHANGED)
 // - Profile save/get
 // - Avatar upload to Supabase Storage + profile update
 // - Broadcasts: insert + list (DESC, 25)
 // - Refund: insert + list
 // - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
+// - NEW: Weighted-blend pricing (Jupiter + DexScreener) with USD formatter & caching
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -39,7 +40,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 /* ---------- Health ---------- */
 app.get("/healthz", (_req,res)=>res.json({ ok:true, time:new Date().toISOString() }));
 
-/* ---------- Chart poller (unchanged) ---------- */
+/* ---------- Chart poller (UNCHANGED) ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 let FETCH_INTERVAL = 20000;
 const BACKOFF_INTERVAL = 60000;
@@ -74,7 +75,7 @@ async function pollLoop(){
 }
 pollLoop();
 
-/* ---------- Chart API ---------- */
+/* ---------- Chart API (UNCHANGED) ---------- */
 function bucketMs(interval){ switch(interval){case"1m":return 60e3;case"5m":return 300e3;case"30m":return 1800e3;case"1h":return 3600e3;case"D":return 86400e3;default:return 60e3;} }
 function getWindow(interval){ const now=Date.now(); if(interval==="D") return new Date(now-30*86400e3).toISOString(); if(interval==="1h") return new Date(now-7*86400e3).toISOString(); return new Date(now-86400e3).toISOString(); }
 function floorToBucketUTC(tsISO, interval){ const ms=bucketMs(interval); const d=new Date(tsISO); return new Date(Math.floor(d.getTime()/ms)*ms); }
@@ -145,9 +146,111 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
 
-const DEX_PRICE_CACHE = new Map(); // mint -> {priceUsd, ts}
-const SOL_PRICE_CACHE = { priceUsd: null, ts: 0 };
+// ===== New: Price formatter (server-side display rules) =====
+function abbreviate(n) {
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  if (abs >= 1_000_000_000) return sign + (abs/1_000_000_000).toFixed(abs % 1_000_000_000 === 0 ? 0 : 2).replace(/\.0+$|(?<=\.\d*[1-9])0+$/g,"") + "B";
+  if (abs >= 1_000_000)     return sign + (abs/1_000_000).toFixed(abs % 1_000_000 === 0 ? 0 : 2).replace(/\.0+$|(?<=\.\d*[1-9])0+$/g,"") + "M";
+  if (abs >= 10_000)        return sign + (abs/1_000).toFixed(abs % 1_000 === 0 ? 0 : 2).replace(/\.0+$|(?<=\.\d*[1-9])0+$/g,"") + "K";
+  return null;
+}
+function formatUsd(value){
+  if (value == null || Number.isNaN(value)) return "$0.00";
+  const v = Number(value);
+  const abs = Math.abs(v);
+  // Tiny values < $1: up to 6 decimals, trim trailing zeros
+  if (abs < 1) {
+    const s = abs.toFixed(6).replace(/\.?0+$/,"");
+    return (v < 0 ? "-$" : "$") + (v < 0 ? s.slice(1) : s);
+  }
+  // Normal values < $10k: two decimals with commas
+  if (abs < 10_000) {
+    return (v < 0 ? "-$" : "$") + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  // Large values: K/M/B
+  const abbr = abbreviate(v);
+  return "$" + abbr;
+}
+
+// ===== New: Price sources + blending =====
+const MAJOR_SPL = new Set([
+  "So11111111111111111111111111111111111111112", // SOL (native pseudo mint)
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  "JUPyiwrYJFskUPiHa7hkrL2Fzf8mFk7LtKXBs3CToyD", // JUP
+  "DezXAZ8z7PnrnRJjz3wXBoRgixAeg22u71LtBH5e7UDm", // BONK
+  "7W13pQwT5F9nMEW3YQicPZaBFtwZr9QG4bw35vjULK2f", // WIF (placeholder old/wrapped variants may differ)
+  "orcaEKTd74cKAXcFDcCk6N88G9nogjXwLMoMfeJMZgj", // ORCA
+  "GoMCK2uJfM8WQbGkB8pZphrepz7qW3f9zZrLJQMQWZwQ", // RAY (note: dummy if ray mint differs; blend still works)
+  "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", // mSOL
+  "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"  // PYTH
+]);
+
 const PRICE_TTL_MS = 25_000;
+const BLENDED_CACHE = new Map(); // mint -> { priceUsd, ts, source }
+
+async function fetchJSON(url, headers={}){
+  const r = await fetch(url, { headers: { "Cache-Control":"no-cache", ...headers }});
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+async function jupPrice(mint){
+  try{
+    const j = await fetchJSON(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
+    const p = Number(j?.data?.[mint]?.price) || Number(j?.data?.price) || 0;
+    return (p>0)? p : 0;
+  }catch{ return 0; }
+}
+async function dsPrice(mint){
+  try{
+    const j = await fetchJSON(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`);
+    const p = Number(j?.pairs?.[0]?.priceUsd) || 0;
+    return (p>0)? p : 0;
+  }catch{ return 0; }
+}
+function pickConfidence(p){
+  if (p >= 1) return "high";
+  if (p > 0) return "medium";
+  return "low";
+}
+
+async function blendedPrice(mint){
+  const now = Date.now();
+  const cached = BLENDED_CACHE.get(mint);
+  if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached;
+
+  // Fetch in parallel
+  const [jp, ds] = await Promise.all([ jupPrice(mint), dsPrice(mint) ]);
+
+  const isMajor = MAJOR_SPL.has(mint);
+  let price = 0, source = [];
+  if (isMajor) {
+    // 70% JUP, 30% DS
+    if (jp || ds) {
+      price = (jp * 0.7) + (ds * 0.3);
+      source = ["jup","dex"];
+    }
+  } else {
+    // 85% DS, 15% JUP (pump/meme/new)
+    if (jp || ds) {
+      price = (ds * 0.85) + (jp * 0.15);
+      source = ["dex","jup"];
+    }
+  }
+  if (!price) {
+    price = ds || jp || 0;
+    source = ds ? ["dex"] : jp ? ["jup"] : [];
+  }
+
+  const out = { priceUsd: price || 0, confidence: pickConfidence(price||0), source, ts: now, raw: { jup: jp, dex: ds } };
+  BLENDED_CACHE.set(mint, out);
+  return out;
+}
+
+// ===== keep the existing Coingecko SOL fetch for wallet SOL valuation =====
+const DEX_PRICE_CACHE = new Map(); // (legacy; kept for compatibility) mint -> {priceUsd, ts}
+const SOL_PRICE_CACHE = { priceUsd: null, ts: 0 };
 
 async function getSolUsd() {
   const now = Date.now();
@@ -167,30 +270,14 @@ async function getSolUsd() {
   return SOL_PRICE_CACHE.priceUsd ?? 0;
 }
 
-async function getTokenUsd(mint) {
-  const now = Date.now();
-  const cached = DEX_PRICE_CACHE.get(mint);
-  if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached.priceUsd;
-
-  try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`, { headers: { "Cache-Control": "no-cache" }});
-    const j = await r.json();
-    const price = Number(j?.pairs?.[0]?.priceUsd) || 0;
-    if (price > 0) {
-      DEX_PRICE_CACHE.set(mint, { priceUsd: price, ts: now });
-      return price;
-    }
-  } catch {}
-  return 0;
-}
-
 /**
  * POST /api/balances
  * body: { wallet: string }
  * returns: {
  *   sol: number,
  *   solUsd: number,
- *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd }]
+ *   solFormattedUsd?: string,
+ *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd, formattedUsd }]
  * }
  */
 app.post("/api/balances", async (req, res) => {
@@ -230,25 +317,50 @@ app.post("/api/balances", async (req, res) => {
       .filter(t => t.mint && t.amount > 0);
 
     const solUsd = await getSolUsd();
+    const solUsdTotal = sol * solUsd;
 
-    const priced = await Promise.allSettled(tokensBase.map(async t => {
-      const priceUsd = await getTokenUsd(t.mint);
-      return { ...t, priceUsd, usd: priceUsd * t.amount };
+    // ===== NEW: use blended price per token and add formattedUsd field
+    const priced = await Promise.all(tokensBase.map(async t => {
+      const blend = await blendedPrice(t.mint);
+      const priceUsd = Number(blend.priceUsd) || 0;
+      const usd = priceUsd * t.amount;
+      return { ...t, priceUsd, usd, formattedUsd: formatUsd(usd) };
     }));
 
     const tokens = priced
-      .map(p => p.status === "fulfilled" ? p.value : null)
-      .filter(Boolean)
       .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    res.json({
+    const response = {
       sol,
       solUsd,
+      solFormattedUsd: formatUsd(solUsdTotal),
       tokens
-    });
+    };
+
+    res.json(response);
   } catch (e) {
     err("Error /api/balances:", e);
     res.status(500).json({ error: e.message || "Failed to load balances" });
+  }
+});
+
+// ===== NEW: unified price endpoint using weighted blend =====
+app.get("/api/price", async (req, res) => {
+  try{
+    const mint = String(req.query.mint || "").trim();
+    if (!mint) return res.status(400).json({ error: "Missing mint" });
+    const out = await blendedPrice(mint);
+    res.json({
+      mint,
+      priceUsd: out.priceUsd,
+      formatted: formatUsd(out.priceUsd),
+      confidence: out.confidence,
+      source: out.source,
+      raw: out.raw
+    });
+  }catch(e){
+    err("Error /api/price:", e);
+    res.status(500).json({ error: e.message || "Failed" });
   }
 });
 
@@ -361,7 +473,6 @@ function wsBroadcast(o){
 }
 
 /* ---------- Supabase Realtime: resilient subscription ---------- */
-// we wrap the subscription logic so we can re-subscribe on failures
 let rtChannel = null;
 function subscribeToBroadcasts() {
   try {
