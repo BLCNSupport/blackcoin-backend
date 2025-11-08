@@ -279,19 +279,40 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
   }
 });
 
-/* ---------- Balances (Helius + Prices) ---------- */
+/* ---------- Balances (Helius RPC + DexScreener + Jupiter) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY missing");
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
-const PRICE_CACHE = new Map();
+const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"; // SPL legacy
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"; // SPL-2022
+
+// Caches
 const SOL_CACHE = { priceUsd: null, ts: 0 };
-const TTL = 25000;
+const META_CACHE = new Map();    // mint -> { symbol, name, logo, tags, verified, decimals? }
+const PRICE_CACHE = new Map();   // mint -> { priceUsd, ts }
+const TTL_PRICE = 30_000;        // 30s for prices
+const TTL_META  = 6 * 60 * 60 * 1000; // 6h for token metadata
+const TTL_SOL   = 25_000;
+
+// Small helpers
+async function rpc(method, params) {
+  const r = await fetch(HELIUS_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  });
+  if (!r.ok) throw new Error(`RPC ${method} HTTP ${r.status}`);
+  const j = await r.json();
+  if (j.error) throw new Error(`RPC ${method} error: ${j.error.message || "unknown"}`);
+  return j.result;
+}
 
 async function getSolUsd() {
   const now = Date.now();
-  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL) return SOL_CACHE.priceUsd;
+  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL_SOL) return SOL_CACHE.priceUsd;
   try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=false");
     const j = await r.json();
     const p = Number(j?.solana?.usd) || 0;
     if (p > 0) {
@@ -303,21 +324,124 @@ async function getSolUsd() {
   return SOL_CACHE.priceUsd ?? 0;
 }
 
-async function getTokenUsd(mint) {
+// ---- Token metadata (symbol/name/logo/verified/tags) via Jupiter first ----
+async function getTokenMeta(mint) {
   const now = Date.now();
-  const cached = PRICE_CACHE.get(mint);
-  if (cached && now - cached.ts < TTL) return cached.priceUsd;
+  const cached = META_CACHE.get(mint);
+  if (cached && now - cached.ts < TTL_META) return cached.data;
 
+  // Jupiter token endpoint returns rich metadata
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
-    const j = await r.json();
-    const price = Number(j?.pairs?.[0]?.priceUsd) || 0;
-    if (price > 0) {
-      PRICE_CACHE.set(mint, { priceUsd: price, ts: now });
-      return price;
+    const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
+    if (r.ok) {
+      const j = await r.json();
+      const meta = {
+        symbol: j?.symbol || "",
+        name: j?.name || "",
+        logo: j?.logoURI || "",
+        tags: Array.isArray(j?.tags) ? j.tags : [],
+        isVerified: Boolean(j?.extensions?.coingeckoId || j?.daily_volume || j?.liquidity || j?.verified),
+        decimals: typeof j?.decimals === "number" ? j.decimals : undefined
+      };
+      META_CACHE.set(mint, { ts: now, data: meta });
+      return meta;
     }
   } catch {}
+
+  // Fallback: lean meta (nothing fancy)
+  const meta = { symbol: "", name: "", logo: "", tags: [], isVerified: false, decimals: undefined };
+  META_CACHE.set(mint, { ts: now, data: meta });
+  return meta;
+}
+
+// ---- Price: DexScreener primary, Jupiter fallback
+async function getTokenUsd(mint) {
+  const now = Date.now();
+  const c = PRICE_CACHE.get(mint);
+  if (c && now - c.ts < TTL_PRICE) return c.priceUsd;
+
+  // 1) DexScreener
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
+    if (r.ok) {
+      const j = await r.json();
+      const p = Number(j?.pairs?.[0]?.priceUsd) || 0;
+      if (p > 0) {
+        PRICE_CACHE.set(mint, { ts: now, priceUsd: p });
+        return p;
+      }
+    }
+  } catch {}
+
+  // 2) Jupiter price fallback
+  try {
+    const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
+    if (r2.ok) {
+      const j2 = await r2.json();
+      const p2 = Number(j2?.data?.[mint]?.price) || 0;
+      if (p2 > 0) {
+        PRICE_CACHE.set(mint, { ts: now, priceUsd: p2 });
+        return p2;
+      }
+    }
+  } catch {}
+
+  PRICE_CACHE.set(mint, { ts: now, priceUsd: 0 });
   return 0;
+}
+
+// Normalize one parsed token account from RPC
+function parseParsedAccount(acc) {
+  // rpc result item: { pubkey, account: { data: { parsed: {...} } } }
+  const info = acc?.account?.data?.parsed?.info;
+  const amt  = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
+  const decimals = Number(amt?.decimals ?? info?.decimals ?? 0);
+  const raw = amt?.amount != null ? String(amt.amount) : null;
+
+  const uiAmount = (raw && decimals >= 0)
+    ? Number(raw) / Math.pow(10, decimals)
+    : Number(amt?.uiAmount ?? 0);
+
+  return {
+    mint: info?.mint || info?.parsed?.info?.mint || "",
+    amount: uiAmount || 0,
+    decimals
+  };
+}
+
+async function getAllSplTokenAccounts(owner) {
+  // Legacy program
+  const legacy = await rpc("getTokenAccountsByOwner", [
+    owner,
+    { programId: TOKEN_PROGRAM_ID },
+    { encoding: "jsonParsed" }
+  ]);
+  // Token-2022 program
+  const t22 = await rpc("getTokenAccountsByOwner", [
+    owner,
+    { programId: TOKEN_2022_PROGRAM_ID },
+    { encoding: "jsonParsed" }
+  ]);
+
+  const list = []
+    .concat(legacy?.value || [], t22?.value || [])
+    .map(parseParsedAccount)
+    // Hide zero-balance tokens (your Q3 = No)
+    .filter(t => t.mint && t.amount > 0);
+
+  // Combine duplicates (same mint across multiple ATAs)
+  const byMint = new Map();
+  for (const t of list) {
+    const prev = byMint.get(t.mint);
+    if (prev) {
+      prev.amount += t.amount;
+      // prefer a defined decimals
+      if (typeof prev.decimals !== "number" && typeof t.decimals === "number") prev.decimals = t.decimals;
+    } else {
+      byMint.set(t.mint, { ...t });
+    }
+  }
+  return Array.from(byMint.values());
 }
 
 app.post("/api/balances", async (req, res) => {
@@ -325,40 +449,50 @@ app.post("/api/balances", async (req, res) => {
     const wallet = req.body?.wallet?.trim();
     if (!wallet || !HELIUS_KEY) return res.status(400).json({ error: "Bad request" });
 
-    const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
-    const r = await fetch(url);
-    if (!r.ok) return res.status(502).json({ error: "Helius failed" });
-
-    const data = await r.json();
-    const sol = (data?.nativeBalance?.lamports || 0) / 1e9;
+    // 1) SOL balance
+    const solBal = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
+    const sol = Number(solBal?.value || 0) / 1e9;
     const solUsd = await getSolUsd();
 
-    const tokens = (data?.tokens || [])
-      .map(t => ({
-        mint: t.mint,
-        amount: Number(t.uiAmount || 0),
-        decimals: t.decimals,
-        symbol: t.symbol || "",
-        name: t.name || "",
-        logo: t.logo || ""
-      }))
-      .filter(t => t.amount > 0);
+    // 2) SPL token accounts (legacy + 2022)
+    const tokenAccounts = await getAllSplTokenAccounts(wallet);
 
-    const priced = await Promise.all(tokens.map(async t => {
+    // 3) Enrich with metadata + pricing (rich object)
+    const enriched = await Promise.all(tokenAccounts.map(async t => {
+      const meta = await getTokenMeta(t.mint);
+      // if decimals missing from meta, keep RPC decimals
+      const decimals = typeof meta.decimals === "number" ? meta.decimals : t.decimals;
       const priceUsd = await getTokenUsd(t.mint);
-      return { ...t, priceUsd, usd: priceUsd * t.amount };
+      const usd = priceUsd * t.amount;
+
+      return {
+        mint: t.mint,
+        amount: t.amount,
+        decimals,
+        symbol: meta.symbol || "",
+        name: meta.name || "",
+        logo: meta.logo || "",
+        tags: meta.tags || [],
+        isVerified: Boolean(meta.isVerified),
+        priceUsd,
+        usd
+      };
     }));
 
-    res.json({
+    // 4) Sort by USD desc
+    enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
+
+    return res.json({
       sol,
       solUsd,
-      tokens: priced.sort((a, b) => (b.usd || 0) - (a.usd || 0))
+      tokens: enriched
     });
   } catch (e) {
     err("Balances error:", e);
     res.status(500).json({ error: "Failed" });
   }
 });
+
 
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso) => {
