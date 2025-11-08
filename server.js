@@ -27,7 +27,7 @@ const err = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   err("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing");
   process.exit(1);
