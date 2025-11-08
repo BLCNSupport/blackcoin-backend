@@ -1,8 +1,10 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched)
-/* Changes:
- * - Realtime: add UPDATE + DELETE handlers so broadcast deletes/edits propagate instantly
- * - Env vars: accept SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (backward compatible)
- * - Clearer missing-env error message
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.0 — SMART POLLING EDITION
+/* Changes from v10.0:
+ * - Smart polling with adaptive intervals (calm/normal/volatile)
+ * - DexScreener primary + Jupiter fallback (price only)
+ * - Store-only-on-meaningful-change (Q1: B, threshold 0.25%) with periodic keepalive writes
+ * - Still polls 24/7 (Q2: No), no pause when no viewers
+ * - Realtime broadcast UPDATE/DELETE handlers preserved
  */
 import express from "express";
 import fetch from "node-fetch";
@@ -44,61 +46,179 @@ app.get("/healthz", (_req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
-/* ---------- Chart Poller — 429 IMMUNE ---------- */
+/* ---------- Chart Poller — SMART + 429 IMMUNE ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-let FETCH_INTERVAL = 70000;
-const BACKOFF_INTERVAL = 180000;
-let isBackoff = false,
-  fetchInProgress = false,
-  pollTimer = null;
-let memoryCache = [];
+
+// Adaptive polling tiers
+const INTERVAL_CALM = 120_000;   // 120s when flat
+const INTERVAL_BASE = 60_000;    // 60s normal
+const INTERVAL_HOT  = 20_000;    // 20s during spikes
+
+const BACKOFF_INTERVAL = 180_000; // 3min after a 429
+
+let fetchInProgress = false;
+let isBackoff = false;
+let pollTimer = null;
+let currentInterval = INTERVAL_BASE;
+
+// v11 knobs (from your choices)
+const SIGNIFICANT_CHANGE_PCT = 0.25; // Q1:B — write only if change ≥ 0.25%
+const KEEPALIVE_WRITE_MS = 15 * 60_000; // always write at least once every 15 minutes
+const VOL_TRIGGER_PCT = 3; // if |Δ| ≥ 3% → volatility mode for a bit
+let volCooldownTicks = 0; // countdown of HOT cycles
+
+// In-memory cache for quick charts without DB
+let memoryCache = []; // [{ timestamp, price, change, volume }]
+let lastWriteAt = 0;  // unix ms of last DB write
 
 async function insertPoint(point) {
   try {
-    const { error } = await supabase
-      .from("chart_data")
-      .insert([point]);
+    const { error } = await supabase.from("chart_data").insert([point]);
     if (error) err("Supabase insert failed:", error.message);
   } catch (e) {
     err("Supabase insert exception:", e);
   }
 }
 
+// --- Price helpers
+async function fetchDexscreenerPrice(mint) {
+  const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+    headers: { "Cache-Control": "no-cache" }
+  });
+  return res;
+}
+
+async function fetchJupiterPrice(mint) {
+  try {
+    const r = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const p = Number(j?.data?.[mint]?.price) || 0;
+    return p > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function pctChange(newVal, oldVal) {
+  if (!oldVal || oldVal === 0) return 0;
+  return ((newVal - oldVal) / oldVal) * 100;
+}
+
+// Core tick: try DexScreener; on 429/empty, fallback to Jupiter price
 async function fetchOneTick() {
   fetchInProgress = true;
-  log("Polling DexScreener...");
+  log("Polling price ...");
   try {
-    const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,
-      { headers: { "Cache-Control": "no-cache" } }
-    );
+    // 1) DexScreener primary
+    const res = await fetchDexscreenerPrice(TOKEN_MINT);
 
+    // Handle 429
     if (res.status === 429) {
       warn("429 — entering 3min backoff");
       return "backoff";
     }
-    if (!res.ok) {
-      warn(`Upstream ${res.status} — continuing`);
+
+    // Non-OK but not 429 → try fallback
+    let priceUsd = null, change = null, volume = null;
+
+    if (res.ok) {
+      const json = await res.json().catch(() => ({}));
+      const pair = json?.pairs?.[0];
+      if (pair) {
+        priceUsd = Number(pair.priceUsd) || null;
+        change = pair?.priceChange?.h24 != null ? Number(pair.priceChange.h24) : null;
+        volume = pair?.volume?.h24 != null ? Number(pair.volume.h24) : null;
+      }
+    }
+
+    // 2) Fallback to Jupiter price if price missing/zero
+    if (!priceUsd || priceUsd <= 0) {
+      const jPrice = await fetchJupiterPrice(TOKEN_MINT);
+      if (jPrice != null) {
+        priceUsd = jPrice;
+        // change/volume unknown from Jupiter; we retain previous values if available
+        const last = memoryCache.at(-1);
+        change = change != null ? change : (last ? pctChange(priceUsd, last.price) : 0);
+        volume = volume != null ? volume : (last?.volume ?? 0);
+        warn("Using Jupiter price fallback");
+      }
+    }
+
+    if (!priceUsd || priceUsd <= 0) {
+      warn(`Price unavailable (status ${res.status}).`);
       return "softfail";
     }
 
-    const json = await res.json();
-    const pair = json.pairs?.[0];
-    if (!pair) return "softfail";
+    // Compute change if missing
+    const last = memoryCache.at(-1);
+    const lastPrice = last?.price ?? null;
+    const computedChange = lastPrice != null ? pctChange(priceUsd, lastPrice) : 0;
+    const change24h = change != null ? change : computedChange;
 
     const point = {
       timestamp: new Date().toISOString(),
-      price: +pair.priceUsd,
-      change: +(pair.priceChange?.h24),
-      volume: +(pair.volume?.h24),
+      price: +priceUsd,
+      change: +change24h,
+      volume: Number.isFinite(volume) ? +volume : (last?.volume ?? 0)
     };
 
-    if (Object.values(point).some(v => isNaN(v))) return "softfail";
+    if (Object.values(point).some(v => typeof v !== "number" || Number.isNaN(v))) {
+      warn("Bad point, skipping", point);
+      return "softfail";
+    }
 
+    // Push into memory immediately (visual smoothness)
     memoryCache.push(point);
     if (memoryCache.length > 10000) memoryCache.shift();
-    await insertPoint(point);
-    log("Data stored");
+
+    // Decide DB write
+    let shouldWrite = false;
+    const msSinceWrite = Date.now() - lastWriteAt;
+
+    if (!last) {
+      // first point of session — store
+      shouldWrite = true;
+    } else {
+      const absPct = Math.abs(pctChange(point.price, lastPrice));
+      // Q1:B — only write on meaningful move ≥ threshold
+      if (absPct >= SIGNIFICANT_CHANGE_PCT) {
+        shouldWrite = true;
+      }
+      // keepalive write at least every KEEPALIVE_WRITE_MS
+      if (!shouldWrite && msSinceWrite >= KEEPALIVE_WRITE_MS) {
+        shouldWrite = true;
+      }
+    }
+
+    if (shouldWrite) {
+      await insertPoint(point);
+      lastWriteAt = Date.now();
+      log("Data stored");
+    } else {
+      log("Calm tick — skipped DB write (memory only).");
+    }
+
+    // Adaptive interval logic
+    let next = INTERVAL_BASE;
+
+    // Volatility trigger based on immediate movement between last 2 points
+    if (last) {
+      const spikeAbs = Math.abs(pctChange(point.price, lastPrice));
+      if (spikeAbs >= VOL_TRIGGER_PCT) {
+        volCooldownTicks = Math.ceil((3 * 60_000) / INTERVAL_HOT); // ~3min @ 20s
+      }
+    }
+    if (volCooldownTicks > 0) {
+      next = INTERVAL_HOT;
+      volCooldownTicks -= 1;
+    } else {
+      // If we haven't written for a while and price barely moves, cool down
+      const absSinceWrite = last ? Math.abs(pctChange(point.price, lastPrice)) : 0;
+      next = absSinceWrite < 0.05 ? INTERVAL_CALM : INTERVAL_BASE; // <0.05% → very calm
+    }
+
+    currentInterval = next;
     return "ok";
   } catch (e) {
     err("fetch failed:", e);
@@ -114,21 +234,21 @@ function scheduleNext(ms) {
 }
 
 async function pollLoop() {
-  if (fetchInProgress) return scheduleNext(isBackoff ? BACKOFF_INTERVAL : FETCH_INTERVAL);
+  if (fetchInProgress) return scheduleNext(isBackoff ? BACKOFF_INTERVAL : currentInterval);
   const r = await fetchOneTick();
   if (r === "backoff") {
-    if (!isBackoff) isBackoff = true;
+    isBackoff = true;
     return scheduleNext(BACKOFF_INTERVAL);
   }
   if (isBackoff && r === "ok") {
     isBackoff = false;
     log("Backoff ended");
   }
-  scheduleNext(FETCH_INTERVAL);
+  scheduleNext(currentInterval);
 }
 pollLoop();
 
-/* ---------- Chart API ---------- */
+/* ---------- Chart API (unchanged response shape) ---------- */
 function bucketMs(i) {
   switch (i) {
     case "1m": return 60e3;
@@ -156,13 +276,13 @@ function bucketize(rows, i) {
     const b = m.get(key);
     b.price = price;
     b.change = change;
-    b.volume += isNaN(vol) ? 0 : vol;
+    b.volume += Number.isFinite(vol) ? vol : 0;
   }
   return Array.from(m.values()).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 }
 
 app.get("/api/chart", async (req, res) => {
-  try {
+  try {
     const interval = req.query.interval || "D";
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(parseInt(req.query.limit) || 10000, 20000);
@@ -413,20 +533,20 @@ async function getAllSplTokenAccounts(owner) {
   // Legacy program
   const legacy = await rpc("getTokenAccountsByOwner", [
     owner,
-    { programId: TOKEN_PROGRAM_ID },
+    { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
     { encoding: "jsonParsed" }
   ]);
   // Token-2022 program
   const t22 = await rpc("getTokenAccountsByOwner", [
     owner,
-    { programId: TOKEN_2022_PROGRAM_ID },
+    { programId: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" },
     { encoding: "jsonParsed" }
   ]);
 
   const list = []
     .concat(legacy?.value || [], t22?.value || [])
     .map(parseParsedAccount)
-    // Hide zero-balance tokens (your Q3 = No)
+    // Hide zero-balance tokens
     .filter(t => t.mint && t.amount > 0);
 
   // Combine duplicates (same mint across multiple ATAs)
@@ -435,7 +555,6 @@ async function getAllSplTokenAccounts(owner) {
     const prev = byMint.get(t.mint);
     if (prev) {
       prev.amount += t.amount;
-      // prefer a defined decimals
       if (typeof prev.decimals !== "number" && typeof t.decimals === "number") prev.decimals = t.decimals;
     } else {
       byMint.set(t.mint, { ...t });
@@ -460,11 +579,9 @@ app.post("/api/balances", async (req, res) => {
     // 3) Enrich with metadata + pricing (rich object)
     const enriched = await Promise.all(tokenAccounts.map(async t => {
       const meta = await getTokenMeta(t.mint);
-      // if decimals missing from meta, keep RPC decimals
       const decimals = typeof meta.decimals === "number" ? meta.decimals : t.decimals;
       const priceUsd = await getTokenUsd(t.mint);
       const usd = priceUsd * t.amount;
-
       return {
         mint: t.mint,
         amount: t.amount,
@@ -479,14 +596,9 @@ app.post("/api/balances", async (req, res) => {
       };
     }));
 
-    // 4) Sort by USD desc
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    return res.json({
-      sol,
-      solUsd,
-      tokens: enriched
-    });
+    return res.json({ sol, solUsd, tokens: enriched });
   } catch (e) {
     err("Balances error:", e);
     res.status(500).json({ error: "Failed" });
@@ -542,7 +654,7 @@ app.get("/api/broadcasts", async (_req, res) => {
     res.json((data || []).map(normRow));
   } catch (e) {
     err("Broadcasts GET error:", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Failed" });
   }
 });
 
@@ -629,7 +741,7 @@ subscribe();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v10.0 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.0 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
 });
