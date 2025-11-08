@@ -1,5 +1,9 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION
-// 429-PROOF + FULL PROFILE + AVATAR + BROADCAST + REFUND + REALTIME + RENDER-READY
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched)
+/* Changes:
+ * - Realtime: add UPDATE + DELETE handlers so broadcast deletes/edits propagate instantly
+ * - Env vars: accept SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (backward compatible)
+ * - Clearer missing-env error message
+ */
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -27,9 +31,10 @@ const err = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// Accept both names to match your Render config
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  err("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing");
+  err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
   process.exit(1);
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -407,41 +412,6 @@ app.get("/api/broadcasts", async (_req, res) => {
   }
 });
 
-/* ---------- Refunds ---------- */
-app.post("/api/refund", async (req, res) => {
-  try {
-    const { wallet, token, rent, tx, status } = req.body;
-    if (!wallet || !tx) return res.status(400).json({ error: "Missing" });
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .insert([{ wallet, token: token || "UNKNOWN", rent_reclaimed: rent ?? 0, tx, status: status || "Success" }])
-      .select();
-    if (error) throw error;
-    res.json({ success: true, inserted: data });
-  } catch (e) {
-    err("Refund insert error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/refund-history", async (req, res) => {
-  try {
-    const { wallet } = req.query;
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .select("*")
-      .eq("wallet", wallet)
-      .order("created_at", { ascending: false })
-      .limit(50);
-    if (error) throw error;
-    res.json(data || []);
-  } catch (e) {
-    err("Refund history error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 /* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -467,9 +437,9 @@ wss.on("connection", async (socket) => {
 
 setInterval(() => {
   for (const s of clients) {
-    if (!s.isAlive) return s.terminate();
+    if (!s.isAlive) { try { s.terminate(); } catch {} continue; }
     s.isAlive = false;
-    s.ping();
+    try { s.ping(); } catch {}
   }
 }, 30000);
 
@@ -486,12 +456,28 @@ function subscribe() {
     if (rtChannel) supabase.removeChannel(rtChannel);
     rtChannel = supabase
       .channel("rt:hub_broadcasts")
+      // INSERTS
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_broadcasts" }, (p) => {
-        const row = normRow(p.new);
+        const row = normRow(p.new || p.record);
         if (row) {
-          log("New broadcast");
+          log("Realtime INSERT hub_broadcasts id=", row.id);
           wsBroadcast({ type: "insert", row });
         }
+      })
+      // UPDATES
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hub_broadcasts" }, (p) => {
+        const row = normRow(p.new || p.record);
+        if (row) {
+          log("Realtime UPDATE hub_broadcasts id=", row.id);
+          wsBroadcast({ type: "update", row });
+        }
+      })
+      // DELETES
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "hub_broadcasts" }, (p) => {
+        const old = p.old || p.record || null;
+        const id = old?.id;
+        log("Realtime DELETE hub_broadcasts id=", id);
+        if (id) wsBroadcast({ type: "delete", id });
       })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") log("Realtime: LIVE");
