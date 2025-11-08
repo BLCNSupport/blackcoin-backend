@@ -10,7 +10,8 @@
 // - 10s API caching for price & 24h change + server-side portfolioDeltaPct (25% per-asset cap)
 // - BlackCoin overrides (mint symbol/name + price source order) + server-side icon resolution
 // - T2 HYBRID FORMATTING for balances (raw + formatted fields)
-// - ULTRA dust protection: mark tiny tokens as hidden (NOT removed), keep hidden tokens at bottom
+// - Ultra: send token `icon` field (in addition to `logo`) to match frontend renderer
+// - Helius v1 path fix + resilient v0 fallback (prevents `sol: null`)
 
 import express from "express";
 import fetch from "node-fetch";
@@ -336,10 +337,11 @@ async function resolveTokenIcon(mint){
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
 
+// v1: /v1/addresses/:address/balances (no tokenType filter; we'll keep all then filter to fungible if present)
 async function fetchHeliusBalances(wallet){
   // Try v1
   try{
-    const u1 = `https://api.helius.xyz/v1/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&tokenType=fungible`;
+    const u1 = `https://api.helius.xyz/v1/addresses/${wallet}/balances?api-key=${HELIUS_KEY}`;
     const r1 = await fetch(u1, { headers: { "Cache-Control": "no-cache" }});
     if (r1.ok) return { json: await r1.json(), version: "v1" };
     const t1 = await r1.text();
@@ -357,17 +359,16 @@ async function fetchHeliusBalances(wallet){
 }
 
 /**
- * POST /api/balances   (T2 hybrid formatting + ULTRA dust flagging)
+ * POST /api/balances   (T2 hybrid formatting)
  * body: { wallet: string }
  * returns: {
  *   sol, solUsd, solChangePct, solFormattedUsd,
  *   tokens: [{
- *     mint, symbol, name, logo, decimals,
+ *     mint, symbol, name, icon, logo, decimals,
  *     amount, amountFormatted,
  *     priceUsd, formattedUsd,
  *     usd, usdFormatted,
- *     changePct,
- *     hidden   // <-- ULTRA dust flag
+ *     changePct
  *   }],
  *   portfolioDeltaPct
  * }
@@ -379,15 +380,23 @@ app.post("/api/balances", async (req, res) => {
     if (!HELIUS_KEY) return res.status(500).json({ error: "Backend missing HELIUS_API_KEY" });
 
     // Pull balances
-    const { json: data } = await fetchHeliusBalances(wallet);
+    const { json: data, version } = await fetchHeliusBalances(wallet);
 
-    // SOL
-    const lamports =
-      Number(data?.nativeBalance?.lamports) ??
-      Number(data?.native?.lamports) ?? 0;
-    const sol = lamports / 1e9;
+    // SOL (normalize between v1 & v0)
+    let lamports = 0;
+    if (version === "v1") {
+      // v1 may return { nativeBalance: { lamports } } OR { native: { ... } }
+      lamports =
+        Number(data?.nativeBalance?.lamports) ??
+        Number(data?.native?.lamports) ?? 0;
+    } else {
+      lamports =
+        Number(data?.nativeBalance?.lamports) ??
+        Number(data?.native?.lamports) ?? 0;
+    }
+    const sol = (lamports || 0) / 1e9;
 
-    // Tokens
+    // Tokens (v1: tokens[], v0: tokens[] or tokenBalances[])
     const rawTokens =
       Array.isArray(data?.tokens) ? data.tokens :
       Array.isArray(data?.tokenBalances) ? data.tokenBalances :
@@ -413,7 +422,7 @@ app.post("/api/balances", async (req, res) => {
       const isBlack = t.mint === TOKEN_MINT;
       const symbol = isBlack ? "BLCN" : (t.symbol || "");
       const name   = isBlack ? "BlackCoin" : (t.name || "");
-      const logo   = await resolveTokenIcon(t.mint);
+      const icon   = await resolveTokenIcon(t.mint); // resolved icon
 
       if (isBlack) {
         const bc = await blackCoinPriceAndChange(t.mint);
@@ -421,7 +430,7 @@ app.post("/api/balances", async (req, res) => {
         const usd = priceUsd * t.amount;
         return {
           mint: t.mint,
-          symbol, name, logo,
+          symbol, name, icon, logo: icon,
           decimals: t.decimals,
           amount: t.amount,
           amountFormatted: formatAmountSmart(t.amount),
@@ -429,7 +438,8 @@ app.post("/api/balances", async (req, res) => {
           formattedUsd: formatUsd(priceUsd),
           usd,
           usdFormatted: formatUsd(usd),
-          changePct: bc.changePct
+          changePct: bc.changePct,
+          hidden: false
         };
       } else {
         const blend = await blendedPriceGeneric(t.mint);
@@ -437,7 +447,7 @@ app.post("/api/balances", async (req, res) => {
         const usd = priceUsd * t.amount;
         return {
           mint: t.mint,
-          symbol, name, logo,
+          symbol, name, icon, logo: icon,
           decimals: t.decimals,
           amount: t.amount,
           amountFormatted: formatAmountSmart(t.amount),
@@ -445,34 +455,13 @@ app.post("/api/balances", async (req, res) => {
           formattedUsd: formatUsd(priceUsd),
           usd,
           usdFormatted: formatUsd(usd),
-          changePct: Number(blend.changePct) || 0
+          changePct: Number(blend.changePct) || 0,
+          hidden: false
         };
       }
     }));
 
-    // ---- ULTRA dust flagging ----
-    // Rules (chosen mode):
-    // 1) BlackCoin is NEVER hidden
-    // 2) Hidden if usd < $0.01 OR (solEquivalent <= 0.0008 SOL) AND amount is micro-dust
-    // 3) We *mark* hidden tokens (hidden:true) but do NOT remove them (refund tool safe)
-    const MICRO_AMOUNT_CUTOFF = 0.000001; // generic micro amount for SPL
-    const SOL_DUST_EQ = 0.0008;          // per your preference
-    const tokensWithHidden = priced.map(t => {
-      const isBlack = t.mint === TOKEN_MINT;
-      const usd = Number(t.usd) || 0;
-      const amount = Number(t.amount) || 0;
-      const solEq = solUsd > 0 ? (usd / solUsd) : 0;
-      const hidden = !isBlack && (
-        ((usd > 0 && usd < 0.01) || (solEq > 0 && solEq <= SOL_DUST_EQ))
-        && amount <= MICRO_AMOUNT_CUTOFF
-      );
-      return { ...t, hidden };
-    });
-
-    // Sort: visible first by USD desc, then hidden by USD desc (Option A)
-    const visible = tokensWithHidden.filter(t => !t.hidden).sort((a,b) => (b.usd||0) - (a.usd||0));
-    const hidden  = tokensWithHidden.filter(t =>  t.hidden).sort((a,b) => (b.usd||0) - (a.usd||0));
-    const tokens  = [...visible, ...hidden];
+    const tokens = priced.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
     // ---- Portfolio Δ% with 25% per-asset cap ----
     const parts = [];
@@ -495,7 +484,7 @@ app.post("/api/balances", async (req, res) => {
     }
 
     res.json({
-      sol,
+      sol: Number.isFinite(sol) ? sol : 0,
       solUsd,
       solChangePct,
       solFormattedUsd: formatUsd(solUsd),
@@ -504,7 +493,6 @@ app.post("/api/balances", async (req, res) => {
     });
   } catch (e) {
     err("Error /api/balances:", e);
-    // Surface upstream body if we captured it in message
     res.status(500).json({ error: e.message || "Failed to load balances" });
   }
 });
