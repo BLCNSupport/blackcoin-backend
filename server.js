@@ -423,9 +423,10 @@ app.post("/api/balances", async (req, res) => {
     // Price tokens (BlackCoin override for name/symbol + price pref)
     const priced = await Promise.all(tokensBase.map(async t => {
       const isBlack = t.mint === TOKEN_MINT;
-      const symbol = isBlack ? "BLCN" : (t.symbol || "");
-      const name   = isBlack ? "BlackCoin" : (t.name || "");
-      const icon   = await resolveTokenIcon(t.mint); // resolved icon
+      const { name: metaName, symbol: metaSymbol, icon: metaIcon } = await resolveTokenMeta(t.mint);
+      const symbol = isBlack ? "BLCN" : (t.symbol || metaSymbol || "");
+      const name   = isBlack ? "BlackCoin" : (t.name || metaName || "");
+      const icon   = t.logo || metaIcon || await resolveTokenIcon(t.mint);
 
       let priceUsd, changePct;
       if (isBlack) {
@@ -442,7 +443,10 @@ app.post("/api/balances", async (req, res) => {
 
       return {
         mint: t.mint,
-        symbol, name, icon, logo: icon,
+        symbol: symbol || `Unknown (${t.mint.slice(0,4)}...)`,
+        name: name || `Unknown Token`,
+        icon,
+        logo: icon,
         decimals: t.decimals,
         amount: t.uiAmount,
         amountFormatted: formatAmountSmart(t.uiAmount),
