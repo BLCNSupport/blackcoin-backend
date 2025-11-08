@@ -1,10 +1,8 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.9 — RENDER KILLER + DNS NUKED + IMMORTAL CHART
-/* v10.9 ULTIMATE EDITION:
- * - Render cold-start DNS ENOTFOUND = OBLITERATED
- * - 60s aggressive warmup + IP fallback + 8 retries + exponential backoff
- * - Jupiter Primary → Jupiter Quote → DexScreener → Supabase LAST_KNOWN
- * - All your features 100% intact: chart, profiles, avatars, handles, balances, broadcasts, live WS, delete/update
- * - Your chart NEVER dies. Jupiter works on first tick. BlackCoin wins.
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched)
+/* Changes:
+ * - Realtime: add UPDATE + DELETE handlers so broadcast deletes/edits propagate instantly
+ * - Env vars: accept SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (backward compatible)
+ * - Clearer missing-env error message
  */
 import express from "express";
 import fetch from "node-fetch";
@@ -14,10 +12,6 @@ import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
 import { WebSocketServer } from "ws";
 import http from "http";
-import dns from "dns";
-
-// FORCE IPv4 — DESTROYS Render DNS bug
-dns.setDefaultResultOrder("ipv4first");
 
 dotenv.config();
 
@@ -26,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(express.static("public"));
+app.use(express.static("public")); // ← Serves OperatorHub.html
 
 function ts() {
   return `[${new Date().toTimeString().slice(0, 8)}]`;
@@ -37,6 +31,7 @@ const err = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
+// Accept both names to match your Render config
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
@@ -44,266 +39,94 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+/* ---------- Health ---------- */
 app.get("/healthz", (_req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
-/* ---------- Chart Poller — RENDER KILLER + TRIPLE REDUNDANT + LAST_KNOWN ---------- */
+/* ---------- Chart Poller — 429 IMMUNE ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
-
-// IP fallback for price.jup.ag
-const JUPITER_IP = "76.76.21.21";
-const JUPITER_PRIMARY = "https://price.jup.ag/v6/price";
-const JUPITER_QUOTE   = "https://quote-api.jup.ag/v6/price";
-const DEXSCREENER_API = `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`;
-
-const BASE_INTERVAL = 240000 + Math.floor(Math.random() * 120000); // 4–6 min
-let currentInterval = BASE_INTERVAL;
-let pollTimer = null;
-let fetchInProgress = false;
+let FETCH_INTERVAL = 70000;
+const BACKOFF_INTERVAL = 180000;
+let isBackoff = false,
+  fetchInProgress = false,
+  pollTimer = null;
 let memoryCache = [];
-
-// LAST_KNOWN — survives deploys, crashes, nukes
-let LAST_KNOWN = { price: null, change: null, timestamp: null };
-let consecutiveFailures = 0;
-const MAX_BACKOFF = 30 * 60 * 1000;
-
-// NUCLEAR DNS-PROOF FETCH
-async function fetchWithDnsNuke(url, options = {}, retries = 8) {
-  let lastError;
-  for (let i = 0; i < retries; i++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-
-      const finalUrl = i >= 3 && url.includes("price.jup.ag") 
-        ? url.replace("price.jup.ag", JUPITER_IP)
-        : url;
-
-      const res = await fetch(finalUrl, {
-        ...options,
-        signal: controller.signal,
-        headers: {
-          "User-Agent": "BlackcoinHub/10.9-RENDERKILLER",
-          "Host": url.includes("price.jup.ag") ? "price.jup.ag" : undefined,
-          "Cache-Control": "no-cache",
-          ...options.headers
-        }
-      });
-
-      clearTimeout(timeout);
-      if (res.ok) return res;
-    } catch (e) {
-      lastError = e;
-      if (e.message.includes("ENOTFOUND")) {
-        warn(`DNS NUKE: ${url} → attempt ${i + 1}/${retries} (backoff ${(i + 1) * 4}s)`);
-        await new Promise(r => setTimeout(r, (i + 1) * 4000));
-      } else if (e.name !== "AbortError") {
-        warn(`Fetch error: ${e.message}`);
-      }
-    }
-  }
-  throw lastError || new Error(`DNS NUKE failed: ${url}`);
-}
 
 async function insertPoint(point) {
   try {
-    const { error } = await supabase.from("chart_data").insert([point]);
+    const { error } = await supabase
+      .from("chart_data")
+      .insert([point]);
     if (error) err("Supabase insert failed:", error.message);
   } catch (e) {
     err("Supabase insert exception:", e);
   }
 }
 
-async function saveLastKnown(price, change, timestamp) {
-  try {
-    await supabase
-      .from("chart_state")
-      .upsert({
-        key: "last_known",
-        price,
-        change,
-        timestamp,
-        updated_at: new Date().toISOString()
-      }, { onConflict: "key" });
-  } catch (e) {
-    err("Failed to save LAST_KNOWN:", e.message);
-  }
-}
-
-async function loadLastKnown() {
-  try {
-    const { data } = await supabase
-      .from("chart_state")
-      .select("price, change, timestamp")
-      .eq("key", "last_known")
-      .maybeSingle();
-
-    if (data) {
-      LAST_KNOWN = {
-        price: Number(data.price),
-        change: Number(data.change),
-        timestamp: data.timestamp
-      };
-      log(`RESTORED LAST_KNOWN → $${LAST_KNOWN.price.toFixed(8)} | 24h: ${LAST_KNOWN.change >= 0 ? '+' : ''}${LAST_KNOWN.change.toFixed(2)}%`);
-    } else {
-      log("No LAST_KNOWN in DB → starting fresh");
-    }
-  } catch (e) {
-    err("Failed to load LAST_KNOWN:", e.message);
-  }
-}
-
-async function fetchPrice() {
-  const sources = [
-    {
-      name: "Jupiter Primary",
-      url: `${JUPITER_PRIMARY}?ids=${TOKEN_MINT}`,
-      parse: (json) => {
-        const d = json.data?.[TOKEN_MINT];
-        if (d?.price) return { price: +d.price, change: +(d.priceChange?.h24 || 0), volume: +(d.volume?.h24 || 0) || 0 };
-        return null;
-      }
-    },
-    {
-      name: "Jupiter Quote",
-      url: `${JUPITER_QUOTE}?ids=${TOKEN_MINT}`,
-      parse: (json) => {
-        const d = json.data?.[TOKEN_MINT];
-        if (d?.price) return { price: +d.price, change: +(d.priceChange?.h24 || 0), volume: +(d.volume?.h24 || 0) || 0 };
-        return null;
-      }
-    },
-    {
-      name: "DexScreener",
-      url: DEXSCREENER_API,
-      parse: (json) => {
-        const pair = json.pairs?.[0];
-        if (pair?.priceUsd) {
-          return { price: +pair.priceUsd, change: +(pair.priceChange?.h24 || 0), volume: +(pair.volume?.h24 || 0) || 0 };
-        }
-        return null;
-      }
-    }
-  ];
-
-  for (const src of sources) {
-    try {
-      const res = await fetchWithDnsNuke(src.url);
-      const json = await res.json();
-      const data = src.parse(json);
-      if (data) {
-        log(`PRICE FROM ${src.name} → $${data.price.toFixed(8)} | 24h: ${data.change >= 0 ? '+' : ''}${data.change.toFixed(2)}%`);
-        return { ...data, source: src.name };
-      }
-    } catch (e) {
-      warn(`Source failed: ${src.name}`);
-    }
-  }
-  return null;
-}
-
 async function fetchOneTick() {
-  if (fetchInProgress) return;
   fetchInProgress = true;
-  const now = new Date().toISOString();
-
-  log("NUCLEAR TICK → Jupiter (IP fallback) → DexScreener → LAST_KNOWN");
-
-  let success = false;
-  let point = null;
-
+  log("Polling DexScreener...");
   try {
-    const result = await fetchPrice();
-    if (result) {
-      point = {
-        timestamp: now,
-        price: result.price,
-        change: result.change,
-        volume: result.volume
-      };
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,
+      { headers: { "Cache-Control": "no-cache" } }
+    );
 
-      LAST_KNOWN = { price: point.price, change: point.change, timestamp: now };
-      await saveLastKnown(point.price, point.change, now);
-      success = true;
+    if (res.status === 429) {
+      warn("429 — entering 3min backoff");
+      return "backoff";
     }
+    if (!res.ok) {
+      warn(`Upstream ${res.status} — continuing`);
+      return "softfail";
+    }
+
+    const json = await res.json();
+    const pair = json.pairs?.[0];
+    if (!pair) return "softfail";
+
+    const point = {
+      timestamp: new Date().toISOString(),
+      price: +pair.priceUsd,
+      change: +(pair.priceChange?.h24),
+      volume: +(pair.volume?.h24),
+    };
+
+    if (Object.values(point).some(v => isNaN(v))) return "softfail";
+
+    memoryCache.push(point);
+    if (memoryCache.length > 10000) memoryCache.shift();
+    await insertPoint(point);
+    log("Data stored");
+    return "ok";
   } catch (e) {
-    err("All sources failed:", e.message);
+    err("fetch failed:", e);
+    return "softfail";
+  } finally {
+    fetchInProgress = false;
   }
-
-  if (!success) {
-    if (LAST_KNOWN.price !== null) {
-      point = {
-        timestamp: now,
-        price: LAST_KNOWN.price,
-        change: LAST_KNOWN.change,
-        volume: 0
-      };
-      warn(`TOTAL BLACKOUT → using DB-backed price: $${point.price.toFixed(8)}`);
-    } else {
-      point = { timestamp: now, price: 0.00012450, change: -2.22, volume: 0 };
-      warn("FIRST RUN + APOCALYPSE → using DexScreener seed");
-    }
-    consecutiveFailures++;
-  } else {
-    if (consecutiveFailures > 0) {
-      log(`NUCLEAR RECOVERY after ${consecutiveFailures} failures`);
-      consecutiveFailures = 0;
-    }
-  }
-
-  memoryCache.push(point);
-  if (memoryCache.length > 10000) memoryCache.shift();
-  await insertPoint(point);
-
-  currentInterval = success
-    ? BASE_INTERVAL + Math.random() * 90000
-    : Math.min(MAX_BACKOFF, currentInterval * 1.5);
-
-  scheduleNext(currentInterval);
-  fetchInProgress = false;
 }
 
 function scheduleNext(ms) {
   if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(fetchOneTick, ms);
+  pollTimer = setTimeout(pollLoop, ms);
 }
 
-// 60-SECOND AGGRESSIVE DNS WARMUP
-async function startPoller() {
-  await loadLastKnown();
-  log(`RENDER KILLER warming up DNS for 60 seconds...`);
-
-  const warmupUrls = [
-    "https://price.jup.ag",
-    "https://quote-api.jup.ag",
-    "https://api.dexscreener.com",
-    `https://${JUPITER_IP}`
-  ];
-
-  await Promise.all(warmupUrls.map(async (url) => {
-    for (let i = 0; i < 3; i++) {
-      try {
-        await fetch(url, { method: "HEAD", headers: { Host: url.includes(JUPITER_IP) ? "price.jup.ag" : undefined } });
-        log(`DNS NUKED: ${url}`);
-        break;
-      } catch {}
-      await new Promise(r => setTimeout(r, 3000));
-    }
-  }));
-
-  log(`RENDER DNS = DEAD. Starting poller in 10s`);
-  setTimeout(() => {
-    log(`FIRST TICK — JUPITER WILL WORK`);
-    fetchOneTick();
-  }, 10000);
+async function pollLoop() {
+  if (fetchInProgress) return scheduleNext(isBackoff ? BACKOFF_INTERVAL : FETCH_INTERVAL);
+  const r = await fetchOneTick();
+  if (r === "backoff") {
+    if (!isBackoff) isBackoff = true;
+    return scheduleNext(BACKOFF_INTERVAL);
+  }
+  if (isBackoff && r === "ok") {
+    isBackoff = false;
+    log("Backoff ended");
+  }
+  scheduleNext(FETCH_INTERVAL);
 }
-startPoller();
-
-// Keep-alive ping
-setInterval(() => {
-  fetch(`https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'blackcoin-backend-1.onrender.com'}/healthz`).catch(() => {});
-}, 300000);
+pollLoop();
 
 /* ---------- Chart API ---------- */
 function bucketMs(i) {
@@ -457,21 +280,22 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 });
 
 /* ---------- Balances (Helius RPC + DexScreener + Jupiter) ---------- */
-// ← YOUR FULL BALANCES CODE — 100% UNTOUCHED AND PERFECT
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY missing");
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
-const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"; // SPL legacy
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"; // SPL-2022
 
+// Caches
 const SOL_CACHE = { priceUsd: null, ts: 0 };
-const META_CACHE = new Map();
-const PRICE_CACHE = new Map();
-const TTL_PRICE = 30_000;
-const TTL_META  = 6 * 60 * 60 * 1000;
+const META_CACHE = new Map();    // mint -> { symbol, name, logo, tags, verified, decimals? }
+const PRICE_CACHE = new Map();   // mint -> { priceUsd, ts }
+const TTL_PRICE = 30_000;        // 30s for prices
+const TTL_META  = 6 * 60 * 60 * 1000; // 6h for token metadata
 const TTL_SOL   = 25_000;
 
+// Small helpers
 async function rpc(method, params) {
   const r = await fetch(HELIUS_RPC, {
     method: "POST",
@@ -500,11 +324,13 @@ async function getSolUsd() {
   return SOL_CACHE.priceUsd ?? 0;
 }
 
+// ---- Token metadata (symbol/name/logo/verified/tags) via Jupiter first ----
 async function getTokenMeta(mint) {
   const now = Date.now();
   const cached = META_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_META) return cached.data;
 
+  // Jupiter token endpoint returns rich metadata
   try {
     const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
     if (r.ok) {
@@ -522,16 +348,19 @@ async function getTokenMeta(mint) {
     }
   } catch {}
 
+  // Fallback: lean meta (nothing fancy)
   const meta = { symbol: "", name: "", logo: "", tags: [], isVerified: false, decimals: undefined };
   META_CACHE.set(mint, { ts: now, data: meta });
   return meta;
 }
 
+// ---- Price: DexScreener primary, Jupiter fallback
 async function getTokenUsd(mint) {
   const now = Date.now();
   const c = PRICE_CACHE.get(mint);
   if (c && now - c.ts < TTL_PRICE) return c.priceUsd;
 
+  // 1) DexScreener
   try {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
     if (r.ok) {
@@ -544,6 +373,7 @@ async function getTokenUsd(mint) {
     }
   } catch {}
 
+  // 2) Jupiter price fallback
   try {
     const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
     if (r2.ok) {
@@ -560,7 +390,9 @@ async function getTokenUsd(mint) {
   return 0;
 }
 
+// Normalize one parsed token account from RPC
 function parseParsedAccount(acc) {
+  // rpc result item: { pubkey, account: { data: { parsed: {...} } } }
   const info = acc?.account?.data?.parsed?.info;
   const amt  = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
   const decimals = Number(amt?.decimals ?? info?.decimals ?? 0);
@@ -578,11 +410,13 @@ function parseParsedAccount(acc) {
 }
 
 async function getAllSplTokenAccounts(owner) {
+  // Legacy program
   const legacy = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_PROGRAM_ID },
     { encoding: "jsonParsed" }
   ]);
+  // Token-2022 program
   const t22 = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_2022_PROGRAM_ID },
@@ -592,13 +426,16 @@ async function getAllSplTokenAccounts(owner) {
   const list = []
     .concat(legacy?.value || [], t22?.value || [])
     .map(parseParsedAccount)
+    // Hide zero-balance tokens (your Q3 = No)
     .filter(t => t.mint && t.amount > 0);
 
+  // Combine duplicates (same mint across multiple ATAs)
   const byMint = new Map();
   for (const t of list) {
     const prev = byMint.get(t.mint);
     if (prev) {
       prev.amount += t.amount;
+      // prefer a defined decimals
       if (typeof prev.decimals !== "number" && typeof t.decimals === "number") prev.decimals = t.decimals;
     } else {
       byMint.set(t.mint, { ...t });
@@ -612,14 +449,18 @@ app.post("/api/balances", async (req, res) => {
     const wallet = req.body?.wallet?.trim();
     if (!wallet || !HELIUS_KEY) return res.status(400).json({ error: "Bad request" });
 
+    // 1) SOL balance
     const solBal = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
     const sol = Number(solBal?.value || 0) / 1e9;
     const solUsd = await getSolUsd();
 
+    // 2) SPL token accounts (legacy + 2022)
     const tokenAccounts = await getAllSplTokenAccounts(wallet);
 
+    // 3) Enrich with metadata + pricing (rich object)
     const enriched = await Promise.all(tokenAccounts.map(async t => {
       const meta = await getTokenMeta(t.mint);
+      // if decimals missing from meta, keep RPC decimals
       const decimals = typeof meta.decimals === "number" ? meta.decimals : t.decimals;
       const priceUsd = await getTokenUsd(t.mint);
       const usd = priceUsd * t.amount;
@@ -638,6 +479,7 @@ app.post("/api/balances", async (req, res) => {
       };
     }));
 
+    // 4) Sort by USD desc
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
     return res.json({
@@ -650,6 +492,7 @@ app.post("/api/balances", async (req, res) => {
     res.status(500).json({ error: "Failed" });
   }
 });
+
 
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso) => {
@@ -747,6 +590,7 @@ function subscribe() {
     if (rtChannel) supabase.removeChannel(rtChannel);
     rtChannel = supabase
       .channel("rt:hub_broadcasts")
+      // INSERTS
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
@@ -754,6 +598,7 @@ function subscribe() {
           wsBroadcast({ type: "insert", row });
         }
       })
+      // UPDATES
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
@@ -761,6 +606,7 @@ function subscribe() {
           wsBroadcast({ type: "update", row });
         }
       })
+      // DELETES
       .on("postgres_changes", { event: "DELETE", schema: "public", table: "hub_broadcasts" }, (p) => {
         const old = p.old || p.record || null;
         const id = old?.id;
@@ -783,10 +629,7 @@ subscribe();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB v10.9 — RENDER KILLER — LIVE ON PORT ${PORT}`);
-  log(`DNS bug: OBLITERATED`);
-  log(`Jupiter works on first tick`);
-  log(`Your chart is immortal`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v10.0 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
 });
