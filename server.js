@@ -7,8 +7,9 @@
 // - Refund: insert + list
 // - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
 // - Weighted-blend pricing (Jupiter + DexScreener) with USD formatter & caching
-// - NEW: 10s API caching for price & 24h change + server-side portfolioDeltaPct (with 25% per-asset cap)
-// - NEW: BlackCoin overrides (mint symbol/name + price source order) + server-side icon resolution
+// - 10s API caching for price & 24h change + server-side portfolioDeltaPct (25% per-asset cap)
+// - BlackCoin overrides (mint symbol/name + price source order) + server-side icon resolution
+// - T2 HYBRID FORMATTING for balances (raw + formatted fields)
 
 import express from "express";
 import fetch from "node-fetch";
@@ -145,11 +146,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
   }catch(e){ err("Error /api/avatar-upload:",e); res.status(500).json({error:e.message}); }
 });
 
-/* ---------- Balances (Helius Enhanced + prices) ---------- */
-const HELIUS_KEY = process.env.HELIUS_API_KEY;
-if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
-
-// ===== Number/format utils =====
+/* ---------- Helpers: formatting ---------- */
 function abbreviate(n) {
   const abs = Math.abs(n);
   const sign = n < 0 ? "-" : "";
@@ -170,25 +167,32 @@ function formatUsd(value){
     return (v < 0 ? "-$" : "$") + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   const abbr = abbreviate(v);
-  return "$" + abbr;
+  return "$" + (abbr ?? abs.toLocaleString("en-US", { maximumFractionDigits: 2 }));
+}
+function formatAmountSmart(amount, decimals = 2) {
+  const v = Number(amount) || 0;
+  const abs = Math.abs(v);
+  if (abs === 0) return "0";
+  if (abs >= 1)  return abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // < 1: show up to 6 dp, trim trailing zeros
+  return abs.toFixed(6).replace(/\.?0+$/,"");
 }
 
-// ===== Caches =====
+/* ---------- Price sources, caches, icons ---------- */
 const PRICE_TTL_MS = 25_000;
-const BLENDED_CACHE = new Map(); // mint -> { priceUsd, ts, source, confidence, raw }
+const BLENDED_CACHE = new Map(); // mint -> { priceUsd, changePct, ts, source, confidence, raw }
 const TEN_S = 10_000;
 const DS_SEARCH_CACHE = new Map(); // mint -> { ts, json }
 const CG_SOL_CACHE = { ts: 0, priceUsd: 0, changePct: 0 };
 const ICON_CACHE = new Map();
 
-// ===== Helper fetch =====
 async function fetchJSON(url, headers={}){
   const r = await fetch(url, { headers: { "Cache-Control":"no-cache", ...headers }});
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
-// ===== Price sources =====
+// Jupiter price
 async function jupPrice(mint){
   try{
     const j = await fetchJSON(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
@@ -196,6 +200,8 @@ async function jupPrice(mint){
     return (p>0)? p : 0;
   }catch{ return 0; }
 }
+
+// DexScreener search (10s cache)
 async function dsSearch(mint){
   const now = Date.now();
   const hit = DS_SEARCH_CACHE.get(mint);
@@ -208,6 +214,7 @@ async function dsSearch(mint){
     return null;
   }
 }
+
 async function dsPriceAndChange(mint){
   const j = await dsSearch(mint);
   const pair = j?.pairs?.[0];
@@ -216,14 +223,12 @@ async function dsPriceAndChange(mint){
   return { price, changePct };
 }
 
-// ===== Confidence label =====
 function pickConfidence(p){
   if (p >= 1) return "high";
   if (p > 0) return "medium";
   return "low";
 }
 
-// ===== Blended price (general SPL) =====
 const MAJOR_SPL = new Set([
   "So11111111111111111111111111111111111111112", // SOL pseudo mint
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
@@ -236,48 +241,49 @@ const MAJOR_SPL = new Set([
   "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"  // PYTH
 ]);
 
-async function blendedPrice(mint){
+async function blendedPriceGeneric(mint){
   const now = Date.now();
   const cached = BLENDED_CACHE.get(mint);
   if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached;
 
-  const [ {price: dsPrice, changePct}, jPrice ] = await Promise.all([ dsPriceAndChange(mint), jupPrice(mint) ]);
+  const [ {price: dsP, changePct}, jPrice ] = await Promise.all([ dsPriceAndChange(mint), jupPrice(mint) ]);
 
   const isMajor = MAJOR_SPL.has(mint);
   let price = 0, source = [];
   if (isMajor) {
-    if (jPrice || dsPrice) { price = (jPrice * 0.7) + (dsPrice * 0.3); source = ["jup","dex"]; }
+    if (jPrice || dsP) { price = (jPrice * 0.7) + (dsP * 0.3); source = ["jup","dex"]; }
   } else {
-    if (jPrice || dsPrice) { price = (dsPrice * 0.85) + (jPrice * 0.15); source = ["dex","jup"]; }
+    if (jPrice || dsP) { price = (dsP * 0.85) + (jPrice * 0.15); source = ["dex","jup"]; }
   }
-  if (!price) { price = dsPrice || jPrice || 0; source = dsPrice ? ["dex"] : jPrice ? ["jup"] : []; }
+  if (!price) { price = dsP || jPrice || 0; source = dsP ? ["dex"] : jPrice ? ["jup"] : []; }
 
-  const out = { priceUsd: price || 0, changePct: changePct || 0, confidence: pickConfidence(price||0), source, ts: now, raw: { jup: jPrice, dex: dsPrice } };
+  const out = { priceUsd: price || 0, changePct: changePct || 0, confidence: pickConfidence(price||0), source, ts: now, raw: { jup: jPrice, dex: dsP } };
   BLENDED_CACHE.set(mint, out);
   return out;
 }
 
-// ===== BlackCoin price (override: Dex → Jup → Pump.fun) =====
+// Pump.fun (used as last resort for BlackCoin)
 async function pumpFunPrice(mint){
   try{
     const p = await fetchJSON(`https://pump.fun/api/coin/${encodeURIComponent(mint)}`);
-    // no guaranteed price field; best-effort parse:
     const price = Number(p?.usdPrice || p?.priceUsd || p?.price || 0);
     return price > 0 ? price : 0;
   }catch{ return 0; }
 }
+
+// BlackCoin override: Dex → Jup → Pump for price, DS for change if possible
 async function blackCoinPriceAndChange(mint){
-  // Prefer DexScreener price & change, then Jup price, last Pump price (change from DS if available)
   const [{ price: dsP, changePct }, jP, pumpP] = await Promise.all([
     dsPriceAndChange(mint),
     jupPrice(mint),
     pumpFunPrice(mint)
   ]);
   const price = dsP || jP || pumpP || 0;
-  return { priceUsd: price, changePct: changePct || 0, source: price === dsP ? ["dex"] : price === jP ? ["jup"] : ["pump"] };
+  const source = price === dsP ? ["dex"] : price === jP ? ["jup"] : ["pump"];
+  return { priceUsd: price, changePct: changePct || 0, source };
 }
 
-// ===== Coingecko SOL (price + 24h change) with 10s cache =====
+// SOL Coingecko (price + 24h change) with 10s cache
 async function getSolUsdAndChange() {
   const now = Date.now();
   if ((now - CG_SOL_CACHE.ts) < TEN_S && CG_SOL_CACHE.priceUsd) {
@@ -298,7 +304,7 @@ async function getSolUsdAndChange() {
   }
 }
 
-// ===== Icon resolver (Jupiter → Solscan → Pump → GH fallback) =====
+// Token icon resolver (Jupiter → Solscan → Pump → GH fallback)
 async function resolveTokenIcon(mint){
   if (!mint) return null;
   if (ICON_CACHE.has(mint)) return ICON_CACHE.get(mint);
@@ -325,15 +331,43 @@ async function resolveTokenIcon(mint){
   return gh;
 }
 
+/* ---------- Helius balances (v1-first with v0 fallback) ---------- */
+const HELIUS_KEY = process.env.HELIUS_API_KEY;
+if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
+
+async function fetchHeliusBalances(wallet){
+  // Try v1
+  try{
+    const u1 = `https://api.helius.xyz/v1/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
+    const r1 = await fetch(u1, { headers: { "Cache-Control": "no-cache" }});
+    if (r1.ok) return { json: await r1.json(), version: "v1" };
+    const t1 = await r1.text();
+    warn("Helius v1 fallback:", r1.status, t1.slice(0,200));
+  }catch(e){ warn("Helius v1 error:", e?.message||e); }
+
+  // Fallback v0
+  const u0 = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
+  const r0 = await fetch(u0, { headers: { "Cache-Control": "no-cache" }});
+  if (!r0.ok) {
+    const t0 = await r0.text();
+    throw new Error(`Helius ${r0.status} :: ${t0}`);
+  }
+  return { json: await r0.json(), version: "v0" };
+}
+
 /**
- * POST /api/balances
+ * POST /api/balances   (T2 hybrid formatting)
  * body: { wallet: string }
  * returns: {
- *   sol: number,
- *   solUsd: number,
- *   solChangePct: number,
- *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd, changePct }],
- *   portfolioDeltaPct: number
+ *   sol, solUsd, solChangePct, solFormattedUsd,
+ *   tokens: [{
+ *     mint, symbol, name, logo, decimals,
+ *     amount, amountFormatted,
+ *     priceUsd, formattedUsd,
+ *     usd, usdFormatted,
+ *     changePct
+ *   }],
+ *   portfolioDeltaPct
  * }
  */
 app.post("/api/balances", async (req, res) => {
@@ -342,26 +376,21 @@ app.post("/api/balances", async (req, res) => {
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
     if (!HELIUS_KEY) return res.status(500).json({ error: "Backend missing HELIUS_API_KEY" });
 
-    const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
-    const r = await fetch(url, { headers: { "Cache-Control": "no-cache" }});
-    if (!r.ok) {
-      const t = await r.text();
-      return res.status(502).json({ error: `Helius ${r.status}`, body: t });
-    }
-    const data = await r.json();
+    // Pull balances
+    const { json: data } = await fetchHeliusBalances(wallet);
 
+    // SOL
     const lamports =
-      Number(data?.nativeBalance?.lamports) ||
-      Number(data?.native?.lamports) ||
-      0;
+      Number(data?.nativeBalance?.lamports) ??
+      Number(data?.native?.lamports) ?? 0;
     const sol = lamports / 1e9;
 
+    // Tokens
     const rawTokens =
       Array.isArray(data?.tokens) ? data.tokens :
       Array.isArray(data?.tokenBalances) ? data.tokenBalances :
       [];
 
-    // Normalize token fields
     const tokensBase = rawTokens
       .map(t => ({
         mint: t.mint || t.tokenMint || "",
@@ -375,37 +404,56 @@ app.post("/api/balances", async (req, res) => {
 
     // SOL price + change
     const { priceUsd: solUsd, changePct: solChangePct } = await getSolUsdAndChange();
-    const totalUsdFromSol = sol * solUsd;
+    const solUsdTotal = sol * solUsd;
 
-    // Price tokens (BlackCoin override)
+    // Price tokens (BlackCoin override for name/symbol + price pref)
     const priced = await Promise.all(tokensBase.map(async t => {
       const isBlack = t.mint === TOKEN_MINT;
-      // BlackCoin: force symbol/name regardless of Helius metadata
       const symbol = isBlack ? "BLCN" : (t.symbol || "");
       const name   = isBlack ? "BlackCoin" : (t.name || "");
-
-      const icon   = await resolveTokenIcon(t.mint);
+      const logo   = await resolveTokenIcon(t.mint);
 
       if (isBlack) {
         const bc = await blackCoinPriceAndChange(t.mint);
         const priceUsd = Number(bc.priceUsd) || 0;
         const usd = priceUsd * t.amount;
-        return { ...t, symbol, name, logo: icon, priceUsd, usd, changePct: bc.changePct };
+        return {
+          mint: t.mint,
+          symbol, name, logo,
+          decimals: t.decimals,
+          amount: t.amount,
+          amountFormatted: formatAmountSmart(t.amount),
+          priceUsd,
+          formattedUsd: formatUsd(priceUsd),
+          usd,
+          usdFormatted: formatUsd(usd),
+          changePct: bc.changePct
+        };
       } else {
-        const blend = await blendedPrice(t.mint);
+        const blend = await blendedPriceGeneric(t.mint);
         const priceUsd = Number(blend.priceUsd) || 0;
         const usd = priceUsd * t.amount;
-        return { ...t, symbol, name, logo: icon, priceUsd, usd, changePct: Number(blend.changePct) || 0 };
+        return {
+          mint: t.mint,
+          symbol, name, logo,
+          decimals: t.decimals,
+          amount: t.amount,
+          amountFormatted: formatAmountSmart(t.amount),
+          priceUsd,
+          formattedUsd: formatUsd(priceUsd),
+          usd,
+          usdFormatted: formatUsd(usd),
+          changePct: Number(blend.changePct) || 0
+        };
       }
     }));
 
     const tokens = priced.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    // ---- Weighted portfolio Δ with 25% per-asset influence cap ----
-    // Build value parts (include SOL as a "token-like" part)
+    // ---- Portfolio Δ% with 25% per-asset cap ----
     const parts = [];
-    let totalUSD = totalUsdFromSol;
-    if (totalUsdFromSol > 0) parts.push({ val: totalUsdFromSol, pct: solChangePct, label: "SOL" });
+    let totalUSD = solUsdTotal;
+    if (solUsdTotal > 0) parts.push({ val: solUsdTotal, pct: solChangePct, label: "SOL" });
     for (const t of tokens) {
       const val = Number(t.usd) || 0;
       if (val > 0) {
@@ -413,10 +461,8 @@ app.post("/api/balances", async (req, res) => {
         totalUSD += val;
       }
     }
-
     let portfolioDeltaPct = 0;
     if (totalUSD > 0 && parts.length) {
-      // Cap each asset's contribution to 25% of total, then re-average
       const cap = 0.25 * totalUSD;
       const effVals = parts.map(p => Math.min(p.val, cap));
       const denom = effVals.reduce((s,v)=>s+v,0) || 1;
@@ -428,11 +474,13 @@ app.post("/api/balances", async (req, res) => {
       sol,
       solUsd,
       solChangePct,
+      solFormattedUsd: formatUsd(solUsd),
       tokens,
       portfolioDeltaPct
     });
   } catch (e) {
     err("Error /api/balances:", e);
+    // Surface upstream body if we captured it in message
     res.status(500).json({ error: e.message || "Failed to load balances" });
   }
 });
@@ -451,11 +499,10 @@ app.get("/api/price", async (req, res) => {
         formatted: formatUsd(out.priceUsd),
         confidence: pickConfidence(out.priceUsd || 0),
         source: out.source,
-        raw: { dex: out.source.includes("dex") ? out.priceUsd : null }
       });
     }
 
-    const out = await blendedPrice(mint);
+    const out = await blendedPriceGeneric(mint);
     res.json({
       mint,
       priceUsd: out.priceUsd,
