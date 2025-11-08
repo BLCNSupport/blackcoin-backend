@@ -338,7 +338,7 @@ if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
 async function fetchHeliusBalances(wallet){
   // Try v1
   try{
-    const u1 = `https://api.helius.xyz/v1/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
+    const u1 = `https://api.helius.xyz/v1/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&tokenType=fungible`;
     const r1 = await fetch(u1, { headers: { "Cache-Control": "no-cache" }});
     if (r1.ok) return { json: await r1.json(), version: "v1" };
     const t1 = await r1.text();
