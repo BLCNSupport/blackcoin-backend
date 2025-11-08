@@ -6,7 +6,9 @@
 // - Broadcasts: insert + list (DESC, 25)
 // - Refund: insert + list
 // - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
-// - NEW: Weighted-blend pricing (Jupiter + DexScreener) with USD formatter & caching
+// - Weighted-blend pricing (Jupiter + DexScreener) with USD formatter & caching
+// - NEW (this patch): 10s API caching for price & 24h change + server-side portfolioDeltaPct
+
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -146,7 +148,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
 
-// ===== New: Price formatter (server-side display rules) =====
+// ===== Number/format utils =====
 function abbreviate(n) {
   const abs = Math.abs(n);
   const sign = n < 0 ? "-" : "";
@@ -159,36 +161,38 @@ function formatUsd(value){
   if (value == null || Number.isNaN(value)) return "$0.00";
   const v = Number(value);
   const abs = Math.abs(v);
-  // Tiny values < $1: up to 6 decimals, trim trailing zeros
   if (abs < 1) {
     const s = abs.toFixed(6).replace(/\.?0+$/,"");
     return (v < 0 ? "-$" : "$") + (v < 0 ? s.slice(1) : s);
   }
-  // Normal values < $10k: two decimals with commas
   if (abs < 10_000) {
     return (v < 0 ? "-$" : "$") + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
-  // Large values: K/M/B
   const abbr = abbreviate(v);
   return "$" + abbr;
 }
 
-// ===== New: Price sources + blending =====
+// ===== Price sources + blending =====
 const MAJOR_SPL = new Set([
-  "So11111111111111111111111111111111111111112", // SOL (native pseudo mint)
+  "So11111111111111111111111111111111111111112", // SOL (pseudo mint)
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
   "JUPyiwrYJFskUPiHa7hkrL2Fzf8mFk7LtKXBs3CToyD", // JUP
   "DezXAZ8z7PnrnRJjz3wXBoRgixAeg22u71LtBH5e7UDm", // BONK
-  "7W13pQwT5F9nMEW3YQicPZaBFtwZr9QG4bw35vjULK2f", // WIF (placeholder old/wrapped variants may differ)
+  "7W13pQwT5F9nMEW3YQicPZaBFtwZr9QG4bw35vjULK2f", // WIF
   "orcaEKTd74cKAXcFDcCk6N88G9nogjXwLMoMfeJMZgj", // ORCA
-  "GoMCK2uJfM8WQbGkB8pZphrepz7qW3f9zZrLJQMQWZwQ", // RAY (note: dummy if ray mint differs; blend still works)
+  "GoMCK2uJfM8WQbGkB8pZphrepz7qW3f9zZrLJQMQWZwQ", // RAY (placeholder ok)
   "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", // mSOL
   "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"  // PYTH
 ]);
 
 const PRICE_TTL_MS = 25_000;
 const BLENDED_CACHE = new Map(); // mint -> { priceUsd, ts, source }
+
+// NEW: 10s cache for DS queries & SOL cg (price + 24h change)
+const TEN_S = 10_000;
+const DS_SEARCH_CACHE = new Map(); // key: mint -> { ts, json }
+const CG_SOL_CACHE = { ts: 0, priceUsd: 0, changePct: 0 };
 
 async function fetchJSON(url, headers={}){
   const r = await fetch(url, { headers: { "Cache-Control":"no-cache", ...headers }});
@@ -202,12 +206,24 @@ async function jupPrice(mint){
     return (p>0)? p : 0;
   }catch{ return 0; }
 }
-async function dsPrice(mint){
+async function dsSearch(mint){
+  const now = Date.now();
+  const hit = DS_SEARCH_CACHE.get(mint);
+  if (hit && (now - hit.ts) < TEN_S) return hit.json;
   try{
     const j = await fetchJSON(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`);
-    const p = Number(j?.pairs?.[0]?.priceUsd) || 0;
-    return (p>0)? p : 0;
-  }catch{ return 0; }
+    DS_SEARCH_CACHE.set(mint, { ts: now, json: j });
+    return j;
+  }catch{
+    return null;
+  }
+}
+async function dsPriceAndChange(mint){
+  const j = await dsSearch(mint);
+  const pair = j?.pairs?.[0];
+  const price = Number(pair?.priceUsd) || 0;
+  const changePct = Number(pair?.priceChange?.h24) || 0;
+  return { price, changePct };
 }
 function pickConfidence(p){
   if (p >= 1) return "high";
@@ -232,7 +248,7 @@ async function blendedPrice(mint){
       source = ["jup","dex"];
     }
   } else {
-    // 85% DS, 15% JUP (pump/meme/new)
+    // 85% DS, 15% JUP
     if (jp || ds) {
       price = (ds * 0.85) + (jp * 0.15);
       source = ["dex","jup"];
@@ -247,27 +263,32 @@ async function blendedPrice(mint){
   BLENDED_CACHE.set(mint, out);
   return out;
 }
+async function dsPrice(mint){
+  try{
+    const { price } = await dsPriceAndChange(mint);
+    return price;
+  }catch{ return 0; }
+}
 
-// ===== keep the existing Coingecko SOL fetch for wallet SOL valuation =====
-const DEX_PRICE_CACHE = new Map(); // (legacy; kept for compatibility) mint -> {priceUsd, ts}
-const SOL_PRICE_CACHE = { priceUsd: null, ts: 0 };
-
-async function getSolUsd() {
+// ===== Coingecko SOL (price + 24h change) with 10s cache =====
+async function getSolUsdAndChange() {
   const now = Date.now();
-  if (SOL_PRICE_CACHE.priceUsd && (now - SOL_PRICE_CACHE.ts) < PRICE_TTL_MS) {
-    return SOL_PRICE_CACHE.priceUsd;
+  if ((now - CG_SOL_CACHE.ts) < TEN_S && CG_SOL_CACHE.priceUsd) {
+    return { priceUsd: CG_SOL_CACHE.priceUsd, changePct: CG_SOL_CACHE.changePct };
   }
   try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { headers: { "Cache-Control": "no-cache" }});
-    const j = await r.json();
-    const p = Number(j?.solana?.usd) || 0;
-    if (p > 0) {
-      SOL_PRICE_CACHE.priceUsd = p;
-      SOL_PRICE_CACHE.ts = now;
-      return p;
+    const j = await fetchJSON("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true");
+    const priceUsd = Number(j?.solana?.usd) || 0;
+    const changePct = Number(j?.solana?.usd_24h_change) || 0;
+    if (priceUsd > 0) {
+      CG_SOL_CACHE.ts = now;
+      CG_SOL_CACHE.priceUsd = priceUsd;
+      CG_SOL_CACHE.changePct = changePct;
     }
-  } catch {}
-  return SOL_PRICE_CACHE.priceUsd ?? 0;
+    return { priceUsd, changePct };
+  } catch {
+    return { priceUsd: CG_SOL_CACHE.priceUsd || 0, changePct: CG_SOL_CACHE.changePct || 0 };
+  }
 }
 
 /**
@@ -276,8 +297,9 @@ async function getSolUsd() {
  * returns: {
  *   sol: number,
  *   solUsd: number,
- *   solFormattedUsd?: string,
- *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd, formattedUsd }]
+ *   solChangePct: number,
+ *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd, changePct }],
+ *   portfolioDeltaPct: number
  * }
  */
 app.post("/api/balances", async (req, res) => {
@@ -316,35 +338,47 @@ app.post("/api/balances", async (req, res) => {
       }))
       .filter(t => t.mint && t.amount > 0);
 
-    const solUsd = await getSolUsd();
-    const solUsdTotal = sol * solUsd;
+    // SOL price + change (10s cache)
+    const { priceUsd: solUsd, changePct: solChangePct } = await getSolUsdAndChange();
+    const totalUsdFromSol = sol * solUsd;
 
-    // ===== NEW: use blended price per token and add formattedUsd field
+    // Price each token (using blended price) and pull 24h change from DS (10s cache)
     const priced = await Promise.all(tokensBase.map(async t => {
       const blend = await blendedPrice(t.mint);
+      const { changePct } = await dsPriceAndChange(t.mint);
       const priceUsd = Number(blend.priceUsd) || 0;
       const usd = priceUsd * t.amount;
-      return { ...t, priceUsd, usd, formattedUsd: formatUsd(usd) };
+      return { ...t, priceUsd, usd, changePct };
     }));
 
-    const tokens = priced
-      .sort((a, b) => (b.usd || 0) - (a.usd || 0));
+    const tokens = priced.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    const response = {
+    // Weighted portfolio Δ
+    let totalUSD = totalUsdFromSol;
+    const parts = [];
+    if (totalUsdFromSol > 0) parts.push({ val: totalUsdFromSol, pct: solChangePct });
+    for (const t of tokens) {
+      const val = Number(t.usd) || 0;
+      if (val > 0) parts.push({ val, pct: Number.isFinite(t.changePct) ? t.changePct : 0 });
+      totalUSD += val;
+    }
+    const num = parts.reduce((s,p)=> s + p.val*(p.pct/100), 0);
+    const portfolioDeltaPct = totalUSD > 0 ? (num / totalUSD) * 100 : 0;
+
+    res.json({
       sol,
       solUsd,
-      solFormattedUsd: formatUsd(solUsdTotal),
-      tokens
-    };
-
-    res.json(response);
+      solChangePct,
+      tokens,
+      portfolioDeltaPct
+    });
   } catch (e) {
     err("Error /api/balances:", e);
     res.status(500).json({ error: e.message || "Failed to load balances" });
   }
 });
 
-// ===== NEW: unified price endpoint using weighted blend =====
+// Unified price endpoint
 app.get("/api/price", async (req, res) => {
   try{
     const mint = String(req.query.mint || "").trim();
@@ -366,19 +400,10 @@ app.get("/api/price", async (req, res) => {
 
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso)=>{ try{ const d=new Date(iso); return d.toTimeString().slice(0,5);}catch{return "";} };
-
-// Normalize DB row into a stable payload for clients
 function normRow(r){
   if(!r) return null;
-  return {
-    id: r.id,
-    wallet: r.wallet,
-    message: r.message,
-    created_at: r.created_at,
-    display_time: hhmm(r.created_at)
-  };
+  return { id: r.id, wallet: r.wallet, message: r.message, created_at: r.created_at, display_time: hhmm(r.created_at) };
 }
-
 app.post("/api/broadcast", async (req,res)=>{
   try{
     const { wallet, message } = req.body;
@@ -386,14 +411,10 @@ app.post("/api/broadcast", async (req,res)=>{
     const { data, error } = await supabase.from("hub_broadcasts").insert([{ wallet, message }]).select().maybeSingle();
     if(error) throw error;
     const row = normRow(data);
-
-    // Instant echo so the poster sees it immediately (others still get realtime)
     wsBroadcast({ type:"insert", row });
-
     res.json({ success:true, data: row });
   }catch(e){ err("Error /api/broadcast:",e); res.status(500).json({error:e.message}); }
 });
-
 app.get("/api/broadcasts", async (_req,res)=>{
   try{
     const { data, error } = await supabase
@@ -446,7 +467,7 @@ wss.on("connection", async (socket)=>{
   socket.on("close", ()=> clients.delete(socket));
   socket.on("error", (e)=> err("WS error:", e?.message||e));
 
-  // send last 25 on connect (DESC -> client sorts; or show as-is)
+  // send last 25 on connect
   try{
     const { data, error } = await supabase
       .from("hub_broadcasts")
@@ -459,14 +480,12 @@ wss.on("connection", async (socket)=>{
     }
   }catch(e){ err("WS hello failed:", e?.message||e); }
 });
-
 setInterval(()=>{
   for(const s of clients){
     if(s.isAlive===false) { try{s.terminate();}catch{}; continue; }
     s.isAlive=false; try{s.ping();}catch{}
   }
 }, 30000);
-
 function wsBroadcast(o){
   const msg = JSON.stringify(o);
   for(const s of clients){ if(s.readyState===s.OPEN) s.send(msg); }
@@ -480,35 +499,21 @@ function subscribeToBroadcasts() {
       try { supabase.removeChannel(rtChannel); } catch {}
       rtChannel = null;
     }
-
     rtChannel = supabase
       .channel("rt:hub_broadcasts", {
         config: { broadcast: { ack: true }, presence: { key: "server" } }
       })
       .on("postgres_changes",
         { event: "INSERT", schema: "public", table: "hub_broadcasts" },
-        (payload) => {
-          const row = normRow(payload?.new || payload?.record);
-          log("🔔 INSERT hub_broadcasts id=", row?.id);
-          if (row) wsBroadcast({ type:"insert", row });
-        }
+        (payload) => { const row = normRow(payload?.new || payload?.record); log("🔔 INSERT hub_broadcasts id=", row?.id); if (row) wsBroadcast({ type:"insert", row }); }
       )
       .on("postgres_changes",
         { event: "UPDATE", schema: "public", table: "hub_broadcasts" },
-        (payload) => {
-          const row = normRow(payload?.new || payload?.record);
-          log("🔧 UPDATE hub_broadcasts id=", row?.id);
-          if (row) wsBroadcast({ type:"update", row });
-        }
+        (payload) => { const row = normRow(payload?.new || payload?.record); log("🔧 UPDATE hub_broadcasts id=", row?.id); if (row) wsBroadcast({ type:"update", row }); }
       )
       .on("postgres_changes",
         { event: "DELETE", schema: "public", table: "hub_broadcasts" },
-        (payload) => {
-          const old = payload?.old || payload?.record || null;
-          const id = old?.id;
-          log("🗑️  DELETE hub_broadcasts id=", id);
-          if (id) wsBroadcast({ type:"delete", id });
-        }
+        (payload) => { const old = payload?.old || payload?.record || null; const id = old?.id; log("🗑️  DELETE hub_broadcasts id=", id); if (id) wsBroadcast({ type:"delete", id }); }
       )
       .subscribe((status) => {
         if (status === "SUBSCRIBED") log("✅ Realtime subscribed: hub_broadcasts");
