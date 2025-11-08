@@ -10,6 +10,7 @@
 // - 10s API caching for price & 24h change + server-side portfolioDeltaPct (25% per-asset cap)
 // - BlackCoin overrides (mint symbol/name + price source order) + server-side icon resolution
 // - T2 HYBRID FORMATTING for balances (raw + formatted fields)
+// - ULTRA dust protection: mark tiny tokens as hidden (NOT removed), keep hidden tokens at bottom
 
 import express from "express";
 import fetch from "node-fetch";
@@ -356,7 +357,7 @@ async function fetchHeliusBalances(wallet){
 }
 
 /**
- * POST /api/balances   (T2 hybrid formatting)
+ * POST /api/balances   (T2 hybrid formatting + ULTRA dust flagging)
  * body: { wallet: string }
  * returns: {
  *   sol, solUsd, solChangePct, solFormattedUsd,
@@ -365,7 +366,8 @@ async function fetchHeliusBalances(wallet){
  *     amount, amountFormatted,
  *     priceUsd, formattedUsd,
  *     usd, usdFormatted,
- *     changePct
+ *     changePct,
+ *     hidden   // <-- ULTRA dust flag
  *   }],
  *   portfolioDeltaPct
  * }
@@ -448,7 +450,29 @@ app.post("/api/balances", async (req, res) => {
       }
     }));
 
-    const tokens = priced.sort((a, b) => (b.usd || 0) - (a.usd || 0));
+    // ---- ULTRA dust flagging ----
+    // Rules (chosen mode):
+    // 1) BlackCoin is NEVER hidden
+    // 2) Hidden if usd < $0.01 OR (solEquivalent <= 0.0008 SOL) AND amount is micro-dust
+    // 3) We *mark* hidden tokens (hidden:true) but do NOT remove them (refund tool safe)
+    const MICRO_AMOUNT_CUTOFF = 0.000001; // generic micro amount for SPL
+    const SOL_DUST_EQ = 0.0008;          // per your preference
+    const tokensWithHidden = priced.map(t => {
+      const isBlack = t.mint === TOKEN_MINT;
+      const usd = Number(t.usd) || 0;
+      const amount = Number(t.amount) || 0;
+      const solEq = solUsd > 0 ? (usd / solUsd) : 0;
+      const hidden = !isBlack && (
+        ((usd > 0 && usd < 0.01) || (solEq > 0 && solEq <= SOL_DUST_EQ))
+        && amount <= MICRO_AMOUNT_CUTOFF
+      );
+      return { ...t, hidden };
+    });
+
+    // Sort: visible first by USD desc, then hidden by USD desc (Option A)
+    const visible = tokensWithHidden.filter(t => !t.hidden).sort((a,b) => (b.usd||0) - (a.usd||0));
+    const hidden  = tokensWithHidden.filter(t =>  t.hidden).sort((a,b) => (b.usd||0) - (a.usd||0));
+    const tokens  = [...visible, ...hidden];
 
     // ---- Portfolio Δ% with 25% per-asset cap ----
     const parts = [];
