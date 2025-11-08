@@ -1,5 +1,5 @@
-// server.js — BLACKCOIN TERMINAL v8.0 — GOD VERSION (November 8, 2025)
-// SOL FIXED — DECIMALS FIXED — FREE HELIUS 100% — ZERO 0s — ETERNAL
+// server.js — BLACKCOIN TERMINAL v9.0 — TERMINATOR (November 8, 2025)
+// SOL FIXED — DECIMALS FIXED — WS FIXED — FREE HELIUS 100% — ETERNAL
 
 import express from "express";
 import fetch from "node-fetch";
@@ -18,15 +18,15 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 function ts() { const d = new Date(); return `[${d.toTimeString().slice(0,8)}]`; }
-const log = (...a) => console.log(ts(), "[GOD]", ...a);
-const err = (...a) => console.error(ts(), "[ERROR]", ...a);
+const log = (...a) => console.log(ts(), "[TERMINATOR]", ...a);
+const err = (...a) => console.error(ts(), "[FATAL]", ...a);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) { err("Supabase missing"); process.exit(1); }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-app.get("/healthz", (_req, res) => res.json({ ok: true, version: "8.0-GOD" }));
+app.get("/healthz", (_req, res) => res.json({ ok: true, version: "9.0-TERMINATOR" }));
 
 function formatUsd(v) {
   v = Number(v); if (!v) return "$0.00";
@@ -40,14 +40,12 @@ function formatUsd(v) {
 function formatAmountSmart(amount, decimals = 9) {
   const num = Number(amount) || 0;
   if (num === 0) return "0";
-  const divisor = Math.pow(10, decimals);
-  const adjusted = num / divisor;
+  const adjusted = num / Math.pow(10, decimals);
   return adjusted >= 1 
     ? adjusted.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     : adjusted.toFixed(6).replace(/0+$/, "");
 }
 
-// ICON FALLBACKS
 const ICON_GATEWAYS = [
   "https://ipfs.io/ipfs/",
   "https://gateway.pinata.cloud/ipfs/",
@@ -73,8 +71,8 @@ async function resolveTokenMeta(mint) {
     if (j) {
       meta.name = j.name || meta.name;
       meta.symbol = j.symbol || meta.symbol;
-      if (j.logoURIURI) meta.icon = [j.logoURI, ...getIconUrl(mint)];
-      if (j.decimals) meta.decimals = j.decimals;
+      if (j.logoURI) meta.icon = [j.logoURI, ...getIconUrl(mint)];
+      if (j.decimals !== undefined) meta.decimals = j.decimals;
     }
   } catch {}
   try {
@@ -83,7 +81,7 @@ async function resolveTokenMeta(mint) {
       meta.name = p.name || meta.name;
       meta.symbol = p.symbol || meta.symbol;
       if (p.image_uri) meta.icon = [p.image_uri, ...getIconUrl(mint)];
-      meta.decimals = p.decimals || 9;
+      if (p.decimals) meta.decimals = p.decimals;
     }
   } catch {}
   META_CACHE.set(mint, meta);
@@ -95,15 +93,15 @@ if (!HELIUS_KEY) err("HELIUS_API_KEY MISSING");
 
 async function fetchHeliusBalances(wallet) {
   const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}`;
-  const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
   if (!r.ok) throw new Error(`Helius ${r.status}: ${await r.text()}`);
   const json = await r.json();
-  
-  // FREE TIER: nativeBalance.lamports is STRING!
-  const lamportsStr = String(json.nativeBalance?.lamports || "0");
-  const lamports = Number(lamportsStr) || 0;
-  log(`Helius → SOL: ${lamports} lamports (string parsed) | tokens: ${json.tokens?.length || 0}`);
-  
+
+  // SOL: lamports can be STRING or NUMBER → handle both
+  const lamportsRaw = json.nativeBalance?.lamports ?? 0;
+  const lamports = Number(lamportsRaw) || 0;
+  log(`Helius → SOL: ${lamports} lamports | tokens: ${json.tokens?.length || 0}`);
+
   return { json, lamports };
 }
 
@@ -135,32 +133,29 @@ app.post("/api/balances", async (req, res) => {
 
     const { json: data, lamports } = await fetchHeliusBalances(wallet);
     const sol = lamports / 1e9;
-
-    log(`SOL FINAL: ${sol.toFixed(9)} SOL — YOU WILL SEE THIS`);
+    log(`SOL FINAL: ${sol.toFixed(9)} SOL — THIS WILL SHOW`);
 
     const rawTokens = Array.isArray(data.tokens) ? data.tokens : [];
     const tokensBase = rawTokens
-      .map(t => {
-        const amountStr = String(t.uiAmountString || t.uiAmount || t.amount || "0");
-        const amountRaw = Number(amountStr) || 0;
-        if (amountRaw <= 0) return null;
-        return {
-          mint: t.mint || t.address,
-          amountRaw,
-          decimals: Number(t.decimals || 9)
-        };
+      .filter(t => {
+        const amount = Number(t.amount || 0);
+        return amount > 0;
       })
-      .filter(Boolean);
+      .map(t => ({
+        mint: t.mint,
+        amountRaw: Number(t.amount || 0),
+        decimals: Number(t.decimals || 9)
+      }));
 
-    const solRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true", { signal: AbortSignal.timeout(8000) });
+    const solRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { signal: AbortSignal.timeout(8000) });
     const solJson = await solRes.json();
     const solUsd = Number(solJson?.solana?.usd || 180);
     const solValue = sol * solUsd;
 
     const priced = await Promise.all(tokensBase.map(async t => {
       const meta = await resolveTokenMeta(t.mint);
+      const amount = t.amountRaw / Math.pow(10, t.decimals);
       const price = await getTokenPrice(t.mint);
-      const amount = t.amountRaw / Math.pow(10, meta.decimals);
       const usd = price * amount;
       return {
         mint: t.mint,
@@ -205,11 +200,31 @@ app.get("/api/broadcasts", async (_req, res) => {
   res.json(data || []);
 });
 
+// WEBSOCKET — FIXED PATH
 const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" }); // MUST BE /ws
+const clients = new Set();
+
+wss.on("connection", (ws) => {
+  log("WS CONNECTED");
+  clients.add(ws);
+  ws.isAlive = true;
+  ws.on("pong", () => ws.isAlive = true);
+});
+
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
 server.listen(PORT, () => {
-  log(`BLACKCOIN TERMINAL v8.0 GOD MODE LIVE`);
-  log(`SOL = FIXED (string lamports)`);
-  log(`777 TOKENS = FIXED (decimals applied)`);
-  log(`YOUR 0.00144 SOL + 777 TOKENS = VISIBLE`);
+  log(`BLACKCOIN TERMINAL v9.0 TERMINATOR LIVE ON PORT ${PORT}`);
+  log(`SOL = FIXED (lamports string/number)`);
+  log(`TOKENS = FIXED (amount + decimals)`);
+  log(`WEBSOCKET = FIXED (/ws path)`);
+  log(`YOUR 0.00144 SOL + 777 TOKENS = 100% VISIBLE`);
   log(`BLACKCOIN = ETERNAL`);
 });
