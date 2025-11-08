@@ -7,7 +7,8 @@
 // - Refund: insert + list
 // - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
 // - Weighted-blend pricing (Jupiter + DexScreener) with USD formatter & caching
-// - NEW (this patch): 10s API caching for price & 24h change + server-side portfolioDeltaPct
+// - NEW: 10s API caching for price & 24h change + server-side portfolioDeltaPct (with 25% per-asset cap)
+// - NEW: BlackCoin overrides (mint symbol/name + price source order) + server-side icon resolution
 
 import express from "express";
 import fetch from "node-fetch";
@@ -43,7 +44,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 app.get("/healthz", (_req,res)=>res.json({ ok:true, time:new Date().toISOString() }));
 
 /* ---------- Chart poller (UNCHANGED) ---------- */
-const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
+const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump"; // BlackCoin
 let FETCH_INTERVAL = 20000;
 const BACKOFF_INTERVAL = 60000;
 let isBackoff=false, fetchInProgress=false, pollTimer=null;
@@ -172,33 +173,22 @@ function formatUsd(value){
   return "$" + abbr;
 }
 
-// ===== Price sources + blending =====
-const MAJOR_SPL = new Set([
-  "So11111111111111111111111111111111111111112", // SOL (pseudo mint)
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
-  "JUPyiwrYJFskUPiHa7hkrL2Fzf8mFk7LtKXBs3CToyD", // JUP
-  "DezXAZ8z7PnrnRJjz3wXBoRgixAeg22u71LtBH5e7UDm", // BONK
-  "7W13pQwT5F9nMEW3YQicPZaBFtwZr9QG4bw35vjULK2f", // WIF
-  "orcaEKTd74cKAXcFDcCk6N88G9nogjXwLMoMfeJMZgj", // ORCA
-  "GoMCK2uJfM8WQbGkB8pZphrepz7qW3f9zZrLJQMQWZwQ", // RAY (placeholder ok)
-  "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", // mSOL
-  "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"  // PYTH
-]);
-
+// ===== Caches =====
 const PRICE_TTL_MS = 25_000;
-const BLENDED_CACHE = new Map(); // mint -> { priceUsd, ts, source }
-
-// NEW: 10s cache for DS queries & SOL cg (price + 24h change)
+const BLENDED_CACHE = new Map(); // mint -> { priceUsd, ts, source, confidence, raw }
 const TEN_S = 10_000;
-const DS_SEARCH_CACHE = new Map(); // key: mint -> { ts, json }
+const DS_SEARCH_CACHE = new Map(); // mint -> { ts, json }
 const CG_SOL_CACHE = { ts: 0, priceUsd: 0, changePct: 0 };
+const ICON_CACHE = new Map();
 
+// ===== Helper fetch =====
 async function fetchJSON(url, headers={}){
   const r = await fetch(url, { headers: { "Cache-Control":"no-cache", ...headers }});
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
+
+// ===== Price sources =====
 async function jupPrice(mint){
   try{
     const j = await fetchJSON(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
@@ -225,49 +215,66 @@ async function dsPriceAndChange(mint){
   const changePct = Number(pair?.priceChange?.h24) || 0;
   return { price, changePct };
 }
+
+// ===== Confidence label =====
 function pickConfidence(p){
   if (p >= 1) return "high";
   if (p > 0) return "medium";
   return "low";
 }
 
+// ===== Blended price (general SPL) =====
+const MAJOR_SPL = new Set([
+  "So11111111111111111111111111111111111111112", // SOL pseudo mint
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  "JUPyiwrYJFskUPiHa7hkrL2Fzf8mFk7LtKXBs3CToyD", // JUP
+  "DezXAZ8z7PnrnRJjz3wXBoRgixAeg22u71LtBH5e7UDm", // BONK
+  "7W13pQwT5F9nMEW3YQicPZaBFtwZr9QG4bw35vjULK2f", // WIF
+  "orcaEKTd74cKAXcFDcCk6N88G9nogjXwLMoMfeJMZgj", // ORCA
+  "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", // mSOL
+  "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"  // PYTH
+]);
+
 async function blendedPrice(mint){
   const now = Date.now();
   const cached = BLENDED_CACHE.get(mint);
   if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached;
 
-  // Fetch in parallel
-  const [jp, ds] = await Promise.all([ jupPrice(mint), dsPrice(mint) ]);
+  const [ {price: dsPrice, changePct}, jPrice ] = await Promise.all([ dsPriceAndChange(mint), jupPrice(mint) ]);
 
   const isMajor = MAJOR_SPL.has(mint);
   let price = 0, source = [];
   if (isMajor) {
-    // 70% JUP, 30% DS
-    if (jp || ds) {
-      price = (jp * 0.7) + (ds * 0.3);
-      source = ["jup","dex"];
-    }
+    if (jPrice || dsPrice) { price = (jPrice * 0.7) + (dsPrice * 0.3); source = ["jup","dex"]; }
   } else {
-    // 85% DS, 15% JUP
-    if (jp || ds) {
-      price = (ds * 0.85) + (jp * 0.15);
-      source = ["dex","jup"];
-    }
+    if (jPrice || dsPrice) { price = (dsPrice * 0.85) + (jPrice * 0.15); source = ["dex","jup"]; }
   }
-  if (!price) {
-    price = ds || jp || 0;
-    source = ds ? ["dex"] : jp ? ["jup"] : [];
-  }
+  if (!price) { price = dsPrice || jPrice || 0; source = dsPrice ? ["dex"] : jPrice ? ["jup"] : []; }
 
-  const out = { priceUsd: price || 0, confidence: pickConfidence(price||0), source, ts: now, raw: { jup: jp, dex: ds } };
+  const out = { priceUsd: price || 0, changePct: changePct || 0, confidence: pickConfidence(price||0), source, ts: now, raw: { jup: jPrice, dex: dsPrice } };
   BLENDED_CACHE.set(mint, out);
   return out;
 }
-async function dsPrice(mint){
+
+// ===== BlackCoin price (override: Dex → Jup → Pump.fun) =====
+async function pumpFunPrice(mint){
   try{
-    const { price } = await dsPriceAndChange(mint);
-    return price;
+    const p = await fetchJSON(`https://pump.fun/api/coin/${encodeURIComponent(mint)}`);
+    // no guaranteed price field; best-effort parse:
+    const price = Number(p?.usdPrice || p?.priceUsd || p?.price || 0);
+    return price > 0 ? price : 0;
   }catch{ return 0; }
+}
+async function blackCoinPriceAndChange(mint){
+  // Prefer DexScreener price & change, then Jup price, last Pump price (change from DS if available)
+  const [{ price: dsP, changePct }, jP, pumpP] = await Promise.all([
+    dsPriceAndChange(mint),
+    jupPrice(mint),
+    pumpFunPrice(mint)
+  ]);
+  const price = dsP || jP || pumpP || 0;
+  return { priceUsd: price, changePct: changePct || 0, source: price === dsP ? ["dex"] : price === jP ? ["jup"] : ["pump"] };
 }
 
 // ===== Coingecko SOL (price + 24h change) with 10s cache =====
@@ -289,6 +296,33 @@ async function getSolUsdAndChange() {
   } catch {
     return { priceUsd: CG_SOL_CACHE.priceUsd || 0, changePct: CG_SOL_CACHE.changePct || 0 };
   }
+}
+
+// ===== Icon resolver (Jupiter → Solscan → Pump → GH fallback) =====
+async function resolveTokenIcon(mint){
+  if (!mint) return null;
+  if (ICON_CACHE.has(mint)) return ICON_CACHE.get(mint);
+
+  try {
+    const j = await fetchJSON(`https://tokens.jup.ag/token/${encodeURIComponent(mint)}`);
+    if (j?.logoURI) { ICON_CACHE.set(mint, j.logoURI); return j.logoURI; }
+  } catch {}
+
+  try {
+    const s = await fetchJSON(`https://public-api.solscan.io/token/meta?tokenAddress=${encodeURIComponent(mint)}`);
+    const img = s?.icon || s?.image || s?.metadata?.image;
+    if (img) { ICON_CACHE.set(mint, img); return img; }
+  } catch {}
+
+  try {
+    const p = await fetchJSON(`https://pump.fun/api/coin/${encodeURIComponent(mint)}`);
+    const img = p?.image_uri || p?.image || p?.metadata?.image;
+    if (img) { ICON_CACHE.set(mint, img); return img; }
+  } catch {}
+
+  const gh = `https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/${mint}/logo.png`;
+  ICON_CACHE.set(mint, gh);
+  return gh;
 }
 
 /**
@@ -327,10 +361,11 @@ app.post("/api/balances", async (req, res) => {
       Array.isArray(data?.tokenBalances) ? data.tokenBalances :
       [];
 
+    // Normalize token fields
     const tokensBase = rawTokens
       .map(t => ({
         mint: t.mint || t.tokenMint || "",
-        amount: Number(t.amount ?? t.uiAmount ?? 0),
+        amount: Number(t.amount ?? t.uiAmount ?? t.tokenAmount?.uiAmount ?? 0),
         decimals: Number(t.decimals ?? t.tokenAmount?.decimals ?? 0),
         symbol: t.symbol || t.tokenSymbol || t.info?.symbol || "",
         name: t.name || t.tokenName || t.info?.name || "",
@@ -338,32 +373,56 @@ app.post("/api/balances", async (req, res) => {
       }))
       .filter(t => t.mint && t.amount > 0);
 
-    // SOL price + change (10s cache)
+    // SOL price + change
     const { priceUsd: solUsd, changePct: solChangePct } = await getSolUsdAndChange();
     const totalUsdFromSol = sol * solUsd;
 
-    // Price each token (using blended price) and pull 24h change from DS (10s cache)
+    // Price tokens (BlackCoin override)
     const priced = await Promise.all(tokensBase.map(async t => {
-      const blend = await blendedPrice(t.mint);
-      const { changePct } = await dsPriceAndChange(t.mint);
-      const priceUsd = Number(blend.priceUsd) || 0;
-      const usd = priceUsd * t.amount;
-      return { ...t, priceUsd, usd, changePct };
+      const isBlack = t.mint === TOKEN_MINT;
+      // BlackCoin: force symbol/name regardless of Helius metadata
+      const symbol = isBlack ? "BLCN" : (t.symbol || "");
+      const name   = isBlack ? "BlackCoin" : (t.name || "");
+
+      const icon   = await resolveTokenIcon(t.mint);
+
+      if (isBlack) {
+        const bc = await blackCoinPriceAndChange(t.mint);
+        const priceUsd = Number(bc.priceUsd) || 0;
+        const usd = priceUsd * t.amount;
+        return { ...t, symbol, name, logo: icon, priceUsd, usd, changePct: bc.changePct };
+      } else {
+        const blend = await blendedPrice(t.mint);
+        const priceUsd = Number(blend.priceUsd) || 0;
+        const usd = priceUsd * t.amount;
+        return { ...t, symbol, name, logo: icon, priceUsd, usd, changePct: Number(blend.changePct) || 0 };
+      }
     }));
 
     const tokens = priced.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    // Weighted portfolio Δ
-    let totalUSD = totalUsdFromSol;
+    // ---- Weighted portfolio Δ with 25% per-asset influence cap ----
+    // Build value parts (include SOL as a "token-like" part)
     const parts = [];
-    if (totalUsdFromSol > 0) parts.push({ val: totalUsdFromSol, pct: solChangePct });
+    let totalUSD = totalUsdFromSol;
+    if (totalUsdFromSol > 0) parts.push({ val: totalUsdFromSol, pct: solChangePct, label: "SOL" });
     for (const t of tokens) {
       const val = Number(t.usd) || 0;
-      if (val > 0) parts.push({ val, pct: Number.isFinite(t.changePct) ? t.changePct : 0 });
-      totalUSD += val;
+      if (val > 0) {
+        parts.push({ val, pct: Number.isFinite(t.changePct) ? t.changePct : 0, label: t.symbol || t.name || t.mint });
+        totalUSD += val;
+      }
     }
-    const num = parts.reduce((s,p)=> s + p.val*(p.pct/100), 0);
-    const portfolioDeltaPct = totalUSD > 0 ? (num / totalUSD) * 100 : 0;
+
+    let portfolioDeltaPct = 0;
+    if (totalUSD > 0 && parts.length) {
+      // Cap each asset's contribution to 25% of total, then re-average
+      const cap = 0.25 * totalUSD;
+      const effVals = parts.map(p => Math.min(p.val, cap));
+      const denom = effVals.reduce((s,v)=>s+v,0) || 1;
+      const num = parts.reduce((s,p,i)=> s + effVals[i]*(p.pct/100), 0);
+      portfolioDeltaPct = (num / denom) * 100;
+    }
 
     res.json({
       sol,
@@ -378,11 +437,24 @@ app.post("/api/balances", async (req, res) => {
   }
 });
 
-// Unified price endpoint
+// Unified price endpoint (uses BlackCoin override when mint matches)
 app.get("/api/price", async (req, res) => {
   try{
     const mint = String(req.query.mint || "").trim();
     if (!mint) return res.status(400).json({ error: "Missing mint" });
+
+    if (mint === TOKEN_MINT) {
+      const out = await blackCoinPriceAndChange(mint);
+      return res.json({
+        mint,
+        priceUsd: out.priceUsd,
+        formatted: formatUsd(out.priceUsd),
+        confidence: pickConfidence(out.priceUsd || 0),
+        source: out.source,
+        raw: { dex: out.source.includes("dex") ? out.priceUsd : null }
+      });
+    }
+
     const out = await blendedPrice(mint);
     res.json({
       mint,
