@@ -1,10 +1,11 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.1 — NUCLEAR RADIATION EDITION
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.1 — NUCLEAR RADIATION EDITION (HOTFIX)
 /* Changes:
  * - Chart poller: FULLY REWRITTEN → Jupiter v6 API (NO MORE 429s)
  * - True exponential backoff + jitter + Retry-After + timeout
- * - Random 3.5–4.5 min polling → survives Render shared IP bans
+ * - Random 3.5–5 min polling → survives Render shared IP bans
  * - User-Agent + AbortController
  * - All broadcasts, profiles, avatars, balances, realtime — UNTOUCHED & WORKING
+ * - HOTFIX: Fixed syntax error in /api/broadcasts GET handler
  */
 import express from "express";
 import fetch from "node-fetch";
@@ -48,7 +49,6 @@ app.get("/healthz", (_req, res) =>
 /* ---------- Chart Poller — TRULY 429-PROOF (Jupiter Edition) ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 
-// Safer base interval with random jitter
 const BASE_INTERVAL = 210000 + Math.floor(Math.random() * 90000); // 3.5–5 min random
 let currentInterval = BASE_INTERVAL;
 let pollTimer = null;
@@ -90,7 +90,6 @@ async function fetchOneTick() {
 
     clearTimeout(timeout);
 
-    // --- Rate limit handling ---
     if (res.status === 429 || res.status === 403) {
       const retryAfter = res.headers.get("retry-after");
       let delay = retryAfter ? parseInt(retryAfter, 10) * 1000 : 10 * 60 * 1000;
@@ -140,14 +139,13 @@ async function fetchOneTick() {
 
     log(`Success: $${point.price.toFixed(8)} | 24h: ${point.change.toFixed(2)}% | Vol: $${(point.volume/1e6).toFixed(1)}M`);
 
-    // Reset backoff on success
     if (consecutiveFailures > 0) {
       log(`Recovered after ${consecutiveFailures} failures`);
       consecutiveFailures = 0;
     }
     currentInterval = BASE_INTERVAL;
 
-    scheduleNext(currentInterval + Math.random() * 60000); // jitter
+    scheduleNext(currentInterval + Math.random() * 60000);
 
   } catch (e) {
     if (e.name === "AbortError") {
@@ -168,7 +166,6 @@ function scheduleNext(ms) {
   pollTimer = setTimeout(fetchOneTick, ms);
 }
 
-// Start with cold-start delay
 setTimeout(() => {
   log(`Starting Jupiter poller → ~${Math.round(BASE_INTERVAL/60000)} min ±30s jitter`);
   fetchOneTick();
@@ -225,7 +222,9 @@ app.get("/api/chart", async (req, res) => {
     if (error) throw error;
     const raw = data?.length ? data : memoryCache.filter(p => new Date(p.timestamp) >= new Date(cutoff));
     const points = bucketize(raw, interval);
-    const latest = raw.length ? raw[raw.length - 1] : memoryCache.at(-1);
+    const latest =
+
+    raw.length ? raw[raw.length - 1] : memoryCache.at(-1);
     const totalCount = count || raw.length;
     const nextPage = offset + limit < totalCount ? page + 1 : null;
 
@@ -326,7 +325,6 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 });
 
 /* ---------- Balances (Helius RPC + DexScreener + Jupiter) ---------- */
-// ← LEFT 100% UNTOUCHED — YOU SAID IT WORKS PERFECTLY
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY missing");
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
@@ -539,7 +537,7 @@ function normRow(r) {
 app.post("/api/broadcast", async (req, res) => {
   try {
     const { wallet, message } = req.body;
-    if (!wallet || !message) return res.status(400).json({ error: "Missing" });
+    if (!wallet || !message) return res.status( 400).json({ error: "Missing" });
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
@@ -567,7 +565,8 @@ app.get("/api/broadcasts", async (_req, res) => {
     if (error) throw error;
     res.json((data || []).map(normRow));
   } catch (e) {
-    err("Broadcasts GET error:",    res.status(500).json({ error: e.message });
+    err("Broadcasts GET error:", e);  // ← FIXED THIS LINE
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -651,7 +650,7 @@ subscribe();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v10.1 — NUCLEAR RADIATION EDITION — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v10.1 — NUCLEAR RADIATION EDITION (HOTFIX) — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
   log(`Chart source: Jupiter v6 API → NO MORE 429s`);
