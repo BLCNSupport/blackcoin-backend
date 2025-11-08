@@ -336,6 +336,8 @@ async function resolveTokenIcon(mint){
 /* ---------- Helius balances (v1-first with v0 fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+
 
 // v1: /v1/addresses/:address/balances (no tokenType filter; we'll keep all then filter to fungible if present)
 async function fetchHeliusBalances(wallet){
