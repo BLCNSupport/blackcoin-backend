@@ -1,11 +1,17 @@
-// server.js — BLACKCOIN TERMINAL v11.0 — FINAL BALANCE FIX (November 8, 2025)
-// 777 BLACKCOIN + 0.00144 SOL = 100% VISIBLE — NO MORE 0s — ETERNAL
-
+// server.js — BlackCoin backend (Operator Hub realtime edition)
+// ESM + Express + Supabase + WS
+// - Chart poller with backoff
+// - Profile save/get
+// - Avatar upload to Supabase Storage + profile update
+// - Broadcasts: insert + list (DESC, 25)
+// - Refund: insert + list
+// - WebSocket server on /ws broadcasting realtime INSERT/UPDATE/DELETE from hub_broadcasts
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import multer from "multer";
 import http from "http";
 import * as ws from "ws";
 const { WebSocketServer } = ws;
@@ -15,231 +21,395 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json());
 
-function ts() { const d = new Date(); return `[${d.toTimeString().slice(0,8)}]`; }
-const log = (...a) => console.log(ts(), "[v11-GOD]", ...a);
-const err = (...a) => console.error(ts(), "[FATAL]", ...a);
+function ts(){ const d=new Date(); return `[${d.toTimeString().slice(0,8)}]`; }
+const log=(...a)=>console.log(ts(),...a);
+const warn=(...a)=>console.warn(ts(),...a);
+const err=(...a)=>console.error(ts(),...a);
 
+/* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) { err("Supabase missing"); process.exit(1); }
+const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  err("SUPABASE_URL or SUPABASE_KEY missing"); process.exit(1);
+}
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-app.get("/healthz", (_req, res) => res.json({ ok: true, version: "11.0-GOD" }));
+/* ---------- Health ---------- */
+app.get("/healthz", (_req,res)=>res.json({ ok:true, time:new Date().toISOString() }));
 
-function formatUsd(v) {
-  v = Number(v); if (!v) return "$0.00";
-  const a = Math.abs(v);
-  if (a < 1) return (v < 0 ? "-$" : "$") + a.toFixed(6).replace(/0+$/, "");
-  if (a < 1e4) return (v < 0 ? "-$" : "$") + a.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const s = ["", "K", "M", "B", "T"][Math.floor(Math.log10(a) / 3)];
-  return (v < 0 ? "-$" : "$") + (a / Math.pow(1000, Math.floor(Math.log10(a) / 3))).toFixed(2) + s;
+/* ---------- Chart poller (unchanged) ---------- */
+const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
+let FETCH_INTERVAL = 20000;
+const BACKOFF_INTERVAL = 60000;
+let isBackoff=false, fetchInProgress=false, pollTimer=null;
+let memoryCache=[];
+
+async function insertPoint(point){
+  try{ const {error}=await supabase.from("chart_data").insert([point]); if(error) err("Supabase insert failed:",error.message); }
+  catch(e){ err("Supabase insert exception:",e); }
 }
-
-function formatAmountSmart(amount, decimals = 9) {
-  const num = Number(amount) || 0;
-  if (num === 0) return "0";
-  const adjusted = num / Math.pow(10, decimals);
-  return adjusted >= 1 
-    ? adjusted.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : adjusted.toFixed(6).replace(/0+$/, "");
+async function fetchOneTick(){
+  fetchInProgress=true; log("⏱️  Polling Dexscreener...");
+  try{
+    const res=await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,{headers:{"Cache-Control":"no-cache"}});
+    if(res.status===429){ warn("⚠️  429 rate limit hit — entering backoff:",`${BACKOFF_INTERVAL/1000}s`); return "backoff"; }
+    if(!res.ok){ warn(`⚠️  Upstream returned ${res.status} — keeping normal cadence`); return "softfail"; }
+    const json=await res.json(); const pair=json.pairs?.[0];
+    if(!pair){ warn("⚠️  No pairs in response — keeping normal cadence"); return "softfail"; }
+    const point={ timestamp:new Date().toISOString(), price:+pair.priceUsd, change:+(pair.priceChange?.h24), volume:+(pair.volume?.h24) };
+    if([point.price,point.change,point.volume].some(v=>isNaN(v))){ warn("⚠️  Invalid numeric fields — skipping insert"); return "softfail"; }
+    memoryCache.push(point); if(memoryCache.length>10000) memoryCache.shift();
+    await insertPoint(point); log("✅ Data stored at",point.timestamp); return "ok";
+  }catch(e){ err("fetchLiveData failed:",e); return "softfail"; } finally{ fetchInProgress=false; }
 }
-
-const ICON_GATEWAYS = [
-  "https://ipfs.io/ipfs/",
-  "https://gateway.pinata.cloud/ipfs/",
-  "https://cloudflare-ipfs.com/ipfs/",
-  "https://dweb.link/ipfs/",
-  "https://nftstorage.link/ipfs/"
-];
-
-function getIconUrl(mint) {
-  if (mint === "So11111111111111111111111111111111111111112")
-    return ["https://assets.coingecko.com/coins/images/4128/small/solana.png"];
-  const letter = (mint[0] || "?").toUpperCase();
-  const svg = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230f1720'/><text x='16' y='20' font-size='18' text-anchor='middle' fill='%2300d1b2' font-family='Inter,system-ui' font-weight='800'>${letter}</text></svg>`;
-  return [...ICON_GATEWAYS.map(g => `${g}${mint}`), svg];
+function scheduleNext(ms){ if(pollTimer){ clearTimeout(pollTimer); pollTimer=null; } pollTimer=setTimeout(pollLoop,ms); }
+async function pollLoop(){
+  if(fetchInProgress){ warn("⏸️  Prev fetch still running — skip"); return scheduleNext(isBackoff?BACKOFF_INTERVAL:FETCH_INTERVAL); }
+  const r=await fetchOneTick();
+  if(r==="backoff"){ if(!isBackoff) isBackoff=true; log("⏸️  Backoff active — delaying"); return scheduleNext(BACKOFF_INTERVAL); }
+  if(isBackoff && r==="ok"){ isBackoff=false; log("⏳  Backoff ended — resume"); return scheduleNext(FETCH_INTERVAL); }
+  scheduleNext(FETCH_INTERVAL);
 }
+pollLoop();
 
-const META_CACHE = new Map();
-async function resolveTokenMeta(mint) {
-  if (META_CACHE.has(mint)) return META_CACHE.get(mint);
-  let meta = { name: "Unknown", symbol: "???", icon: getIconUrl(mint), decimals: 9 };
-  try {
-    const j = await fetch(`https://tokens.jup.ag/token/${mint}`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : null);
-    if (j) {
-      meta.name = j.name || meta.name;
-      meta.symbol = j.symbol || meta.symbol;
-      if (j.logoURI) meta.icon = [j.logoURI, ...getIconUrl(mint)];
-      if (j.decimals !== undefined) meta.decimals = j.decimals;
-    }
-  } catch {}
-  try {
-    const p = await fetch(`https://pump.fun/api/coin/${mint}`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : null);
-    if (p) {
-      meta.name = p.name || meta.name;
-      meta.symbol = p.symbol || meta.symbol;
-      if (p.image_uri) meta.icon = [p.image_uri, ...getIconUrl(mint)];
-      // PUMP.FUN USES 6 DECIMALS FOR BLACKCOIN
-      if (p.decimals !== undefined) meta.decimals = p.decimals;
-    }
-  } catch {}
-  META_CACHE.set(mint, meta);
-  return meta;
-}
+/* ---------- Chart API ---------- */
+function bucketMs(interval){ switch(interval){case"1m":return 60e3;case"5m":return 300e3;case"30m":return 1800e3;case"1h":return 3600e3;case"D":return 86400e3;default:return 60e3;} }
+function getWindow(interval){ const now=Date.now(); if(interval==="D") return new Date(now-30*86400e3).toISOString(); if(interval==="1h") return new Date(now-7*86400e3).toISOString(); return new Date(now-86400e3).toISOString(); }
+function floorToBucketUTC(tsISO, interval){ const ms=bucketMs(interval); const d=new Date(tsISO); return new Date(Math.floor(d.getTime()/ms)*ms); }
+function bucketize(rows,interval){ const m=new Map(); for(const r of rows){ const key=floorToBucketUTC(r.timestamp,interval).toISOString(); const price=+r.price,change=+r.change,vol=+r.volume; if(!m.has(key)) m.set(key,{timestamp:key,price,change,volume:0}); const b=m.get(key); b.price=price; b.change=change; b.volume+=isNaN(vol)?0:vol; } return Array.from(m.values()).sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp)); }
+app.get("/api/chart",async(req,res)=>{
+  try{
+    const interval=req.query.interval||"D", page=Math.max(parseInt(req.query.page)||1,1), limit=Math.min(parseInt(req.query.limit)||10000,20000);
+    const offset=(page-1)*limit, cutoff=getWindow(interval);
+    const {data,error,count}=await supabase.from("chart_data").select("timestamp, price, change, volume",{count:"exact"}).gte("timestamp",cutoff).order("timestamp",{ascending:true}).range(offset,offset+limit-1);
+    if(error) throw error;
+    const raw=data?.length?data:memoryCache.filter(p=>new Date(p.timestamp)>=new Date(cutoff));
+    const points=bucketize(raw,interval); const latest=raw.length?raw[raw.length-1]:memoryCache.at(-1);
+    const totalCount=count||raw.length; const nextPage=offset+limit<totalCount? page+1:null;
+    res.json({points,latest,page,nextPage,hasMore:Boolean(nextPage)});
+  }catch(e){ err("Error /api/chart:",e); res.status(500).json({error:"Failed to fetch chart data",message:e.message}); }
+});
+app.get("/api/latest",async(_req,res)=>{
+  try{
+    let latest=memoryCache.at(-1);
+    if(!latest){ const {data}=await supabase.from("chart_data").select("timestamp, price, change, volume").order("timestamp",{ascending:false}).limit(1).maybeSingle(); latest=data; }
+    if(!latest) return res.status(404).json({error:"No data"});
+    res.json(latest);
+  }catch(e){ err("Error /api/latest:",e); res.status(500).json({error:"Failed"}); }
+});
 
+/* ---------- Profiles & Avatars ---------- */
+app.post("/api/profile", async (req,res)=>{
+  try{
+    let { wallet, handle, avatar_url } = req.body;
+    if(!wallet) return res.status(400).json({error:"Missing wallet"});
+    if(typeof handle==="string") handle=handle.trim();
+    if(!handle) handle="@Operator";
+    const { data, error } = await supabase.from("hub_profiles").upsert(
+      { wallet, handle, avatar_url: avatar_url ?? null, updated_at:new Date().toISOString() },
+      { onConflict:"wallet" }
+    ).select();
+    if(error) throw error;
+    res.json({ success:true, data });
+  }catch(e){ err("Error /api/profile:",e); res.status(500).json({error:e.message}); }
+});
+app.get("/api/profile", async (req,res)=>{
+  try{
+    const wallet=req.query.wallet; if(!wallet) return res.status(400).json({error:"Missing wallet"});
+    const { data, error } = await supabase.from("hub_profiles").select("*").eq("wallet",wallet).maybeSingle();
+    if(error) throw error;
+    if(!data) return res.status(404).json({error:"Not found"});
+    res.json(data);
+  }catch(e){ err("Error /api/profile[GET]:",e); res.status(500).json({error:e.message}); }
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+app.post("/api/avatar-upload", upload.single("avatar"), async (req,res)=>{
+  try{
+    const { wallet } = req.body; const file = req.file;
+    if(!wallet || !file) return res.status(400).json({error:"Missing fields"});
+    const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
+    const { error: uploadErr } = await supabase.storage.from("hub_avatars").upload(fileName, file.buffer, { contentType:file.mimetype, upsert:true });
+    if(uploadErr) throw uploadErr;
+    const { data: publicURL } = supabase.storage.from("hub_avatars").getPublicUrl(fileName);
+    const url = publicURL.publicUrl;
+    const { error: updErr } = await supabase.from("hub_profiles").upsert({ wallet, avatar_url:url, updated_at:new Date().toISOString() }, { onConflict:"wallet" });
+    if(updErr) throw updErr;
+    res.json({ success:true, url });
+  }catch(e){ err("Error /api/avatar-upload:",e); res.status(500).json({error:e.message}); }
+});
+
+/* ---------- Balances (Helius Enhanced + prices) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
-if (!HELIUS_KEY) err("HELIUS_API_KEY MISSING");
+if (!HELIUS_KEY) warn("HELIUS_API_KEY is not set — /api/balances will fail.");
 
-async function fetchHeliusBalances(wallet) {
-  const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}`;
-  const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
-  if (!r.ok) throw new Error(`Helius ${r.status}: ${await r.text()}`);
-  const json = await r.json();
+const DEX_PRICE_CACHE = new Map(); // mint -> {priceUsd, ts}
+const SOL_PRICE_CACHE = { priceUsd: null, ts: 0 };
+const PRICE_TTL_MS = 25_000;
 
-  // SOL: lamports can be STRING or NUMBER
-  const lamportsRaw = json.nativeBalance?.lamports ?? "0";
-  const lamports = Number(String(lamportsRaw)) || 0;
-  log(`Helius → SOL: ${lamports} lamports | tokens: ${json.tokens?.length || 0}`);
-
-  return { json, lamports };
+async function getSolUsd() {
+  const now = Date.now();
+  if (SOL_PRICE_CACHE.priceUsd && (now - SOL_PRICE_CACHE.ts) < PRICE_TTL_MS) {
+    return SOL_PRICE_CACHE.priceUsd;
+  }
+  try {
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { headers: { "Cache-Control": "no-cache" }});
+    const j = await r.json();
+    const p = Number(j?.solana?.usd) || 0;
+    if (p > 0) {
+      SOL_PRICE_CACHE.priceUsd = p;
+      SOL_PRICE_CACHE.ts = now;
+      return p;
+    }
+  } catch {}
+  return SOL_PRICE_CACHE.priceUsd ?? 0;
 }
 
-async function getTokenPrice(mint) {
-  if (!mint || mint === "So11111111111111111111111111111111111111112") return 0;
-  if (mint === "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump") {
-    try {
-      const r = await fetch(`https://pump.fun/api/coin/${mint}`, { signal: AbortSignal.timeout(6000) });
-      if (r.ok) { const j = await r.json(); return Number(j.usdPrice || 0); }
-    } catch {}
-  }
-  const urls = [
-    `https://quote-api.jup.ag/v6/price?ids=${mint}`,
-    `https://price.jup.ag/v6/price?ids=${mint}`
-  ];
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { signal: AbortSignal.timeout(6000) });
-      if (r.ok) { const j = await r.json(); const p = Number(j.data?.[mint]?.price || 0); if (p > 0) return p; }
-    } catch {}
-  }
+async function getTokenUsd(mint) {
+  const now = Date.now();
+  const cached = DEX_PRICE_CACHE.get(mint);
+  if (cached && (now - cached.ts) < PRICE_TTL_MS) return cached.priceUsd;
+
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`, { headers: { "Cache-Control": "no-cache" }});
+    const j = await r.json();
+    const price = Number(j?.pairs?.[0]?.priceUsd) || 0;
+    if (price > 0) {
+      DEX_PRICE_CACHE.set(mint, { priceUsd: price, ts: now });
+      return price;
+    }
+  } catch {}
   return 0;
 }
 
+/**
+ * POST /api/balances
+ * body: { wallet: string }
+ * returns: {
+ *   sol: number,
+ *   solUsd: number,
+ *   tokens: [{ mint, amount, decimals, symbol, name, logo, priceUsd, usd }]
+ * }
+ */
 app.post("/api/balances", async (req, res) => {
   try {
-    const wallet = String(req.body?.wallet || "").trim();
-    if (!wallet) return res.status(400).json({ error: "No wallet" });
+    const wallet = (req.body?.wallet || "").trim();
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    if (!HELIUS_KEY) return res.status(500).json({ error: "Backend missing HELIUS_API_KEY" });
 
-    const { json: data, lamports } = await fetchHeliusBalances(wallet);
+    const url = `https://api.helius.xyz/v0/addresses/${wallet}/balances?api-key=${HELIUS_KEY}&includeNative=true`;
+    const r = await fetch(url, { headers: { "Cache-Control": "no-cache" }});
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(502).json({ error: `Helius ${r.status}`, body: t });
+    }
+    const data = await r.json();
+
+    const lamports =
+      Number(data?.nativeBalance?.lamports) ||
+      Number(data?.native?.lamports) ||
+      0;
     const sol = lamports / 1e9;
-    log(`SOL FINAL: ${sol.toFixed(9)} SOL — THIS WILL SHOW`);
 
-    const rawTokens = Array.isArray(data.tokens) ? data.tokens : [];
+    const rawTokens =
+      Array.isArray(data?.tokens) ? data.tokens :
+      Array.isArray(data?.tokenBalances) ? data.tokenBalances :
+      [];
+
     const tokensBase = rawTokens
-      .map(t => {
-        const amountRaw = Number(String(t.amount || 0)); // FORCE STRING → NUMBER
-        if (amountRaw <= 0) return null;
-        return {
-          mint: t.mint,
-          amountRaw,
-          decimals: Number(t.decimals || 9)
-        };
-      })
-      .filter(Boolean);
+      .map(t => ({
+        mint: t.mint || t.tokenMint || "",
+        amount: Number(t.amount ?? t.uiAmount ?? 0),
+        decimals: Number(t.decimals ?? t.tokenAmount?.decimals ?? 0),
+        symbol: t.symbol || t.tokenSymbol || t.info?.symbol || "",
+        name: t.name || t.tokenName || t.info?.name || "",
+        logo: t.logo || t.image || t.info?.image || ""
+      }))
+      .filter(t => t.mint && t.amount > 0);
 
-    const solRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true", { signal: AbortSignal.timeout(8000) });
-    const solJson = await solRes.json();
-    const solUsd = Number(solJson?.solana?.usd || 180);
-    const solChange = Number(solJson?.solana?.usd_24h_change || 0);
-    const solValue = sol * solUsd;
+    const solUsd = await getSolUsd();
 
-    const priced = await Promise.all(tokensBase.map(async t => {
-      const meta = await resolveTokenMeta(t.mint);
-      const decimals = meta.decimals ?? t.decimals ?? 9; // TRIPLE FALLBACK
-      const amount = t.amountRaw / Math.pow(10, decimals);
-      const price = await getTokenPrice(t.mint);
-      const usd = price * amount;
-      return {
-        mint: t.mint,
-        name: t.mint === "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump" ? "BlackCoin" : meta.name,
-        symbol: t.mint === "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump" ? "BLCN" : meta.symbol,
-        amount: amount,
-        amountFormatted: formatAmountSmart(amount, decimals),
-        usd,
-        usdFormatted: formatUsd(usd),
-        icon: meta.icon[0],
-        iconFallbacks: meta.icon
-      };
+    const priced = await Promise.allSettled(tokensBase.map(async t => {
+      const priceUsd = await getTokenUsd(t.mint);
+      return { ...t, priceUsd, usd: priceUsd * t.amount };
     }));
 
-    const totalUSD = solValue + priced.reduce((a, b) => a + b.usd, 0);
+    const tokens = priced
+      .map(p => p.status === "fulfilled" ? p.value : null)
+      .filter(Boolean)
+      .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
     res.json({
-      sol: Number(sol.toFixed(9)),
+      sol,
       solUsd,
-      solUsdTotal: Number(solValue.toFixed(2)),
-      solChangePct: solChange,
-      tokens: priced,
-      totalUSD: Number(totalUSD.toFixed(2)),
-      portfolioDeltaPct: solChange
+      tokens
     });
-
   } catch (e) {
-    err("BALANCES ERROR:", e.message);
-    res.status(500).json({ error: "Failed" });
+    err("Error /api/balances:", e);
+    res.status(500).json({ error: e.message || "Failed to load balances" });
   }
 });
 
-app.get("/api/profile", async (req, res) => {
-  const w = req.query.wallet?.trim();
-  if (!w) return res.status(400).json({ error: "No wallet" });
-  const { data } = await supabase.from("hub_profiles").select("*").eq("wallet", w).maybeSingle();
-  res.json(data || { handle: "@Guest", avatar_url: null });
+/* ---------- Broadcasts ---------- */
+const hhmm = (iso)=>{ try{ const d=new Date(iso); return d.toTimeString().slice(0,5);}catch{return "";} };
+
+// Normalize DB row into a stable payload for clients
+function normRow(r){
+  if(!r) return null;
+  return {
+    id: r.id,
+    wallet: r.wallet,
+    message: r.message,
+    created_at: r.created_at,
+    display_time: hhmm(r.created_at)
+  };
+}
+
+app.post("/api/broadcast", async (req,res)=>{
+  try{
+    const { wallet, message } = req.body;
+    if(!wallet || !message) return res.status(400).json({error:"Missing fields"});
+    const { data, error } = await supabase.from("hub_broadcasts").insert([{ wallet, message }]).select().maybeSingle();
+    if(error) throw error;
+    const row = normRow(data);
+
+    // Instant echo so the poster sees it immediately (others still get realtime)
+    wsBroadcast({ type:"insert", row });
+
+    res.json({ success:true, data: row });
+  }catch(e){ err("Error /api/broadcast:",e); res.status(500).json({error:e.message}); }
 });
 
-app.get("/api/broadcasts", async (_req, res) => {
-  const { data } = await supabase.from("hub_broadcasts").select("id,wallet,message,created_at").order("created_at", { ascending: false }).limit(25);
-  res.json(data || []);
+app.get("/api/broadcasts", async (_req,res)=>{
+  try{
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("id, wallet, message, created_at")
+      .order("created_at",{ascending:false})
+      .limit(25);
+    if(error) throw error;
+    const rows = (data||[]).map(normRow);
+    res.json(rows);
+  }catch(e){ err("Error /api/broadcasts:",e); res.status(500).json({error:e.message}); }
 });
 
+/* ---------- Refunds ---------- */
+app.post("/api/refund", async (req,res)=>{
+  try{
+    const { wallet, token, rent, tx, status } = req.body;
+    if(!wallet || !tx) return res.status(400).json({error:"Missing required fields"});
+    const record = { wallet, token:token||"UNKNOWN", rent_reclaimed: rent ?? 0, tx, status: status || "Success" };
+    const { data, error } = await supabase.from("hub_refund_history").insert([record]).select();
+    if(error) throw error;
+    res.json({ success:true, inserted:data });
+  }catch(e){ err("❌ Error inserting refund:",e); res.status(500).json({error:e.message}); }
+});
+app.get("/api/refund-history", async (req,res)=>{
+  try{
+    const { wallet } = req.query;
+    if(!wallet) return res.status(400).json({error:"Missing wallet"});
+    res.set("Cache-Control","no-store");
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .select("*")
+      .eq("wallet",wallet)
+      .order("created_at",{ascending:false})
+      .limit(50);
+    if(error) throw error;
+    res.json(data||[]);
+  }catch(e){ err("Error /api/refund-history:",e); res.status(500).json({error:e.message}); }
+});
+
+/* ---------- WebSocket + realtime bridge ---------- */
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
-wss.on("connection", ws => { 
-  log("WS CONNECTED"); 
-  ws.isAlive = true; 
-  ws.on("pong", () => ws.isAlive = true); 
-  // SEND INITIAL BROADCASTS
-  supabase.from("hub_broadcasts").select("id,wallet,message,created_at").order("created_at", { ascending: false }).limit(25)
-    .then(({ data }) => {
-      if (data && ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: 'hello', rows: data }));
-      }
-    });
-});
+const wss = new WebSocketServer({ server, path:"/ws" });
+const clients = new Set();
 
-setInterval(() => wss.clients.forEach(ws => { 
-  if (!ws.isAlive) ws.terminate(); 
-  ws.isAlive = false; 
-  ws.ping(); 
-}), 30000);
+wss.on("connection", async (socket)=>{
+  socket.isAlive = true;
+  clients.add(socket);
+  socket.on("pong", ()=> socket.isAlive=true);
+  socket.on("close", ()=> clients.delete(socket));
+  socket.on("error", (e)=> err("WS error:", e?.message||e));
 
-// SUPABASE REALTIME BROADCAST
-const channel = supabase.channel('broadcasts');
-channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'hub_broadcasts' }, payload => {
-  wss.clients.forEach(client => {
-    if (client.readyState === client.OPEN) {
-      client.send(JSON.stringify({ type: 'insert', row: payload.new }));
+  // send last 25 on connect (DESC -> client sorts; or show as-is)
+  try{
+    const { data, error } = await supabase
+      .from("hub_broadcasts")
+      .select("id, wallet, message, created_at")
+      .order("created_at",{ascending:false})
+      .limit(25);
+    if(!error && data){
+      const rows = (data||[]).map(normRow);
+      socket.send(JSON.stringify({ type:"hello", rows }));
     }
-  });
-}).subscribe();
-
-server.listen(PORT, () => {
-  log(`BLACKCOIN TERMINAL v11.0 GOD MODE LIVE ON PORT ${PORT}`);
-  log(`SOL = FIXED (lamports string)`);
-  log(`BLACKCOIN = 777.00 (6 decimals)`);
-  log(`ALL TOKENS = CORRECT AMOUNTS`);
-  log(`WS = REALTIME + INITIAL SEND`);
-  log(`BLACKCOIN = ETERNAL`);
+  }catch(e){ err("WS hello failed:", e?.message||e); }
 });
+
+setInterval(()=>{
+  for(const s of clients){
+    if(s.isAlive===false) { try{s.terminate();}catch{}; continue; }
+    s.isAlive=false; try{s.ping();}catch{}
+  }
+}, 30000);
+
+function wsBroadcast(o){
+  const msg = JSON.stringify(o);
+  for(const s of clients){ if(s.readyState===s.OPEN) s.send(msg); }
+}
+
+/* ---------- Supabase Realtime: resilient subscription ---------- */
+// we wrap the subscription logic so we can re-subscribe on failures
+let rtChannel = null;
+function subscribeToBroadcasts() {
+  try {
+    if (rtChannel) {
+      try { supabase.removeChannel(rtChannel); } catch {}
+      rtChannel = null;
+    }
+
+    rtChannel = supabase
+      .channel("rt:hub_broadcasts", {
+        config: { broadcast: { ack: true }, presence: { key: "server" } }
+      })
+      .on("postgres_changes",
+        { event: "INSERT", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const row = normRow(payload?.new || payload?.record);
+          log("🔔 INSERT hub_broadcasts id=", row?.id);
+          if (row) wsBroadcast({ type:"insert", row });
+        }
+      )
+      .on("postgres_changes",
+        { event: "UPDATE", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const row = normRow(payload?.new || payload?.record);
+          log("🔧 UPDATE hub_broadcasts id=", row?.id);
+          if (row) wsBroadcast({ type:"update", row });
+        }
+      )
+      .on("postgres_changes",
+        { event: "DELETE", schema: "public", table: "hub_broadcasts" },
+        (payload) => {
+          const old = payload?.old || payload?.record || null;
+          const id = old?.id;
+          log("🗑️  DELETE hub_broadcasts id=", id);
+          if (id) wsBroadcast({ type:"delete", id });
+        }
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") log("✅ Realtime subscribed: hub_broadcasts");
+        else if (status === "CHANNEL_ERROR") { err("❌ Realtime CHANNEL_ERROR — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+        else if (status === "TIMED_OUT") { warn("⚠️ Realtime TIMED_OUT — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+        else if (status === "CLOSED") { warn("⚠️ Realtime CLOSED — retrying in 2s"); setTimeout(subscribeToBroadcasts, 2000); }
+      });
+  } catch (e) {
+    err("Realtime subscribe failed:", e?.message || e);
+    setTimeout(subscribeToBroadcasts, 2000);
+  }
+}
+subscribeToBroadcasts();
+
+server.listen(PORT, ()=> log(`✅ BlackCoin backend running on port ${PORT}`));
