@@ -653,7 +653,21 @@ app.get("/api/refund-history", async (req, res) => {
 });
 
 /* ---------- Optional RPC Proxy (Helius) ---------- */
-// Useful if frontend hits /api/rpc to avoid CORS; harmless if unused.
+// GET: let frontend discover the RPC URL without exposing method params
+app.get("/api/rpc", (_req, res) => {
+  if (!HELIUS_KEY) {
+    return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+  }
+  // Frontend's loader checks rpc / helius / rpc_url / rpcUrl keys
+  res.json({
+    rpc: HELIUS_RPC,
+    helius: HELIUS_RPC,
+    rpc_url: HELIUS_RPC,
+    rpcUrl: HELIUS_RPC,
+  });
+});
+
+// POST: generic proxy (if you ever want to call Helius via backend)
 app.post("/api/rpc", async (req, res) => {
   try {
     const { method, params } = req.body || {};
@@ -678,7 +692,6 @@ app.post("/api/rpc", async (req, res) => {
     res.status(500).json({ error: "RPC proxy failed" });
   }
 });
-
 /* ---------- WebSocket + Realtime Bridge ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
