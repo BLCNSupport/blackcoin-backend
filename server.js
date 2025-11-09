@@ -1,8 +1,9 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched)
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched+refund-history)
 /* Changes:
  * - Realtime: add UPDATE + DELETE handlers so broadcast deletes/edits propagate instantly
  * - Env vars: accept SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (backward compatible)
  * - Clearer missing-env error message
+ * - NEW: Refund History endpoints (POST/GET) writing to hub_refund_history with server-side timestamps
  */
 import express from "express";
 import fetch from "node-fetch";
@@ -493,6 +494,58 @@ app.post("/api/balances", async (req, res) => {
   }
 });
 
+/* ---------- Refund History (hub_refund_history) ---------- */
+/* Fields: wallet, token, mint (nullable for MULTI), rent_reclaimed (number SOL), tx, status ("Success"), created_at (server) */
+app.post("/api/refund-history", async (req, res) => {
+  try {
+    const { wallet, token, mint, rent_reclaimed, tx, status } = req.body || {};
+    if (!wallet || !token || !tx) {
+      return res.status(400).json({ error: "Missing required fields (wallet, token, tx)" });
+    }
+    const amount = Number(rent_reclaimed ?? 0);
+    const row = {
+      wallet: String(wallet).trim(),
+      token: String(token).trim(),
+      mint: mint ? String(mint).trim() : null,
+      rent_reclaimed: isNaN(amount) ? 0 : amount,
+      tx: String(tx).trim(),
+      status: status ? String(status).trim() : "Success",
+      created_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .insert([row])
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    return res.json({ success: true, data });
+  } catch (e) {
+    err("Refund history insert error:", e);
+    return res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.get("/api/refund-history", async (req, res) => {
+  try {
+    const wallet = (req.query?.wallet || "").trim();
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .select("wallet, token, mint, rent_reclaimed, tx, status, created_at")
+      .eq("wallet", wallet)
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (e) {
+    err("Refund history fetch error:", e);
+    return res.status(500).json({ error: "Failed" });
+  }
+});
 
 /* ---------- Broadcasts ---------- */
 const hhmm = (iso) => {
