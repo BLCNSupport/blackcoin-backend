@@ -711,6 +711,17 @@ app.post("/api/rpc", async (req, res) => {
   }
 });
 
+// Simple GET so the frontend can auto-detect the RPC URL
+app.get("/api/rpc", (_req, res) => {
+  if (!HELIUS_KEY) {
+    return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+  }
+  // Frontend expects one of: rpc / helius / rpc_url / rpcUrl
+  return res.json({ rpc: HELIUS_RPC });
+});
+
+
+
 /* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
