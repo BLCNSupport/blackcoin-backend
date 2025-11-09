@@ -1,9 +1,12 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.1 — REALTIME FIX EDITION
-/* What’s new vs v11.0:
- * - Reverted Supabase client to the same style as your old working backend.
- * - Realtime subscription logic now mirrors the previous “subscribeToBroadcasts” pattern,
- *   extended to also handle hub_refund_history.
- * - Extra logging for realtime INSERT/UPDATE/DELETE on hub_broadcasts + hub_refund_history.
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.1 — realtime broadcasts restored
+/* Key points:
+ * - Keeps all v11 features (chart poller, profiles, avatar upload, balances, refund log/history, /api/rpc).
+ * - WebSocket server on /ws.
+ * - Realtime subscription for hub_broadcasts now matches your old, working pattern:
+ *      • INSERT → { type:"insert", row }
+ *      • UPDATE → { type:"update", row }
+ *      • DELETE → { type:"delete", id }
+ *   so deleting a row in Supabase instantly removes it from Signal Room.
  */
 
 import express from "express";
@@ -12,7 +15,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 import http from "http";
 
 dotenv.config();
@@ -22,31 +25,22 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(express.static("public")); // ← Serves OperatorHub.html
+app.use(express.static("public")); // serves OperatorHub.html etc.
 
-function ts() {
-  return `[${new Date().toTimeString().slice(0, 8)}]`;
-}
-const log = (...a) => console.log(ts(), ...a);
+/* ---------- tiny log helpers ---------- */
+function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
+const log  = (...a) => console.log(ts(), ...a);
 const warn = (...a) => console.warn(ts(), ...a);
-const err = (...a) => console.error(ts(), ...a);
+const err  = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-// Accept both names to match your Render config
-const SUPABASE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
-
+// Accept both names so it works with your existing Render env
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  err(
-    "Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)."
-  );
+  err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
   process.exit(1);
 }
-
-// NOTE: We deliberately keep this simple, like your old working backend.
-// Supabase's client can handle WebSockets in Node without extra config,
-// and this matches the pattern you already know works.
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 /* ---------- Health ---------- */
@@ -54,7 +48,7 @@ app.get("/healthz", (_req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
-/* ---------- Chart Poller — 429 IMMUNE ---------- */
+/* ---------- Chart Poller (DexScreener) ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
@@ -74,7 +68,7 @@ async function insertPoint(point) {
 
 async function fetchOneTick() {
   fetchInProgress = true;
-  log("Polling DexScreener...");
+  log("⏱️  Polling DexScreener...");
   try {
     const res = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${TOKEN_MINT}`,
@@ -82,17 +76,20 @@ async function fetchOneTick() {
     );
 
     if (res.status === 429) {
-      warn("429 — entering 3min backoff");
+      warn("⚠️  429 — entering backoff");
       return "backoff";
     }
     if (!res.ok) {
-      warn(`Upstream ${res.status} — continuing`);
+      warn(`⚠️  Upstream ${res.status} — continuing`);
       return "softfail";
     }
 
     const json = await res.json();
     const pair = json.pairs?.[0];
-    if (!pair) return "softfail";
+    if (!pair) {
+      warn("⚠️  No pairs in response");
+      return "softfail";
+    }
 
     const point = {
       timestamp: new Date().toISOString(),
@@ -101,15 +98,18 @@ async function fetchOneTick() {
       volume: +(pair.volume?.h24),
     };
 
-    if (Object.values(point).some((v) => isNaN(v))) return "softfail";
+    if (Object.values(point).some((v) => isNaN(v))) {
+      warn("⚠️  Invalid numeric fields — skipping insert");
+      return "softfail";
+    }
 
     memoryCache.push(point);
     if (memoryCache.length > 10000) memoryCache.shift();
     await insertPoint(point);
-    log("Data stored");
+    log("✅ Chart data stored");
     return "ok";
   } catch (e) {
-    err("fetch failed:", e);
+    err("fetchOneTick failed:", e);
     return "softfail";
   } finally {
     fetchInProgress = false;
@@ -122,56 +122,53 @@ function scheduleNext(ms) {
 }
 
 async function pollLoop() {
-  if (fetchInProgress)
+  if (fetchInProgress) {
+    warn("⏸️  Previous fetch still running — skipping");
     return scheduleNext(isBackoff ? BACKOFF_INTERVAL : FETCH_INTERVAL);
+  }
   const r = await fetchOneTick();
   if (r === "backoff") {
-    if (!isBackoff) isBackoff = true;
+    isBackoff = true;
     return scheduleNext(BACKOFF_INTERVAL);
   }
   if (isBackoff && r === "ok") {
     isBackoff = false;
-    log("Backoff ended");
+    log("⏳  Backoff ended — resume normal interval");
   }
   scheduleNext(FETCH_INTERVAL);
 }
 pollLoop();
 
 /* ---------- Chart API ---------- */
-function bucketMs(i) {
-  switch (i) {
-    case "1m":
-      return 60e3;
-    case "5m":
-      return 300e3;
-    case "30m":
-      return 1800e3;
-    case "1h":
-      return 3600e3;
-    case "D":
-      return 86400e3;
-    default:
-      return 60e3;
+function bucketMs(interval) {
+  switch (interval) {
+    case "1m":  return 60e3;
+    case "5m":  return 300e3;
+    case "30m": return 1800e3;
+    case "1h":  return 3600e3;
+    case "D":   return 86400e3;
+    default:    return 60e3;
   }
 }
-function getWindow(i) {
+function getWindow(interval) {
   const now = Date.now();
-  return new Date(
-    now - (i === "D" ? 30 : i === "1h" ? 7 : 1) * 86400e3
-  ).toISOString();
+  if (interval === "D")  return new Date(now - 30 * 86400e3).toISOString();
+  if (interval === "1h") return new Date(now - 7  * 86400e3).toISOString();
+  return new Date(now - 86400e3).toISOString();
 }
-function floorToBucketUTC(tsISO, i) {
-  const ms = bucketMs(i);
-  return new Date(Math.floor(new Date(tsISO).getTime() / ms) * ms);
+function floorToBucketUTC(tsISO, interval) {
+  const ms = bucketMs(interval);
+  const d = new Date(tsISO);
+  return new Date(Math.floor(d.getTime() / ms) * ms);
 }
-function bucketize(rows, i) {
+function bucketize(rows, interval) {
   const m = new Map();
   for (const r of rows) {
-    const key = floorToBucketUTC(r.timestamp, i).toISOString();
-    const price = +r.price,
-      change = +r.change,
-      vol = +r.volume;
-    if (!m.has(key)) m.set(key, { timestamp: key, price, change, volume: 0 });
+    const key = floorToBucketUTC(r.timestamp, interval).toISOString();
+    const price = +r.price, change = +r.change, vol = +r.volume;
+    if (!m.has(key)) {
+      m.set(key, { timestamp: key, price, change, volume: 0 });
+    }
     const b = m.get(key);
     b.price = price;
     b.change = change;
@@ -198,9 +195,11 @@ app.get("/api/chart", async (req, res) => {
       .range(offset, offset + limit - 1);
 
     if (error) throw error;
+
     const raw = data?.length
       ? data
       : memoryCache.filter((p) => new Date(p.timestamp) >= new Date(cutoff));
+
     const points = bucketize(raw, interval);
     const latest = raw.length ? raw[raw.length - 1] : memoryCache.at(-1);
     const totalCount = count || raw.length;
@@ -208,8 +207,8 @@ app.get("/api/chart", async (req, res) => {
 
     res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
   } catch (e) {
-    err("Chart error:", e);
-    res.status(500).json({ error: "Failed" });
+    err("Error /api/chart:", e);
+    res.status(500).json({ error: "Failed to fetch chart data" });
   }
 });
 
@@ -228,7 +227,7 @@ app.get("/api/latest", async (_req, res) => {
     if (!latest) return res.status(404).json({ error: "No data" });
     res.json(latest);
   } catch (e) {
-    err("Latest error:", e);
+    err("Error /api/latest:", e);
     res.status(500).json({ error: "Failed" });
   }
 });
@@ -238,16 +237,25 @@ app.post("/api/profile", async (req, res) => {
   try {
     let { wallet, handle, avatar_url } = req.body;
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-    handle = (handle || "@Operator").trim();
+    if (typeof handle === "string") handle = handle.trim();
+    if (!handle) handle = "@Operator";
+
     const { data, error } = await supabase
       .from("hub_profiles")
       .upsert(
-        { wallet, handle, avatar_url: avatar_url || null, updated_at: new Date().toISOString() },
+        {
+          wallet,
+          handle,
+          avatar_url: avatar_url ?? null,
+          updated_at: new Date().toISOString(),
+        },
         { onConflict: "wallet" }
       )
-      .select();
+      .select()
+      .maybeSingle();
+
     if (error) throw error;
-    res.json({ success: true, profile: data[0] });
+    res.json({ success: true, profile: data });
   } catch (e) {
     err("Profile save error:", e);
     res.status(500).json({ error: e.message });
@@ -258,11 +266,13 @@ app.get("/api/profile", async (req, res) => {
   try {
     const { wallet } = req.query;
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
     const { data, error } = await supabase
       .from("hub_profiles")
       .select("*")
       .eq("wallet", wallet)
       .maybeSingle();
+
     if (error) throw error;
     if (!data) return res.status(404).json({ error: "Not found" });
     res.json(data);
@@ -282,16 +292,25 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
     const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
     const { error: uploadErr } = await supabase.storage
       .from("hub_avatars")
-      .upload(fileName, file.buffer, { contentType: file.mimetype, upsert: true });
+      .upload(fileName, file.buffer, {
+        contentType: file.mimetype,
+        upsert: true,
+      });
 
     if (uploadErr) throw uploadErr;
 
-    const { data: urlData } = supabase.storage.from("hub_avatars").getPublicUrl(fileName);
+    const { data: urlData } = supabase
+      .storage
+      .from("hub_avatars")
+      .getPublicUrl(fileName);
     const url = urlData.publicUrl;
 
     const { error: updErr } = await supabase
       .from("hub_profiles")
-      .upsert({ wallet, avatar_url: url, updated_at: new Date().toISOString() }, { onConflict: "wallet" });
+      .upsert(
+        { wallet, avatar_url: url, updated_at: new Date().toISOString() },
+        { onConflict: "wallet" }
+      );
 
     if (updErr) throw updErr;
 
@@ -304,21 +323,21 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 
 /* ---------- Balances (Helius RPC + DexScreener + Jupiter) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
-if (!HELIUS_KEY) warn("HELIUS_API_KEY missing");
+if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances will 400 if called.");
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
-const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"; // SPL legacy
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"; // SPL-2022
+const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 // Caches
-const SOL_CACHE = { priceUsd: null, ts: 0 };
-const META_CACHE = new Map(); // mint -> { symbol, name, logo, tags, verified, decimals? }
-const PRICE_CACHE = new Map(); // mint -> { priceUsd, ts }
-const TTL_PRICE = 30_000; // 30s for prices
-const TTL_META = 6 * 60 * 60 * 1000; // 6h for token metadata
-const TTL_SOL = 25_000;
+const SOL_CACHE   = { priceUsd: null, ts: 0 };
+const META_CACHE  = new Map();  // mint -> { data, ts }
+const PRICE_CACHE = new Map();  // mint -> { priceUsd, ts }
+const TTL_PRICE   = 30_000;     // 30s prices
+const TTL_META    = 6 * 60 * 60 * 1000;
+const TTL_SOL     = 25_000;
 
-// Small helpers
+// Generic RPC helper
 async function rpc(method, params) {
   const r = await fetch(HELIUS_RPC, {
     method: "POST",
@@ -349,7 +368,7 @@ async function getSolUsd() {
   return SOL_CACHE.priceUsd ?? 0;
 }
 
-// ---- Token metadata (symbol/name/logo/verified/tags) via Jupiter first ----
+// Token metadata (symbol/name/logo/decimals) via Jupiter
 async function getTokenMeta(mint) {
   const now = Date.now();
   const cached = META_CACHE.get(mint);
@@ -365,7 +384,10 @@ async function getTokenMeta(mint) {
         logo: j?.logoURI || "",
         tags: Array.isArray(j?.tags) ? j.tags : [],
         isVerified: Boolean(
-          j?.extensions?.coingeckoId || j?.daily_volume || j?.liquidity || j?.verified
+          j?.extensions?.coingeckoId ||
+          j?.daily_volume ||
+          j?.liquidity ||
+          j?.verified
         ),
         decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
       };
@@ -374,19 +396,28 @@ async function getTokenMeta(mint) {
     }
   } catch {}
 
-  const meta = { symbol: "", name: "", logo: "", tags: [], isVerified: false, decimals: undefined };
+  const meta = {
+    symbol: "",
+    name: "",
+    logo: "",
+    tags: [],
+    isVerified: false,
+    decimals: undefined,
+  };
   META_CACHE.set(mint, { ts: now, data: meta });
   return meta;
 }
 
-// ---- Price: DexScreener primary, Jupiter fallback
+// Price: DexScreener, fallback Jupiter
 async function getTokenUsd(mint) {
   const now = Date.now();
-  const c = PRICE_CACHE.get(mint);
-  if (c && now - c.ts < TTL_PRICE) return c.priceUsd;
+  const cached = PRICE_CACHE.get(mint);
+  if (cached && now - cached.ts < TTL_PRICE) return cached.priceUsd;
 
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
+    const r = await fetch(
+      `https://api.dexscreener.com/latest/dex/search?q=${mint}`
+    );
     if (r.ok) {
       const j = await r.json();
       const p = Number(j?.pairs?.[0]?.priceUsd) || 0;
@@ -415,17 +446,16 @@ async function getTokenUsd(mint) {
   return 0;
 }
 
-// Normalize one parsed token account from RPC
+// Normalize parsed token account
 function parseParsedAccount(acc) {
   const info = acc?.account?.data?.parsed?.info;
   const amt = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
   const decimals = Number(amt?.decimals ?? info?.decimals ?? 0);
   const raw = amt?.amount != null ? String(amt.amount) : null;
 
-  const uiAmount =
-    raw && decimals >= 0
-      ? Number(raw) / Math.pow(10, decimals)
-      : Number(amt?.uiAmount ?? 0);
+  const uiAmount = raw && decimals >= 0
+    ? Number(raw) / Math.pow(10, decimals)
+    : Number(amt?.uiAmount ?? 0);
 
   return {
     mint: info?.mint || info?.parsed?.info?.mint || "",
@@ -456,8 +486,9 @@ async function getAllSplTokenAccounts(owner) {
     const prev = byMint.get(t.mint);
     if (prev) {
       prev.amount += t.amount;
-      if (typeof prev.decimals !== "number" && typeof t.decimals === "number")
+      if (typeof prev.decimals !== "number" && typeof t.decimals === "number") {
         prev.decimals = t.decimals;
+      }
     } else {
       byMint.set(t.mint, { ...t });
     }
@@ -468,8 +499,9 @@ async function getAllSplTokenAccounts(owner) {
 app.post("/api/balances", async (req, res) => {
   try {
     const wallet = req.body?.wallet?.trim();
-    if (!wallet || !HELIUS_KEY)
+    if (!wallet || !HELIUS_KEY) {
       return res.status(400).json({ error: "Bad request" });
+    }
 
     const solBal = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
     const sol = Number(solBal?.value || 0) / 1e9;
@@ -502,14 +534,14 @@ app.post("/api/balances", async (req, res) => {
 
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    return res.json({ sol, solUsd, tokens: enriched });
+    res.json({ sol, solUsd, tokens: enriched });
   } catch (e) {
     err("Balances error:", e);
     res.status(500).json({ error: "Failed" });
   }
 });
 
-/* ---------- Broadcasts ---------- */
+/* ---------- Broadcasts (HTTP) ---------- */
 const hhmm = (iso) => {
   try {
     return new Date(iso).toTimeString().slice(0, 5);
@@ -532,8 +564,9 @@ function normRow(r) {
 app.post("/api/broadcast", async (req, res) => {
   try {
     const { wallet, message } = req.body;
-    if (!wallet || !message)
+    if (!wallet || !message) {
       return res.status(400).json({ error: "Missing" });
+    }
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
@@ -544,7 +577,7 @@ app.post("/api/broadcast", async (req, res) => {
     if (error) throw error;
     const row = normRow(data);
 
-    // Echo to connected clients immediately (like old backend)
+    // instant echo so DEV sees their own post immediately
     wsBroadcastAll({ type: "insert", row });
 
     res.json({ success: true, data: row });
@@ -569,9 +602,7 @@ app.get("/api/broadcasts", async (_req, res) => {
   }
 });
 
-/* ---------- Refund History ---------- */
-// Table: hub_refund_history
-// Columns: id, wallet, token, tx, date, status, created_at, rent_reclaimed
+/* ---------- Refund History (HTTP) ---------- */
 function normRefundRow(r) {
   if (!r) return null;
   const tx = r.tx || "";
@@ -582,8 +613,8 @@ function normRefundRow(r) {
     token: r.token,
     tx,
     solscan_url,
-    date: r.date, // ISO or text as stored
-    status: r.status, // e.g., "success" | "failed" | "pending"
+    date: r.date,
+    status: r.status,
     created_at: r.created_at,
     rent_reclaimed:
       typeof r.rent_reclaimed === "number"
@@ -592,7 +623,6 @@ function normRefundRow(r) {
   };
 }
 
-// Insert one refund log
 app.post("/api/refund-log", async (req, res) => {
   try {
     const { wallet, token, tx, date, status, rent_reclaimed } = req.body || {};
@@ -621,8 +651,7 @@ app.post("/api/refund-log", async (req, res) => {
 
     if (error) throw error;
     const row = normRefundRow(data);
-    // private realtime to this wallet only
-    wsBroadcastToWallet(wallet, { type: "refund_insert", row });
+    // optional: could also wsBroadcastToWallet(wallet, { type:"refund_insert", row });
     res.json({ success: true, data: row });
   } catch (e) {
     err("Refund-log error:", e);
@@ -630,7 +659,6 @@ app.post("/api/refund-log", async (req, res) => {
   }
 });
 
-// Fetch latest refund rows for a wallet
 app.get("/api/refund-history", async (req, res) => {
   try {
     const wallet = (req.query.wallet || "").trim();
@@ -653,26 +681,16 @@ app.get("/api/refund-history", async (req, res) => {
 });
 
 /* ---------- Optional RPC Proxy (Helius) ---------- */
-// GET: let frontend discover the RPC URL without exposing method params
-app.get("/api/rpc", (_req, res) => {
-  if (!HELIUS_KEY) {
-    return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
-  }
-  // Frontend's loader checks rpc / helius / rpc_url / rpcUrl keys
-  res.json({
-    rpc: HELIUS_RPC,
-    helius: HELIUS_RPC,
-    rpc_url: HELIUS_RPC,
-    rpcUrl: HELIUS_RPC,
-  });
-});
-
-// POST: generic proxy (if you ever want to call Helius via backend)
+// Frontend calls POST /api/rpc with { method, params }.
+// If you ever want GET style, you can add it later.
 app.post("/api/rpc", async (req, res) => {
   try {
     const { method, params } = req.body || {};
-    if (!HELIUS_KEY)
-      return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+    if (!HELIUS_KEY) {
+      return res
+        .status(400)
+        .json({ error: "HELIUS_API_KEY not configured on backend" });
+    }
     if (!method) return res.status(400).json({ error: "Missing method" });
 
     const r = await fetch(HELIUS_RPC, {
@@ -692,57 +710,21 @@ app.post("/api/rpc", async (req, res) => {
     res.status(500).json({ error: "RPC proxy failed" });
   }
 });
-/* ---------- WebSocket + Realtime Bridge ---------- */
+
+/* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const clients = new Set();
 
-// wallet -> Set<WebSocket>
-const walletIndex = new Map();
-
-function indexAdd(wallet, socket) {
-  if (!wallet) return;
-  if (!walletIndex.has(wallet)) walletIndex.set(wallet, new Set());
-  walletIndex.get(wallet).add(socket);
-}
-function indexRemove(wallet, socket) {
-  if (!wallet) return;
-  const set = walletIndex.get(wallet);
-  if (set) {
-    set.delete(socket);
-    if (set.size === 0) walletIndex.delete(wallet);
-  }
-}
-
 wss.on("connection", async (socket) => {
   socket.isAlive = true;
-  socket.wallet = null; // filled on identify
   clients.add(socket);
 
   socket.on("pong", () => {
     socket.isAlive = true;
   });
 
-  socket.on("message", (buf) => {
-    try {
-      const msg = JSON.parse(buf.toString());
-      if (msg?.type === "identify") {
-        // { type:"identify", wallet:"<pubkey>" }
-        if (socket.wallet && socket.wallet !== msg.wallet) {
-          // move index
-          indexRemove(socket.wallet, socket);
-        }
-        socket.wallet = (msg.wallet || "").trim();
-        if (socket.wallet) indexAdd(socket.wallet, socket);
-        log("WS identify:", socket.wallet || "—");
-      }
-    } catch {
-      // ignore non-JSON
-    }
-  });
-
   socket.on("close", () => {
-    if (socket.wallet) indexRemove(socket.wallet, socket);
     clients.delete(socket);
   });
 
@@ -750,24 +732,25 @@ wss.on("connection", async (socket) => {
     err("WS error:", e?.message || e);
   });
 
-  // Initial hello with last broadcasts
+  // initial hello → last 25 broadcasts
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("hub_broadcasts")
       .select("id, wallet, message, created_at")
       .order("created_at", { ascending: false })
       .limit(25);
-    socket.send(
-      JSON.stringify({ type: "hello", rows: (data || []).map(normRow) })
-    );
+    if (!error && data) {
+      const rows = (data || []).map(normRow);
+      socket.send(JSON.stringify({ type: "hello", rows }));
+    }
   } catch (e) {
-    err("WS hello failed:", e);
+    err("WS hello failed:", e?.message || e);
   }
 });
 
 setInterval(() => {
   for (const s of clients) {
-    if (!s.isAlive) {
+    if (s.isAlive === false) {
       try {
         s.terminate();
       } catch {}
@@ -787,38 +770,19 @@ function wsBroadcastAll(obj) {
   }
 }
 
-// Private: only to sockets identified with this wallet
-function wsBroadcastToWallet(wallet, obj) {
-  if (!wallet) return;
-  const set = walletIndex.get(wallet);
-  if (!set || set.size === 0) return;
-  const msg = JSON.stringify(obj);
-  for (const s of set) {
-    if (s.readyState === s.OPEN) s.send(msg);
-  }
-}
-
-/* ---------- Supabase Realtime: hub_broadcasts + hub_refund_history ---------- */
-// This mirrors your old working pattern, just extended to refunds.
+/* ---------- Supabase Realtime: broadcasts only (matches your old working code) ---------- */
 let rtChannel = null;
-
-function subscribeToRealtime() {
+function subscribeToBroadcasts() {
   try {
     if (rtChannel) {
-      try {
-        supabase.removeChannel(rtChannel);
-      } catch {}
+      try { supabase.removeChannel(rtChannel); } catch {}
       rtChannel = null;
     }
 
-    log("Subscribing to Supabase realtime…");
-
     rtChannel = supabase
-      .channel("rt:hub_broadcasts+refunds", {
+      .channel("rt:hub_broadcasts", {
         config: { broadcast: { ack: true }, presence: { key: "server" } },
       })
-
-      // hub_broadcasts → public to all
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "hub_broadcasts" },
@@ -847,70 +811,30 @@ function subscribeToRealtime() {
           if (id) wsBroadcastAll({ type: "delete", id });
         }
       )
-
-      // hub_refund_history → PRIVATE per wallet
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "hub_refund_history" },
-        (payload) => {
-          const r = normRefundRow(payload?.new || payload?.record);
-          if (r?.wallet) {
-            log("💰 INSERT hub_refund_history id=", r.id, "→", r.wallet);
-            wsBroadcastToWallet(r.wallet, { type: "refund_insert", row: r });
-          }
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "hub_refund_history" },
-        (payload) => {
-          const r = normRefundRow(payload?.new || payload?.record);
-          if (r?.wallet) {
-            log("♻️  UPDATE hub_refund_history id=", r.id, "→", r.wallet);
-            wsBroadcastToWallet(r.wallet, { type: "refund_update", row: r });
-          }
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "DELETE", schema: "public", table: "hub_refund_history" },
-        (payload) => {
-          const old = payload?.old || payload?.record || null;
-          const id = old?.id;
-          const wallet = old?.wallet;
-          log("❌ DELETE hub_refund_history id=", id, "→", wallet || "—");
-          if (id && wallet) {
-            wsBroadcastToWallet(wallet, { type: "refund_delete", id });
-          }
-        }
-      )
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
-          log("✅ Realtime subscribed: hub_broadcasts + hub_refund_history");
+          log("✅ Realtime subscribed: hub_broadcasts");
         } else if (status === "CHANNEL_ERROR") {
           err("❌ Realtime CHANNEL_ERROR — retrying in 2s");
-          setTimeout(subscribeToRealtime, 2000);
+          setTimeout(subscribeToBroadcasts, 2000);
         } else if (status === "TIMED_OUT") {
           warn("⚠️ Realtime TIMED_OUT — retrying in 2s");
-          setTimeout(subscribeToRealtime, 2000);
+          setTimeout(subscribeToBroadcasts, 2000);
         } else if (status === "CLOSED") {
           warn("⚠️ Realtime CLOSED — retrying in 2s");
-          setTimeout(subscribeToRealtime, 2000);
-        } else {
-          warn("Realtime status:", status);
+          setTimeout(subscribeToBroadcasts, 2000);
         }
       });
   } catch (e) {
     err("Realtime subscribe failed:", e?.message || e);
-    setTimeout(subscribeToRealtime, 2000);
+    setTimeout(subscribeToBroadcasts, 2000);
   }
 }
-
-subscribeToRealtime();
+subscribeToBroadcasts();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
   log(`BLACKCOIN OPERATOR HUB BACKEND v11.1 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
-  log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
+  log(`Frontend:  http://localhost:${PORT}/OperatorHub.html`);
 });
