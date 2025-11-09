@@ -15,7 +15,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import http from "http";
 
 dotenv.config();
@@ -42,7 +42,13 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
   process.exit(1);
 }
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  global: {
+    fetch,      // from "node-fetch"
+    WebSocket,  // from "ws" (the default import above)
+  },
+});
+
 
 /* ---------- Health ---------- */
 app.get("/healthz", (_req, res) =>
@@ -744,11 +750,20 @@ function wsBroadcastToWallet(wallet, obj) {
 let rtChannel = null;
 function subscribe() {
   try {
-    if (rtChannel) supabase.removeChannel(rtChannel);
-    rtChannel = supabase
-      .channel("rt:hub_broadcasts+refunds")
+    if (rtChannel) {
+      try { supabase.removeChannel(rtChannel); } catch {}
+      rtChannel = null;
+    }
 
-      // hub_broadcasts → public to all
+    rtChannel = supabase
+      .channel("rt:hub_broadcasts+refunds", {
+        config: {
+          broadcast: { ack: true },
+          presence: { key: "server" },
+        },
+      })
+
+      // hub_broadcasts → public to all (same as before)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
@@ -792,8 +807,9 @@ function subscribe() {
       })
 
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") log("Realtime: LIVE");
-        else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+        if (status === "SUBSCRIBED") {
+          log("Realtime: LIVE");
+        } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
           warn(`Realtime ${status} — reconnecting...`);
           setTimeout(subscribe, 2000);
         }
@@ -803,6 +819,7 @@ function subscribe() {
     setTimeout(subscribe, 2000);
   }
 }
+
 subscribe();
 
 /* ---------- Start ---------- */
