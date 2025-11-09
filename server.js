@@ -1,18 +1,12 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.0 — FINAL NUCLEAR EDITION
-/* What’s new vs v10.0:
- * - Refund History:
- *    • POST /api/refund-log    → insert (hub_refund_history)
- *    • GET  /api/refund-history?wallet=... → list latest for a wallet
- *    • Realtime: Supabase INSERT/UPDATE/DELETE on hub_refund_history are
- *      forwarded via WebSocket **only to the identified wallet’s session** (privacy)
- *    • Each row includes a prebuilt `solscan_url` (clickable in UI)
- * - WebSocket identify:
- *    • Frontend may send {type:"identify", wallet:"<pubkey>"} after connect.
- *      We route refund updates to that wallet only.
- * - Optional: /api/rpc proxy for Helius (POST) to avoid CORS issues from frontend.
- *   (No impact if you don’t call it.)
- *
- * All existing endpoints and logic remain unchanged.
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.1 — PATCHED
+/* What’s new vs v11.0:
+ * - Profile endpoint is now PATCH-style:
+ *    • POST /api/profile only overwrites fields that are actually sent.
+ *      - If you send only { wallet, avatar_url }, handle is preserved.
+ *      - If you send only { wallet, handle }, avatar_url is preserved.
+ * - Added GET /api/rpc:
+ *    • GET  /api/rpc → { rpc: <heliusRpcUrl> } for frontend auto-detect.
+ * - All other endpoints and logic remain unchanged.
  */
 
 import express from "express";
@@ -217,21 +211,37 @@ app.get("/api/latest", async (_req, res) => {
   }
 });
 
-/* ---------- Profile + Avatar ---------- */
+/* ---------- Profile + Avatar (PATCH-style upsert) ---------- */
 app.post("/api/profile", async (req, res) => {
   try {
-    let { wallet, handle, avatar_url } = req.body;
+    const wallet = (req.body.wallet || "").trim();
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-    handle = (handle || "@Operator").trim();
+
+    const payload = {
+      wallet,
+      updated_at: new Date().toISOString(),
+    };
+
+    // Only update handle if client explicitly sent it
+    if (Object.prototype.hasOwnProperty.call(req.body, "handle")) {
+      let handle = (req.body.handle || "@Operator").trim();
+      if (!handle) handle = "@Operator";
+      if (!handle.startsWith("@")) handle = "@" + handle.replace(/^@+/, "");
+      payload.handle = handle;
+    }
+
+    // Only update avatar_url if client explicitly sent it
+    if (Object.prototype.hasOwnProperty.call(req.body, "avatar_url")) {
+      payload.avatar_url = req.body.avatar_url || null;
+    }
+
     const { data, error } = await supabase
       .from("hub_profiles")
-      .upsert(
-        { wallet, handle, avatar_url: avatar_url || null, updated_at: new Date().toISOString() },
-        { onConflict: "wallet" }
-      )
+      .upsert(payload, { onConflict: "wallet" })
       .select();
+
     if (error) throw error;
-    res.json({ success: true, profile: data[0] });
+    res.json({ success: true, profile: data?.[0] || null });
   } catch (e) {
     err("Profile save error:", e);
     res.status(500).json({ error: e.message });
@@ -481,7 +491,7 @@ app.post("/api/balances", async (req, res) => {
   }
 });
 
-/* ---------- Broadcasts (unchanged) ---------- */
+/* ---------- Broadcasts ---------- */
 const hhmm = (iso) => { try { return new Date(iso).toTimeString().slice(0, 5); } catch { return ""; } };
 
 function normRow(r) {
@@ -608,7 +618,15 @@ app.get("/api/refund-history", async (req, res) => {
 });
 
 /* ---------- Optional RPC Proxy (Helius) ---------- */
-// Useful if frontend hits /api/rpc to avoid CORS; harmless if unused.
+// Simple discovery for frontend auto-detect
+app.get("/api/rpc", (_req, res) => {
+  if (!HELIUS_KEY) {
+    return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+  }
+  return res.json({ rpc: HELIUS_RPC });
+});
+
+// Useful if frontend hits /api/rpc (POST) to proxy arbitrary methods; harmless if unused.
 app.post("/api/rpc", async (req, res) => {
   try {
     const { method, params } = req.body || {};
@@ -680,7 +698,7 @@ wss.on("connection", async (socket) => {
     clients.delete(socket);
   });
 
-  // Initial hello with last broadcasts (unchanged)
+  // Initial hello with last broadcasts
   try {
     const { data } = await supabase
       .from("hub_broadcasts")
@@ -730,7 +748,7 @@ function subscribe() {
     rtChannel = supabase
       .channel("rt:hub_broadcasts+refunds")
 
-      // hub_broadcasts → public to all (same as before)
+      // hub_broadcasts → public to all
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
@@ -789,7 +807,7 @@ subscribe();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v11.0 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.1 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
 });
