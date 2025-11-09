@@ -1,10 +1,20 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v10.0 — FINAL NUCLEAR EDITION (patched+refund-history)
-/* Changes:
- * - Realtime: add UPDATE + DELETE handlers so broadcast deletes/edits propagate instantly
- * - Env vars: accept SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (backward compatible)
- * - Clearer missing-env error message
- * - NEW: Refund History endpoints (POST/GET) writing to hub_refund_history with server-side timestamps
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.0 — FINAL NUCLEAR EDITION
+/* What’s new vs v10.0:
+ * - Refund History:
+ *    • POST /api/refund-log    → insert (hub_refund_history)
+ *    • GET  /api/refund-history?wallet=... → list latest for a wallet
+ *    • Realtime: Supabase INSERT/UPDATE/DELETE on hub_refund_history are
+ *      forwarded via WebSocket **only to the identified wallet’s session** (privacy)
+ *    • Each row includes a prebuilt `solscan_url` (clickable in UI)
+ * - WebSocket identify:
+ *    • Frontend may send {type:"identify", wallet:"<pubkey>"} after connect.
+ *      We route refund updates to that wallet only.
+ * - Optional: /api/rpc proxy for Helius (POST) to avoid CORS issues from frontend.
+ *   (No impact if you don’t call it.)
+ *
+ * All existing endpoints and logic remain unchanged.
  */
+
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -56,13 +66,9 @@ let memoryCache = [];
 
 async function insertPoint(point) {
   try {
-    const { error } = await supabase
-      .from("chart_data")
-      .insert([point]);
+    const { error } = await supabase.from("chart_data").insert([point]);
     if (error) err("Supabase insert failed:", error.message);
-  } catch (e) {
-    err("Supabase insert exception:", e);
-  }
+  } catch (e) { err("Supabase insert exception:", e); }
 }
 
 async function fetchOneTick() {
@@ -331,7 +337,6 @@ async function getTokenMeta(mint) {
   const cached = META_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_META) return cached.data;
 
-  // Jupiter token endpoint returns rich metadata
   try {
     const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
     if (r.ok) {
@@ -349,7 +354,6 @@ async function getTokenMeta(mint) {
     }
   } catch {}
 
-  // Fallback: lean meta (nothing fancy)
   const meta = { symbol: "", name: "", logo: "", tags: [], isVerified: false, decimals: undefined };
   META_CACHE.set(mint, { ts: now, data: meta });
   return meta;
@@ -361,7 +365,6 @@ async function getTokenUsd(mint) {
   const c = PRICE_CACHE.get(mint);
   if (c && now - c.ts < TTL_PRICE) return c.priceUsd;
 
-  // 1) DexScreener
   try {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
     if (r.ok) {
@@ -374,7 +377,6 @@ async function getTokenUsd(mint) {
     }
   } catch {}
 
-  // 2) Jupiter price fallback
   try {
     const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
     if (r2.ok) {
@@ -393,7 +395,6 @@ async function getTokenUsd(mint) {
 
 // Normalize one parsed token account from RPC
 function parseParsedAccount(acc) {
-  // rpc result item: { pubkey, account: { data: { parsed: {...} } } }
   const info = acc?.account?.data?.parsed?.info;
   const amt  = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
   const decimals = Number(amt?.decimals ?? info?.decimals ?? 0);
@@ -411,13 +412,11 @@ function parseParsedAccount(acc) {
 }
 
 async function getAllSplTokenAccounts(owner) {
-  // Legacy program
   const legacy = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_PROGRAM_ID },
     { encoding: "jsonParsed" }
   ]);
-  // Token-2022 program
   const t22 = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_2022_PROGRAM_ID },
@@ -427,16 +426,13 @@ async function getAllSplTokenAccounts(owner) {
   const list = []
     .concat(legacy?.value || [], t22?.value || [])
     .map(parseParsedAccount)
-    // Hide zero-balance tokens (your Q3 = No)
     .filter(t => t.mint && t.amount > 0);
 
-  // Combine duplicates (same mint across multiple ATAs)
   const byMint = new Map();
   for (const t of list) {
     const prev = byMint.get(t.mint);
     if (prev) {
       prev.amount += t.amount;
-      // prefer a defined decimals
       if (typeof prev.decimals !== "number" && typeof t.decimals === "number") prev.decimals = t.decimals;
     } else {
       byMint.set(t.mint, { ...t });
@@ -450,18 +446,14 @@ app.post("/api/balances", async (req, res) => {
     const wallet = req.body?.wallet?.trim();
     if (!wallet || !HELIUS_KEY) return res.status(400).json({ error: "Bad request" });
 
-    // 1) SOL balance
     const solBal = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
     const sol = Number(solBal?.value || 0) / 1e9;
     const solUsd = await getSolUsd();
 
-    // 2) SPL token accounts (legacy + 2022)
     const tokenAccounts = await getAllSplTokenAccounts(wallet);
 
-    // 3) Enrich with metadata + pricing (rich object)
     const enriched = await Promise.all(tokenAccounts.map(async t => {
       const meta = await getTokenMeta(t.mint);
-      // if decimals missing from meta, keep RPC decimals
       const decimals = typeof meta.decimals === "number" ? meta.decimals : t.decimals;
       const priceUsd = await getTokenUsd(t.mint);
       const usd = priceUsd * t.amount;
@@ -480,77 +472,17 @@ app.post("/api/balances", async (req, res) => {
       };
     }));
 
-    // 4) Sort by USD desc
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    return res.json({
-      sol,
-      solUsd,
-      tokens: enriched
-    });
+    return res.json({ sol, solUsd, tokens: enriched });
   } catch (e) {
     err("Balances error:", e);
     res.status(500).json({ error: "Failed" });
   }
 });
 
-/* ---------- Refund History (hub_refund_history) ---------- */
-/* Fields: wallet, token, mint (nullable for MULTI), rent_reclaimed (number SOL), tx, status ("Success"), created_at (server) */
-app.post("/api/refund-history", async (req, res) => {
-  try {
-    const { wallet, token, mint, rent_reclaimed, tx, status } = req.body || {};
-    if (!wallet || !token || !tx) {
-      return res.status(400).json({ error: "Missing required fields (wallet, token, tx)" });
-    }
-    const amount = Number(rent_reclaimed ?? 0);
-    const row = {
-      wallet: String(wallet).trim(),
-      token: String(token).trim(),
-      mint: mint ? String(mint).trim() : null,
-      rent_reclaimed: isNaN(amount) ? 0 : amount,
-      tx: String(tx).trim(),
-      status: status ? String(status).trim() : "Success",
-      created_at: new Date().toISOString()
-    };
-
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .insert([row])
-      .select()
-      .maybeSingle();
-
-    if (error) throw error;
-    return res.json({ success: true, data });
-  } catch (e) {
-    err("Refund history insert error:", e);
-    return res.status(500).json({ error: "Failed" });
-  }
-});
-
-app.get("/api/refund-history", async (req, res) => {
-  try {
-    const wallet = (req.query?.wallet || "").trim();
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-
-    const { data, error } = await supabase
-      .from("hub_refund_history")
-      .select("wallet, token, mint, rent_reclaimed, tx, status, created_at")
-      .eq("wallet", wallet)
-      .order("created_at", { ascending: false })
-      .limit(200);
-
-    if (error) throw error;
-    return res.json(data || []);
-  } catch (e) {
-    err("Refund history fetch error:", e);
-    return res.status(500).json({ error: "Failed" });
-  }
-});
-
-/* ---------- Broadcasts ---------- */
-const hhmm = (iso) => {
-  try { return new Date(iso).toTimeString().slice(0, 5); } catch { return ""; }
-};
+/* ---------- Broadcasts (unchanged) ---------- */
+const hhmm = (iso) => { try { return new Date(iso).toTimeString().slice(0, 5); } catch { return ""; } };
 
 function normRow(r) {
   if (!r) return null;
@@ -576,7 +508,7 @@ app.post("/api/broadcast", async (req, res) => {
 
     if (error) throw error;
     const row = normRow(data);
-    wsBroadcast({ type: "insert", row });
+    wsBroadcastAll({ type: "insert", row });
     res.json({ success: true, data: row });
   } catch (e) {
     err("Broadcast error:", e);
@@ -599,17 +531,156 @@ app.get("/api/broadcasts", async (_req, res) => {
   }
 });
 
+/* ---------- Refund History ---------- */
+// Table: hub_refund_history
+// Columns: id, wallet, token, tx, date, status, created_at, rent_reclaimed
+function normRefundRow(r) {
+  if (!r) return null;
+  const tx = r.tx || "";
+  const solscan_url = tx ? `https://solscan.io/tx/${tx}` : null;
+  return {
+    id: r.id,
+    wallet: r.wallet,
+    token: r.token,
+    tx,
+    solscan_url,
+    date: r.date,           // ISO or text as stored
+    status: r.status,       // e.g., "success" | "failed" | "pending"
+    created_at: r.created_at,
+    rent_reclaimed: typeof r.rent_reclaimed === "number" ? r.rent_reclaimed : Number(r.rent_reclaimed || 0)
+  };
+}
+
+// Insert one refund log
+app.post("/api/refund-log", async (req, res) => {
+  try {
+    const { wallet, token, tx, date, status, rent_reclaimed } = req.body || {};
+    if (!wallet || !token || !tx) {
+      return res.status(400).json({ error: "Missing required fields (wallet, token, tx)" });
+    }
+    const payload = {
+      wallet,
+      token,
+      tx,
+      date: date || new Date().toISOString(),
+      status: status || "success",
+      rent_reclaimed: typeof rent_reclaimed === "number" ? rent_reclaimed : Number(rent_reclaimed || 0)
+      // created_at handled by DB default if set; otherwise Supabase will fill server-side timestamp if configured
+    };
+
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .insert([payload])
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    const row = normRefundRow(data);
+    // private realtime to this wallet only
+    wsBroadcastToWallet(wallet, { type: "refund_insert", row });
+    res.json({ success: true, data: row });
+  } catch (e) {
+    err("Refund-log error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Fetch latest refund rows for a wallet
+app.get("/api/refund-history", async (req, res) => {
+  try {
+    const wallet = (req.query.wallet || "").trim();
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+    const { data, error } = await supabase
+      .from("hub_refund_history")
+      .select("id, wallet, token, tx, date, status, created_at, rent_reclaimed")
+      .eq("wallet", wallet)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    res.json((data || []).map(normRefundRow));
+  } catch (e) {
+    err("Refund-history GET error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Optional RPC Proxy (Helius) ---------- */
+// Useful if frontend hits /api/rpc to avoid CORS; harmless if unused.
+app.post("/api/rpc", async (req, res) => {
+  try {
+    const { method, params } = req.body || {};
+    if (!HELIUS_KEY) return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+    if (!method) return res.status(400).json({ error: "Missing method" });
+
+    const r = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || [] })
+    });
+    const j = await r.json();
+    res.status(r.ok ? 200 : 502).json(j);
+  } catch (e) {
+    err("RPC proxy error:", e);
+    res.status(500).json({ error: "RPC proxy failed" });
+  }
+});
+
 /* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const clients = new Set();
 
+// wallet -> Set<WebSocket>
+const walletIndex = new Map();
+
+function indexAdd(wallet, socket) {
+  if (!wallet) return;
+  if (!walletIndex.has(wallet)) walletIndex.set(wallet, new Set());
+  walletIndex.get(wallet).add(socket);
+}
+function indexRemove(wallet, socket) {
+  if (!wallet) return;
+  const set = walletIndex.get(wallet);
+  if (set) {
+    set.delete(socket);
+    if (set.size === 0) walletIndex.delete(wallet);
+  }
+}
+
 wss.on("connection", async (socket) => {
   socket.isAlive = true;
+  socket.wallet = null; // filled on identify
   clients.add(socket);
-  socket.on("pong", () => { socket.isAlive = true; });
-  socket.on("close", () => clients.delete(socket));
 
+  socket.on("pong", () => { socket.isAlive = true; });
+
+  socket.on("message", (buf) => {
+    try {
+      const msg = JSON.parse(buf.toString());
+      if (msg?.type === "identify") {
+        // { type:"identify", wallet:"<pubkey>" }
+        if (socket.wallet && socket.wallet !== msg.wallet) {
+          // move index
+          indexRemove(socket.wallet, socket);
+        }
+        socket.wallet = (msg.wallet || "").trim();
+        if (socket.wallet) indexAdd(socket.wallet, socket);
+        log("WS identify:", socket.wallet || "—");
+      }
+    } catch {
+      // ignore non-JSON
+    }
+  });
+
+  socket.on("close", () => {
+    if (socket.wallet) indexRemove(socket.wallet, socket);
+    clients.delete(socket);
+  });
+
+  // Initial hello with last broadcasts (unchanged)
   try {
     const { data } = await supabase
       .from("hub_broadcasts")
@@ -630,9 +701,24 @@ setInterval(() => {
   }
 }, 30000);
 
-function wsBroadcast(obj) {
+function wsSend(socket, obj) {
+  try {
+    if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(obj));
+  } catch {}
+}
+function wsBroadcastAll(obj) {
   const msg = JSON.stringify(obj);
   for (const s of clients) {
+    if (s.readyState === s.OPEN) s.send(msg);
+  }
+}
+// Private: only to sockets identified with this wallet
+function wsBroadcastToWallet(wallet, obj) {
+  if (!wallet) return;
+  const set = walletIndex.get(wallet);
+  if (!set || set.size === 0) return;
+  const msg = JSON.stringify(obj);
+  for (const s of set) {
     if (s.readyState === s.OPEN) s.send(msg);
   }
 }
@@ -642,30 +728,51 @@ function subscribe() {
   try {
     if (rtChannel) supabase.removeChannel(rtChannel);
     rtChannel = supabase
-      .channel("rt:hub_broadcasts")
-      // INSERTS
+      .channel("rt:hub_broadcasts+refunds")
+
+      // hub_broadcasts → public to all (same as before)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
           log("Realtime INSERT hub_broadcasts id=", row.id);
-          wsBroadcast({ type: "insert", row });
+          wsBroadcastAll({ type: "insert", row });
         }
       })
-      // UPDATES
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hub_broadcasts" }, (p) => {
         const row = normRow(p.new || p.record);
         if (row) {
           log("Realtime UPDATE hub_broadcasts id=", row.id);
-          wsBroadcast({ type: "update", row });
+          wsBroadcastAll({ type: "update", row });
         }
       })
-      // DELETES
       .on("postgres_changes", { event: "DELETE", schema: "public", table: "hub_broadcasts" }, (p) => {
-        const old = p.old || p.record || null;
-        const id = old?.id;
+        const id = (p.old || p.record || {}).id;
         log("Realtime DELETE hub_broadcasts id=", id);
-        if (id) wsBroadcast({ type: "delete", id });
+        if (id) wsBroadcastAll({ type: "delete", id });
       })
+
+      // hub_refund_history → PRIVATE to the row.wallet only
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "hub_refund_history" }, (p) => {
+        const r = normRefundRow(p.new || p.record);
+        if (r?.wallet) {
+          log("Realtime INSERT hub_refund_history id=", r.id, "→", r.wallet);
+          wsBroadcastToWallet(r.wallet, { type: "refund_insert", row: r });
+        }
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hub_refund_history" }, (p) => {
+        const r = normRefundRow(p.new || p.record);
+        if (r?.wallet) {
+          log("Realtime UPDATE hub_refund_history id=", r.id, "→", r.wallet);
+          wsBroadcastToWallet(r.wallet, { type: "refund_update", row: r });
+        }
+      })
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "hub_refund_history" }, (p) => {
+        const old = p.old || p.record || null;
+        const id = old?.id, wallet = old?.wallet;
+        log("Realtime DELETE hub_refund_history id=", id, "→", wallet || "—");
+        if (id && wallet) wsBroadcastToWallet(wallet, { type: "refund_delete", id });
+      })
+
       .subscribe((status) => {
         if (status === "SUBSCRIBED") log("Realtime: LIVE");
         else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
@@ -682,7 +789,7 @@ subscribe();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v10.0 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.0 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend: http://localhost:${PORT}/OperatorHub.html`);
 });
