@@ -905,7 +905,7 @@ app.get("/api/broadcasts", async (_req, res) => {
 function normRefundRow(r) {
   if (!r) return null;
   const tx = r.tx || "";
-  the solscan_url = tx ? `https://solscan.io/tx/${tx}` : null;
+  const solscan_url = tx ? `https://solscan.io/tx/${tx}` : null;
   return {
     id: r.id,
     wallet: r.wallet,
