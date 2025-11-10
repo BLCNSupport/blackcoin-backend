@@ -1,10 +1,8 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.3 — Jupiter V2 tokens + Solscan meta + nocache on token-meta
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.3 — Jupiter v3 price + Jupiter v2 tokens + Solscan meta
 /* Key points:
- * - Adds Jupiter Tokens API v2:
- *      • GET /api/jup/tokens/search?query=... (backend proxy + 15m cache)
- *      • fetchJupiterV2ByMint(mint) for meta resolution
- * - Keeps Solscan as a metadata source (price, market cap, holders, name/symbol/logo when available).
- * - Uses env SOLSCAN_KEY (Render: add "SOLSCAN_KEY" in Environment tab).
+ * - Prices: PRIMARY = Jupiter Price API v3 (Lite) at https://lite-api.jup.ag/price/v3
+ *            Fallback = Dexscreener search
+ * - Token meta: Jupiter Tokens API v2 search preferred, then Solscan/Helius/Pump/Dexscreener merge.
  * - /api/token-meta supports ?nocache=true to bypass memo + stale DB cache for that call.
  * - Keeps all v11.2 features (chart poller, profiles, avatar upload, balances, refund log/history, /api/rpc, WS).
  */
@@ -230,7 +228,6 @@ app.get("/api/latest", async (_req, res) => {
 });
 
 /* ---------- Profile + Avatar ---------- */
-// NEW: GET /api/profile to fix 404s from frontend
 app.get("/api/profile", async (req, res) => {
   try {
     const wallet = String(req.query.wallet || "").trim();
@@ -246,7 +243,6 @@ app.get("/api/profile", async (req, res) => {
       warn("[/api/profile] select error:", error.message);
       return res.status(500).json({ error: "db error" });
     }
-    // Return {} when not found (frontend expects 200)
     return res.status(200).json(data || {});
   } catch (e) {
     err("[/api/profile] fatal:", e?.message || e);
@@ -355,7 +351,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
   }
 });
 
-/* ---------- Balances (Helius RPC + DexScreener + Jupiter) ---------- */
+/* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances will 400 if called.");
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
@@ -584,7 +580,7 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
     updated_at: new Date().toISOString()
   };
 
-  // upsert cache unless nocache requested (still memo so subsequent calls in-flight reuse)
+  // upsert cache unless nocache requested
   try {
     await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
   } catch (e) {
@@ -692,7 +688,7 @@ async function getTokenMeta(mint) {
   }
 }
 
-/* ---------- Price (Dexscreener primary, Jupiter fallback) + WS tick ---------- */
+/* ---------- Price (Jupiter v3 primary, Dexscreener fallback) + WS tick ---------- */
 async function getTokenUsd(mint, { nocache = false } = {}) {
   const now = Date.now();
   if (!nocache) {
@@ -709,29 +705,30 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
     return val;
   };
 
+  // 1) Jupiter Price API v3 (Lite)
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`, {
-      headers: { "Cache-Control": "no-cache" }
-    });
+    const url = `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(mint)}`;
+    const r = await fetch(url, { headers: { accept: "application/json", "Cache-Control":"no-cache" } });
     if (r.ok) {
       const j = await r.json();
-      const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
-      const best =
-        pairs.find(p => p?.chainId === "solana" && p?.baseToken?.address === mint) ||
-        pairs.find(p => p?.baseToken?.address === mint) ||
-        pairs[0];
-      const p = Number(best?.priceUsd) || 0;
+      const p = Number(j?.data?.[mint]?.price) || 0;
       if (p > 0) return setAndMaybeBroadcast(p);
     }
   } catch {}
 
+  // 2) Fallback: Dexscreener search
   try {
-    const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`, {
+    const r2 = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`, {
       headers: { "Cache-Control": "no-cache" }
     });
     if (r2.ok) {
       const j2 = await r2.json();
-      const p2 = Number(j2?.data?.[mint]?.price) || 0;
+      const pairs = Array.isArray(j2?.pairs) ? j2.pairs : [];
+      const best =
+        pairs.find(p => p?.chainId === "solana" && p?.baseToken?.address === mint) ||
+        pairs.find(p => p?.baseToken?.address === mint) ||
+        pairs[0];
+      const p2 = Number(best?.priceUsd) || 0;
       if (p2 > 0) return setAndMaybeBroadcast(p2);
     }
   } catch {}
@@ -804,7 +801,6 @@ app.post("/api/balances", async (req, res) => {
     // Optional: bypass caches when client asks for fresh pull
     if (nocache) {
       SOL_CACHE.ts = 0;
-      // Don't globally clear PRICE_CACHE; clear lazily when we fetch each mint below
     }
 
     const solBal = await rpc("getBalance", [wallet, { commitment }]);
@@ -909,7 +905,7 @@ app.get("/api/broadcasts", async (_req, res) => {
 function normRefundRow(r) {
   if (!r) return null;
   const tx = r.tx || "";
-  const solscan_url = tx ? `https://solscan.io/tx/${tx}` : null;
+  the solscan_url = tx ? `https://solscan.io/tx/${tx}` : null;
   return {
     id: r.id,
     wallet: r.wallet,
