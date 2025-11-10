@@ -23,7 +23,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(express.static("public")); // serves OperatorHub.html / index.html etc.
+app.use(express.static("public")); // serves OperatorHub.html / index.html / Terminal Hub, etc.
 
 /* ---------- tiny log helpers ---------- */
 function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
@@ -358,7 +358,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
 
 /* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
-if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances will 400 if called.");
+if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances and /api/wallets will 400 if called.");
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -826,6 +826,59 @@ app.get("/api/wallets", async (_req, res) => {
   } catch (e) {
     err("/api/wallets error:", e);
     res.status(500).json({ error: "Failed to fetch wallet snapshots" });
+  }
+});
+
+/* ---------- Home dashboard summary (for Terminal Hub hero card) ---------- */
+/* Returns:
+ * {
+ *   mint,
+ *   priceUsd,
+ *   marketCapUsd,
+ *   holders,
+ *   supply,
+ *   changePct24h,
+ *   volume24h
+ * }
+ */
+app.get("/api/home", async (_req, res) => {
+  try {
+    const [meta, latest] = await Promise.all([
+      resolveTokenMetaCombined(TOKEN_MINT, { nocache: false }),
+      (async () => {
+        let l = memoryCache.at(-1);
+        if (!l) {
+          const { data } = await supabase
+            .from("chart_data")
+            .select("timestamp, price, change, volume")
+            .order("timestamp", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          l = data;
+        }
+        return l || null;
+      })()
+    ]);
+
+    const priceUsd = Number(meta?.price_usd || latest?.price || 0);
+    const marketCapUsd = Number(meta?.market_cap_usd || 0);
+    const holders = meta?.holders != null ? Number(meta.holders) : 0;
+    const supply = meta?.supply != null ? Number(meta.supply) : 0;
+    const changePct24h = latest?.change != null ? Number(latest.change) : 0;
+    const volume24h = latest?.volume != null ? Number(latest.volume) : 0;
+
+    res.json({
+      mint: TOKEN_MINT,
+      priceUsd,
+      marketCapUsd,
+      holders,
+      supply,
+      changePct24h,
+      volume24h
+    });
+  } catch (e) {
+    err("/api/home error:", e);
+    res.status(500).json({ error: "Failed to build home summary" });
   }
 });
 
