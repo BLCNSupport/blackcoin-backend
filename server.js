@@ -35,7 +35,6 @@ const err  = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-// Accept both names so it works with your existing Render env
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
@@ -52,9 +51,7 @@ app.get("/healthz", (_req, res) =>
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
-let isBackoff = false,
-  fetchInProgress = false,
-  pollTimer = null;
+let isBackoff = false, fetchInProgress = false, pollTimer = null;
 let memoryCache = [];
 
 async function insertPoint(point) {
@@ -85,7 +82,7 @@ async function fetchOneTick() {
     }
 
     const json = await res.json();
-    const pair = json.pairs?.[0];
+    const pair = json?.pairs?.[0];
     if (!pair) {
       warn("⚠️  No pairs in response");
       return "softfail";
@@ -98,7 +95,7 @@ async function fetchOneTick() {
       volume: +(pair.volume?.h24),
     };
 
-    if (Object.values(point).some((v) => isNaN(v))) {
+    if (Object.values(point).some((v) => Number.isNaN(v))) {
       warn("⚠️  Invalid numeric fields — skipping insert");
       return "softfail";
     }
@@ -172,7 +169,7 @@ function bucketize(rows, interval) {
     const b = m.get(key);
     b.price = price;
     b.change = change;
-    b.volume += isNaN(vol) ? 0 : vol;
+    b.volume += Number.isNaN(vol) ? 0 : vol;
   }
   return Array.from(m.values()).sort(
     (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
@@ -235,33 +232,25 @@ app.get("/api/latest", async (_req, res) => {
 /* ---------- Profile + Avatar ---------- */
 app.post("/api/profile", async (req, res) => {
   try {
-    // Required
     const wallet = String(req.body.wallet || "").trim();
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
-    // Optional fields — treat empty strings and null/undefined as "not provided"
     let handle = req.body.handle;
     if (typeof handle === "string") {
       handle = handle.trim();
       if (handle === "") handle = undefined;
-    } else if (handle == null) {
-      handle = undefined;
-    }
+    } else if (handle == null) handle = undefined;
 
     let avatar_url = req.body.avatar_url;
     if (typeof avatar_url === "string") {
       avatar_url = avatar_url.trim();
       if (avatar_url === "") avatar_url = undefined;
-    } else if (avatar_url == null) {
-      avatar_url = undefined;
-    }
+    } else if (avatar_url == null) avatar_url = undefined;
 
-    // If neither field provided, nothing to do
     if (handle === undefined && avatar_url === undefined) {
       return res.status(400).json({ error: "no fields to update" });
     }
 
-    // Fetch existing row (if any)
     const { data: existing, error: selErr } = await supabase
       .from("hub_profiles")
       .select("wallet, handle, avatar_url")
@@ -272,13 +261,11 @@ app.post("/api/profile", async (req, res) => {
       return res.status(500).json({ error: "select_failed", detail: selErr.message });
     }
 
-    // Build PATCH with only provided keys
     const patch = { updated_at: new Date().toISOString() };
     if (handle !== undefined) patch.handle = handle;
     if (avatar_url !== undefined) patch.avatar_url = avatar_url;
 
     if (existing) {
-      // Update only provided columns
       const { data, error } = await supabase
         .from("hub_profiles")
         .update(patch)
@@ -289,7 +276,6 @@ app.post("/api/profile", async (req, res) => {
       if (error) return res.status(500).json({ error: "update_failed", detail: error.message });
       return res.json({ success: true, profile: data });
     } else {
-      // Insert minimal new row with only provided columns
       const insertRow = { wallet, ...patch };
       const { data, error } = await supabase
         .from("hub_profiles")
@@ -327,7 +313,7 @@ app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
       .storage
       .from("hub_avatars")
       .getPublicUrl(fileName);
-    const url = urlData.publicUrl;
+    const url = urlData?.publicUrl || null;
 
     const { error: updErr } = await supabase
       .from("hub_profiles")
@@ -361,10 +347,9 @@ const TTL_PRICE   = 15_000;     // 15s prices
 const TTL_META    = 6 * 60 * 60 * 1000;
 const TTL_SOL     = 25_000;
 
-// ---------- Token meta cache (merged from Helius DAS + Jupiter + Dexscreener + Pump) ----------
+/* ---------- Token Meta Resolver (shared by API and balances) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 const MEMO_META = new Map();
-
 function memoGetMeta(mint){
   const e = MEMO_META.get(mint);
   if (!e) return null;
@@ -373,7 +358,6 @@ function memoGetMeta(mint){
 }
 function memoSetMeta(mint, v){ MEMO_META.set(mint, { v, t: Date.now() }); }
 
-// Helius DAS (via the same HELIUS_RPC): getAsset
 async function fetchHeliusDAS(mint){
   try{
     const r = await fetch(HELIUS_RPC, {
@@ -393,7 +377,6 @@ async function fetchHeliusDAS(mint){
     return { name, symbol, image, description: desc, decimals, supply };
   }catch{ return null; }
 }
-
 async function fetchJupiterMetaLoose(mint){
   try{
     const r = await fetch(`https://tokens.jup.ag/token/${mint}`, { cache:"no-store" });
@@ -407,15 +390,13 @@ async function fetchJupiterMetaLoose(mint){
     };
   }catch{ return null; }
 }
-
 async function fetchDexscreenerMeta(mint){
   try{
     const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
     const j = await r.json();
     const p = j?.pairs?.[0];
     if (!p) return null;
-    // Dexscreener sometimes exposes base token fields + liquidity/FDV
-    const holders = Number(p?.holders || 0); // often absent; keep as best-effort
+    const holders = Number(p?.holders || 0);
     return {
       price_usd: Number(p?.priceUsd) || 0,
       market_cap_usd: Number(p?.fdv || p?.marketCap || 0),
@@ -423,19 +404,14 @@ async function fetchDexscreenerMeta(mint){
     };
   }catch{ return null; }
 }
-
 async function fetchPumpFunMeta(mint){
   try{
     const r = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
     if (!r.ok) return null;
     const j = await r.json();
-    return {
-      description: j?.description || null,
-      image: j?.image_uri || null
-    };
+    return { description: j?.description || null, image: j?.image_uri || null };
   }catch{ return null; }
 }
-
 function mergeMetaParts(...parts){
   const out = {};
   for (const p of parts) {
@@ -447,72 +423,75 @@ function mergeMetaParts(...parts){
   return out;
 }
 
-// GET /api/token-meta?mint=...
+// shared implementation
+async function resolveTokenMetaCombined(mint){
+  // in-memory memo
+  const memo = memoGetMeta(mint);
+  if (memo) return memo;
+
+  // supabase cache (≤6h)
+  const { data: cached } = await supabase
+    .from("token_meta")
+    .select("*")
+    .eq("mint", mint)
+    .maybeSingle();
+
+  if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
+    memoSetMeta(mint, cached);
+    return cached;
+  }
+
+  // fan-out
+  const [hel, jup, dskr, pump] = await Promise.all([
+    fetchHeliusDAS(mint),
+    fetchJupiterMetaLoose(mint),
+    fetchDexscreenerMeta(mint),
+    fetchPumpFunMeta(mint)
+  ]);
+
+  let merged = mergeMetaParts(hel, jup, pump, dskr);
+
+  if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
+      merged.price_usd && merged.supply) {
+    merged.market_cap_usd = merged.price_usd * merged.supply;
+  }
+
+  const payload = {
+    mint,
+    name: merged.name || jup?.name || hel?.name || null,
+    symbol: merged.symbol || jup?.symbol || hel?.symbol || null,
+    decimals: typeof merged.decimals === "number" ? merged.decimals :
+              (typeof jup?.decimals === "number" ? jup.decimals :
+               (typeof hel?.decimals === "number" ? hel.decimals : 0)),
+    image: merged.image || jup?.image || hel?.image || null,
+    description: merged.description || pump?.description || null,
+    supply: Number(merged.supply || 0),
+    price_usd: Number(merged.price_usd || 0),
+    market_cap_usd: Number(merged.market_cap_usd || 0),
+    holders: typeof merged.holders === "number" ? merged.holders : null,
+    source: { helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump },
+    updated_at: new Date().toISOString()
+  };
+
+  // upsert cache
+  await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
+
+  memoSetMeta(mint, payload);
+  return payload;
+}
+
+/* ---------- /api/token-meta HTTP ---------- */
 app.get("/api/token-meta", async (req, res) => {
   try{
     const mint = String(req.query.mint || "").trim();
     if (!mint) return res.status(400).json({ error:"mint required" });
-
-    // in-memory cache
-    const memo = memoGetMeta(mint);
-    if (memo) return res.json(memo);
-
-    // supabase cache (≤6h)
-    const { data: cached } = await supabase
-      .from("token_meta")
-      .select("*")
-      .eq("mint", mint)
-      .maybeSingle();
-
-    if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
-      memoSetMeta(mint, cached);
-      return res.json(cached);
-    }
-
-    // fan-out to sources in parallel
-    const [hel, jup, dskr, pump] = await Promise.all([
-      fetchHeliusDAS(mint),
-      fetchJupiterMetaLoose(mint),
-      fetchDexscreenerMeta(mint),
-      fetchPumpFunMeta(mint)
-    ]);
-
-    let merged = mergeMetaParts(hel, jup, pump, dskr);
-
-    // compute market cap if missing and we have price + supply
-    if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
-        merged.price_usd && merged.supply) {
-      merged.market_cap_usd = merged.price_usd * merged.supply;
-    }
-
-    const payload = {
-      mint,
-      name: merged.name || jup?.name || hel?.name || null,
-      symbol: merged.symbol || jup?.symbol || hel?.symbol || null,
-      decimals: typeof merged.decimals === "number" ? merged.decimals :
-                (typeof jup?.decimals === "number" ? jup.decimals :
-                 (typeof hel?.decimals === "number" ? hel.decimals : 0)),
-      image: merged.image || jup?.image || hel?.image || null,
-      description: merged.description || pump?.description || null,
-      supply: Number(merged.supply || 0),
-      price_usd: Number(merged.price_usd || 0),
-      market_cap_usd: Number(merged.market_cap_usd || 0),
-      holders: typeof merged.holders === "number" ? merged.holders : null,
-      source: { helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump },
-      updated_at: new Date().toISOString()
-    };
-
-    // upsert cache
-    await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
-
-    memoSetMeta(mint, payload);
+    const payload = await resolveTokenMetaCombined(mint);
     res.json(payload);
   }catch(e){
     err("token-meta error:", e);
     res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
   }
 });
-
 
 // Generic RPC helper
 async function rpc(method, params) {
@@ -545,125 +524,85 @@ async function getSolUsd() {
   return SOL_CACHE.priceUsd ?? 0;
 }
 
-// Token metadata (symbol/name/logo/decimals) via Jupiter
+/* ---------- Server-side getTokenMeta uses local resolver (no HTTP) ---------- */
 async function getTokenMeta(mint) {
   const now = Date.now();
   const cached = META_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_META) return cached.data;
 
-  // 1) Try backend cache endpoint first (fast path)
-  try{
-    const r = await fetch(`${process.env.PUBLIC_URL || ""}/api/token-meta?mint=${encodeURIComponent(mint)}`);
-    if (r.ok){
-      const j = await r.json();
-      const meta = {
-        symbol: j?.symbol || "",
-        name: j?.name || "",
-        logo: j?.image || "",
-        decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
-        // keep your existing flags shape so the rest of code stays untouched
-        tags: [],
-        isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
-      };
-      META_CACHE.set(mint, { ts: now, data: meta });
-      return meta;
-    }
-  }catch{}
-
-  // 2) Fallback to your previous Jupiter-only lookup
+  // Use the same combined resolver as the HTTP route, but directly.
   try {
-    const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
-    if (r.ok) {
-      const j = await r.json();
-      const meta = {
-        symbol: j?.symbol || "",
-        name: j?.name || "",
-        logo: j?.logoURI || "",
-        tags: Array.isArray(j?.tags) ? j.tags : [],
-        isVerified: Boolean(
-          j?.extensions?.coingeckoId ||
-          j?.daily_volume ||
-          j?.liquidity ||
-          j?.verified
-        ),
-        decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
-      };
-      META_CACHE.set(mint, { ts: now, data: meta });
-      return meta;
-    }
-  } catch {}
-
-  const meta = {
-    symbol: "",
-    name: "",
-    logo: "",
-    tags: [],
-    isVerified: false,
-    decimals: undefined,
-  };
-  META_CACHE.set(mint, { ts: now, data: meta });
-  return meta;
+    const j = await resolveTokenMetaCombined(mint);
+    const meta = {
+      symbol: j?.symbol || "",
+      name: j?.name || "",
+      logo: j?.image || "",
+      decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
+      tags: [],
+      isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
+    };
+    META_CACHE.set(mint, { ts: now, data: meta });
+    return meta;
+  } catch {
+    // fallback to Jupiter-only (best-effort)
+    try {
+      const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
+      if (r.ok) {
+        const j = await r.json();
+        const meta = {
+          symbol: j?.symbol || "",
+          name: j?.name || "",
+          logo: j?.logoURI || "",
+          tags: Array.isArray(j?.tags) ? j.tags : [],
+          isVerified: Boolean(
+            j?.extensions?.coingeckoId ||
+            j?.daily_volume ||
+            j?.liquidity ||
+            j?.verified
+          ),
+          decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
+        };
+        META_CACHE.set(mint, { ts: now, data: meta });
+        return meta;
+      }
+    } catch {}
+    const meta = { symbol:"", name:"", logo:"", tags:[], isVerified:false, decimals: undefined };
+    META_CACHE.set(mint, { ts: now, data: meta });
+    return meta;
+  }
 }
 
-  } catch {}
-
-  const meta = {
-    symbol: "",
-    name: "",
-    logo: "",
-    tags: [],
-    isVerified: false,
-    decimals: undefined,
-  };
-  META_CACHE.set(mint, { ts: now, data: meta });
-  return meta;
-}
-
-// Price: DexScreener (primary), Jupiter (fallback) + WS tick broadcast
+/* ---------- Price (Dexscreener primary, Jupiter fallback) + WS tick ---------- */
 async function getTokenUsd(mint) {
   const now = Date.now();
-
-  // Serve hot cache when fresh
   const cached = PRICE_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_PRICE) return cached.priceUsd;
 
-  // Helper: set cache + broadcast tick if value changed and > 0
   const setAndMaybeBroadcast = (val) => {
     const prev = PRICE_CACHE.get(mint)?.priceUsd;
     PRICE_CACHE.set(mint, { ts: now, priceUsd: val });
-
     if (typeof wsBroadcastAll === "function" && val > 0 && val !== prev) {
-      try {
-        wsBroadcastAll({ type: "price", mint, priceUsd: val });
-      } catch {}
+      try { wsBroadcastAll({ type: "price", mint, priceUsd: val }); } catch {}
     }
     return val;
   };
 
-  // ---------- DexScreener primary ----------
   try {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`, {
       headers: { "Cache-Control": "no-cache" }
     });
-
     if (r.ok) {
       const j = await r.json();
       const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
-
-      // Prefer exact baseToken.address==mint on Solana; else fall back to first
       const best =
         pairs.find(p => p?.chainId === "solana" && p?.baseToken?.address === mint) ||
         pairs.find(p => p?.baseToken?.address === mint) ||
         pairs[0];
-
       const p = Number(best?.priceUsd) || 0;
       if (p > 0) return setAndMaybeBroadcast(p);
     }
-  } catch {
-    // swallow; try fallback
-  }
+  } catch {}
 
-  // ---------- Jupiter fallback ----------
   try {
     const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`, {
       headers: { "Cache-Control": "no-cache" }
@@ -673,16 +612,13 @@ async function getTokenUsd(mint) {
       const p2 = Number(j2?.data?.[mint]?.price) || 0;
       if (p2 > 0) return setAndMaybeBroadcast(p2);
     }
-  } catch {
-    // swallow; will return 0 below
-  }
+  } catch {}
 
-  // No price found — cache zero (no broadcast)
   PRICE_CACHE.set(mint, { ts: now, priceUsd: 0 });
   return 0;
 }
 
-// Normalize parsed token account
+/* ---------- Balance helpers ---------- */
 function parseParsedAccount(acc) {
   const info = acc?.account?.data?.parsed?.info;
   const amt = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
@@ -813,7 +749,6 @@ app.post("/api/broadcast", async (req, res) => {
     if (error) throw error;
     const row = normRow(data);
 
-    // instant echo so DEV sees their own post immediately
     wsBroadcastAll({ type: "insert", row });
 
     res.json({ success: true, data: row });
@@ -887,7 +822,6 @@ app.post("/api/refund-log", async (req, res) => {
 
     if (error) throw error;
     const row = normRefundRow(data);
-    // optional: could also wsBroadcastToWallet(wallet, { type:"refund_insert", row });
     res.json({ success: true, data: row });
   } catch (e) {
     err("Refund-log error:", e);
@@ -917,8 +851,6 @@ app.get("/api/refund-history", async (req, res) => {
 });
 
 /* ---------- Optional RPC Proxy (Helius) ---------- */
-// Frontend calls POST /api/rpc with { method, params }.
-// If you ever want GET style, you can add it later.
 app.post("/api/rpc", async (req, res) => {
   try {
     const { method, params } = req.body || {};
@@ -952,11 +884,8 @@ app.get("/api/rpc", (_req, res) => {
   if (!HELIUS_KEY) {
     return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
   }
-  // Frontend expects one of: rpc / helius / rpc_url / rpcUrl
   return res.json({ rpc: HELIUS_RPC });
 });
-
-
 
 /* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
@@ -967,17 +896,9 @@ wss.on("connection", async (socket) => {
   socket.isAlive = true;
   clients.add(socket);
 
-  socket.on("pong", () => {
-    socket.isAlive = true;
-  });
-
-  socket.on("close", () => {
-    clients.delete(socket);
-  });
-
-  socket.on("error", (e) => {
-    err("WS error:", e?.message || e);
-  });
+  socket.on("pong", () => { socket.isAlive = true; });
+  socket.on("close", () => { clients.delete(socket); });
+  socket.on("error", (e) => { err("WS error:", e?.message || e); });
 
   // initial hello → last 25 broadcasts
   try {
@@ -998,15 +919,11 @@ wss.on("connection", async (socket) => {
 setInterval(() => {
   for (const s of clients) {
     if (s.isAlive === false) {
-      try {
-        s.terminate();
-      } catch {}
+      try { s.terminate(); } catch {}
       continue;
     }
     s.isAlive = false;
-    try {
-      s.ping();
-    } catch {}
+    try { s.ping(); } catch {}
   }
 }, 30000);
 
@@ -1017,7 +934,7 @@ function wsBroadcastAll(obj) {
   }
 }
 
-/* ---------- Supabase Realtime: broadcasts only (matches your old working code) ---------- */
+/* ---------- Supabase Realtime: broadcasts ---------- */
 let rtChannel = null;
 function subscribeToBroadcasts() {
   try {
