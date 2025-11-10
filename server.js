@@ -1,12 +1,9 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.1 — realtime broadcasts restored
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.3 — Solscan meta + nocache on token-meta
 /* Key points:
- * - Keeps all v11 features (chart poller, profiles, avatar upload, balances, refund log/history, /api/rpc).
- * - WebSocket server on /ws.
- * - Realtime subscription for hub_broadcasts now matches your old, working pattern:
- *      • INSERT → { type:"insert", row }
- *      • UPDATE → { type:"update", row }
- *      • DELETE → { type:"delete", id }
- *   so deleting a row in Supabase instantly removes it from Signal Room.
+ * - Adds Solscan as a metadata source (price, market cap, holders, name/symbol/logo when available).
+ * - Uses env SOLSCAN_KEY (Render: add "SOLSCAN_KEY" in Environment tab).
+ * - /api/token-meta supports ?nocache=true to bypass memo + stale DB cache for that call.
+ * - Keeps all v11.2 features (chart poller, profiles, avatar upload, balances, refund log/history, /api/rpc, WS).
  */
 
 import express from "express";
@@ -230,6 +227,30 @@ app.get("/api/latest", async (_req, res) => {
 });
 
 /* ---------- Profile + Avatar ---------- */
+// NEW: GET /api/profile to fix 404s from frontend
+app.get("/api/profile", async (req, res) => {
+  try {
+    const wallet = String(req.query.wallet || "").trim();
+    if (!wallet) return res.status(400).json({ error: "wallet required" });
+
+    const { data, error } = await supabase
+      .from("hub_profiles")
+      .select("wallet, handle, avatar_url")
+      .eq("wallet", wallet)
+      .maybeSingle();
+
+    if (error) {
+      warn("[/api/profile] select error:", error.message);
+      return res.status(500).json({ error: "db error" });
+    }
+    // Return {} when not found (frontend expects 200)
+    return res.status(200).json(data || {});
+  } catch (e) {
+    err("[/api/profile] fatal:", e?.message || e);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
 app.post("/api/profile", async (req, res) => {
   try {
     const wallet = String(req.body.wallet || "").trim();
@@ -339,7 +360,11 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
-// Caches
+/* ---------- Solscan ---------- */
+const SOLSCAN_KEY = process.env.SOLSCAN_KEY || "";
+if (!SOLSCAN_KEY) warn("SOLSCAN_KEY not set — Solscan metadata will be skipped.");
+
+/* ---------- Caches ---------- */
 const SOL_CACHE   = { priceUsd: null, ts: 0 };
 const META_CACHE  = new Map();  // mint -> { data, ts }
 const PRICE_CACHE = new Map();  // mint -> { priceUsd, ts }
@@ -347,7 +372,7 @@ const TTL_PRICE   = 15_000;     // 15s prices
 const TTL_META    = 6 * 60 * 60 * 1000;
 const TTL_SOL     = 25_000;
 
-/* ---------- Token Meta Resolver (shared by API and balances) ---------- */
+/* ---------- Token Meta Resolver (shared) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 const MEMO_META = new Map();
 function memoGetMeta(mint){
@@ -412,45 +437,106 @@ async function fetchPumpFunMeta(mint){
     return { description: j?.description || null, image: j?.image_uri || null };
   }catch{ return null; }
 }
+
+/* NEW: Solscan Pro token meta */
+async function fetchSolscanMeta(mint){
+  if (!SOLSCAN_KEY) return null;
+  const headers = { accept: "application/json", token: SOLSCAN_KEY };
+
+  // Try v1.1 first
+  try {
+    const r = await fetch(`https://pro-api.solscan.io/v1.1/token/meta?tokenAddress=${mint}`, { headers });
+    if (r.ok) {
+      const j = await r.json();
+      // Some tenants return { data: {...} }, some inline
+      const d = j?.data || j;
+      if (d) {
+        const price = Number(d?.priceUsdt ?? d?.price_usd ?? 0);
+        const mc    = Number(d?.marketCap ?? d?.market_cap ?? 0);
+        const holders = Number(d?.holder ?? d?.holders ?? 0);
+        return {
+          name: d?.name || null,
+          symbol: d?.symbol || null,
+          image: d?.icon || d?.image || null,
+          price_usd: price > 0 ? price : undefined,
+          market_cap_usd: mc > 0 ? mc : undefined,
+          holders: holders > 0 ? holders : undefined
+        };
+      }
+    }
+  } catch {}
+
+  // Fallback: v1
+  try {
+    const r = await fetch(`https://pro-api.solscan.io/v1/token/meta?tokenAddress=${mint}`, { headers });
+    if (r.ok) {
+      const j = await r.json();
+      const d = j?.data || j;
+      if (d) {
+        const price = Number(d?.priceUsdt ?? d?.price_usd ?? 0);
+        const mc    = Number(d?.marketCap ?? d?.market_cap ?? 0);
+        const holders = Number(d?.holder ?? d?.holders ?? 0);
+        return {
+          name: d?.name || null,
+          symbol: d?.symbol || null,
+          image: d?.icon || d?.image || null,
+          price_usd: price > 0 ? price : undefined,
+          market_cap_usd: mc > 0 ? mc : undefined,
+          holders: holders > 0 ? holders : undefined
+        };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 function mergeMetaParts(...parts){
   const out = {};
   for (const p of parts) {
     if (!p) continue;
     for (const [k,v] of Object.entries(p)) {
-      if (out[k] == null || out[k] === 0 || out[k] === "") out[k] = v;
+      if (v == null || v === "" || v === 0) continue;
+      if (out[k] == null || out[k] === "" || out[k] === 0) out[k] = v;
     }
   }
   return out;
 }
 
 // shared implementation
-async function resolveTokenMetaCombined(mint){
+async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
   // in-memory memo
-  const memo = memoGetMeta(mint);
-  if (memo) return memo;
-
-  // supabase cache (≤6h)
-  const { data: cached } = await supabase
-    .from("token_meta")
-    .select("*")
-    .eq("mint", mint)
-    .maybeSingle();
-
-  if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
-    memoSetMeta(mint, cached);
-    return cached;
+  if (!nocache) {
+    const memo = memoGetMeta(mint);
+    if (memo) return memo;
   }
 
-  // fan-out
-  const [hel, jup, dskr, pump] = await Promise.all([
+  // supabase cache (≤6h)
+  if (!nocache) {
+    const { data: cached } = await supabase
+      .from("token_meta")
+      .select("*")
+      .eq("mint", mint)
+      .maybeSingle();
+
+    if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
+      memoSetMeta(mint, cached);
+      return cached;
+    }
+  }
+
+  // fan-out (now with Solscan)
+  const [hel, jup, dskr, pump, solscan] = await Promise.all([
     fetchHeliusDAS(mint),
     fetchJupiterMetaLoose(mint),
     fetchDexscreenerMeta(mint),
-    fetchPumpFunMeta(mint)
+    fetchPumpFunMeta(mint),
+    fetchSolscanMeta(mint)
   ]);
 
-  let merged = mergeMetaParts(hel, jup, pump, dskr);
+  let merged = mergeMetaParts(solscan, hel, jup, pump, dskr);
 
+  // compute market cap if missing but price & supply are present
   if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
       merged.price_usd && merged.supply) {
     merged.market_cap_usd = merged.price_usd * merged.supply;
@@ -469,12 +555,18 @@ async function resolveTokenMetaCombined(mint){
     price_usd: Number(merged.price_usd || 0),
     market_cap_usd: Number(merged.market_cap_usd || 0),
     holders: typeof merged.holders === "number" ? merged.holders : null,
-    source: { helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump },
+    source: {
+      helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump, solscan: !!solscan
+    },
     updated_at: new Date().toISOString()
   };
 
-  // upsert cache
-  await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
+  // upsert cache unless nocache requested (still memo so subsequent calls in-flight reuse)
+  try {
+    await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
+  } catch (e) {
+    warn("token_meta upsert failed (non-fatal):", e?.message || e);
+  }
 
   memoSetMeta(mint, payload);
   return payload;
@@ -485,7 +577,8 @@ app.get("/api/token-meta", async (req, res) => {
   try{
     const mint = String(req.query.mint || "").trim();
     if (!mint) return res.status(400).json({ error:"mint required" });
-    const payload = await resolveTokenMetaCombined(mint);
+    const nocache = String(req.query.nocache || "").toLowerCase() === "true";
+    const payload = await resolveTokenMetaCombined(mint, { nocache });
     res.json(payload);
   }catch(e){
     err("token-meta error:", e);
@@ -530,7 +623,6 @@ async function getTokenMeta(mint) {
   const cached = META_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_META) return cached.data;
 
-  // Use the same combined resolver as the HTTP route, but directly.
   try {
     const j = await resolveTokenMetaCombined(mint);
     const meta = {
@@ -573,10 +665,12 @@ async function getTokenMeta(mint) {
 }
 
 /* ---------- Price (Dexscreener primary, Jupiter fallback) + WS tick ---------- */
-async function getTokenUsd(mint) {
+async function getTokenUsd(mint, { nocache = false } = {}) {
   const now = Date.now();
-  const cached = PRICE_CACHE.get(mint);
-  if (cached && now - cached.ts < TTL_PRICE) return cached.priceUsd;
+  if (!nocache) {
+    const cached = PRICE_CACHE.get(mint);
+    if (cached && now - cached.ts < TTL_PRICE) return cached.priceUsd;
+  }
 
   const setAndMaybeBroadcast = (val) => {
     const prev = PRICE_CACHE.get(mint)?.priceUsd;
@@ -636,16 +730,16 @@ function parseParsedAccount(acc) {
   };
 }
 
-async function getAllSplTokenAccounts(owner) {
+async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
   const legacy = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_PROGRAM_ID },
-    { encoding: "jsonParsed" },
+    { encoding: "jsonParsed", commitment },
   ]);
   const t22 = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_2022_PROGRAM_ID },
-    { encoding: "jsonParsed" },
+    { encoding: "jsonParsed", commitment },
   ]);
 
   const list = []
@@ -671,22 +765,32 @@ async function getAllSplTokenAccounts(owner) {
 app.post("/api/balances", async (req, res) => {
   try {
     const wallet = req.body?.wallet?.trim();
+    const commitment = ["processed","confirmed","finalized"].includes(req.body?.commitment)
+      ? req.body.commitment : "confirmed";
+    const nocache = Boolean(req.body?.nocache);
+
     if (!wallet || !HELIUS_KEY) {
       return res.status(400).json({ error: "Bad request" });
     }
 
-    const solBal = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
+    // Optional: bypass caches when client asks for fresh pull
+    if (nocache) {
+      SOL_CACHE.ts = 0;
+      // Don't globally clear PRICE_CACHE; clear lazily when we fetch each mint below
+    }
+
+    const solBal = await rpc("getBalance", [wallet, { commitment }]);
     const sol = Number(solBal?.value || 0) / 1e9;
     const solUsd = await getSolUsd();
 
-    const tokenAccounts = await getAllSplTokenAccounts(wallet);
+    const tokenAccounts = await getAllSplTokenAccounts(wallet, commitment);
 
     const enriched = await Promise.all(
       tokenAccounts.map(async (t) => {
         const meta = await getTokenMeta(t.mint);
         const decimals =
           typeof meta.decimals === "number" ? meta.decimals : t.decimals;
-        const priceUsd = await getTokenUsd(t.mint);
+        const priceUsd = await getTokenUsd(t.mint, { nocache });
         const usd = priceUsd * t.amount;
 
         return {
@@ -706,7 +810,7 @@ app.post("/api/balances", async (req, res) => {
 
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    res.json({ sol, solUsd, tokens: enriched });
+    res.json({ sol, solUsd, tokens: enriched, commitment, nocache });
   } catch (e) {
     err("Balances error:", e);
     res.status(500).json({ error: "Failed" });
@@ -998,7 +1102,7 @@ subscribeToBroadcasts();
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v11.1 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend:  http://localhost:${PORT}/OperatorHub.html`);
 });
