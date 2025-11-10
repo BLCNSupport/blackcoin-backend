@@ -357,9 +357,162 @@ const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const SOL_CACHE   = { priceUsd: null, ts: 0 };
 const META_CACHE  = new Map();  // mint -> { data, ts }
 const PRICE_CACHE = new Map();  // mint -> { priceUsd, ts }
-const TTL_PRICE   = 30_000;     // 30s prices
+const TTL_PRICE   = 15_000;     // 15s prices
 const TTL_META    = 6 * 60 * 60 * 1000;
 const TTL_SOL     = 25_000;
+
+// ---------- Token meta cache (merged from Helius DAS + Jupiter + Dexscreener + Pump) ----------
+const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const MEMO_META = new Map();
+
+function memoGetMeta(mint){
+  const e = MEMO_META.get(mint);
+  if (!e) return null;
+  if (Date.now() - e.t > META_TTL_MS) { MEMO_META.delete(mint); return null; }
+  return e.v;
+}
+function memoSetMeta(mint, v){ MEMO_META.set(mint, { v, t: Date.now() }); }
+
+// Helius DAS (via the same HELIUS_RPC): getAsset
+async function fetchHeliusDAS(mint){
+  try{
+    const r = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify({ jsonrpc:"2.0", id:1, method:"getAsset", params:{ id: mint } })
+    });
+    const j = await r.json();
+    const a = j?.result;
+    if (!a) return null;
+    const name   = a?.content?.metadata?.name || a?.token_info?.symbol || null;
+    const symbol = a?.token_info?.symbol || a?.content?.metadata?.symbol || null;
+    const image  = a?.content?.links?.image || null;
+    const desc   = a?.content?.metadata?.description || null;
+    const decimals = Number(a?.token_info?.decimals ?? 0);
+    const supply   = Number(a?.token_info?.supply ?? 0);
+    return { name, symbol, image, description: desc, decimals, supply };
+  }catch{ return null; }
+}
+
+async function fetchJupiterMetaLoose(mint){
+  try{
+    const r = await fetch(`https://tokens.jup.ag/token/${mint}`, { cache:"no-store" });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return {
+      name: j?.name || null,
+      symbol: j?.symbol || null,
+      decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
+      image: j?.logoURI || null
+    };
+  }catch{ return null; }
+}
+
+async function fetchDexscreenerMeta(mint){
+  try{
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
+    const j = await r.json();
+    const p = j?.pairs?.[0];
+    if (!p) return null;
+    // Dexscreener sometimes exposes base token fields + liquidity/FDV
+    const holders = Number(p?.holders || 0); // often absent; keep as best-effort
+    return {
+      price_usd: Number(p?.priceUsd) || 0,
+      market_cap_usd: Number(p?.fdv || p?.marketCap || 0),
+      holders: holders > 0 ? holders : null
+    };
+  }catch{ return null; }
+}
+
+async function fetchPumpFunMeta(mint){
+  try{
+    const r = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
+    if (!r.ok) return null;
+    const j = await r.json();
+    return {
+      description: j?.description || null,
+      image: j?.image_uri || null
+    };
+  }catch{ return null; }
+}
+
+function mergeMetaParts(...parts){
+  const out = {};
+  for (const p of parts) {
+    if (!p) continue;
+    for (const [k,v] of Object.entries(p)) {
+      if (out[k] == null || out[k] === 0 || out[k] === "") out[k] = v;
+    }
+  }
+  return out;
+}
+
+// GET /api/token-meta?mint=...
+app.get("/api/token-meta", async (req, res) => {
+  try{
+    const mint = String(req.query.mint || "").trim();
+    if (!mint) return res.status(400).json({ error:"mint required" });
+
+    // in-memory cache
+    const memo = memoGetMeta(mint);
+    if (memo) return res.json(memo);
+
+    // supabase cache (≤6h)
+    const { data: cached } = await supabase
+      .from("token_meta")
+      .select("*")
+      .eq("mint", mint)
+      .maybeSingle();
+
+    if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
+      memoSetMeta(mint, cached);
+      return res.json(cached);
+    }
+
+    // fan-out to sources in parallel
+    const [hel, jup, dskr, pump] = await Promise.all([
+      fetchHeliusDAS(mint),
+      fetchJupiterMetaLoose(mint),
+      fetchDexscreenerMeta(mint),
+      fetchPumpFunMeta(mint)
+    ]);
+
+    let merged = mergeMetaParts(hel, jup, pump, dskr);
+
+    // compute market cap if missing and we have price + supply
+    if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
+        merged.price_usd && merged.supply) {
+      merged.market_cap_usd = merged.price_usd * merged.supply;
+    }
+
+    const payload = {
+      mint,
+      name: merged.name || jup?.name || hel?.name || null,
+      symbol: merged.symbol || jup?.symbol || hel?.symbol || null,
+      decimals: typeof merged.decimals === "number" ? merged.decimals :
+                (typeof jup?.decimals === "number" ? jup.decimals :
+                 (typeof hel?.decimals === "number" ? hel.decimals : 0)),
+      image: merged.image || jup?.image || hel?.image || null,
+      description: merged.description || pump?.description || null,
+      supply: Number(merged.supply || 0),
+      price_usd: Number(merged.price_usd || 0),
+      market_cap_usd: Number(merged.market_cap_usd || 0),
+      holders: typeof merged.holders === "number" ? merged.holders : null,
+      source: { helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump },
+      updated_at: new Date().toISOString()
+    };
+
+    // upsert cache
+    await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
+
+    memoSetMeta(mint, payload);
+    res.json(payload);
+  }catch(e){
+    err("token-meta error:", e);
+    res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
+  }
+});
+
 
 // Generic RPC helper
 async function rpc(method, params) {
@@ -398,6 +551,26 @@ async function getTokenMeta(mint) {
   const cached = META_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_META) return cached.data;
 
+  // 1) Try backend cache endpoint first (fast path)
+  try{
+    const r = await fetch(`${process.env.PUBLIC_URL || ""}/api/token-meta?mint=${encodeURIComponent(mint)}`);
+    if (r.ok){
+      const j = await r.json();
+      const meta = {
+        symbol: j?.symbol || "",
+        name: j?.name || "",
+        logo: j?.image || "",
+        decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
+        // keep your existing flags shape so the rest of code stays untouched
+        tags: [],
+        isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
+      };
+      META_CACHE.set(mint, { ts: now, data: meta });
+      return meta;
+    }
+  }catch{}
+
+  // 2) Fallback to your previous Jupiter-only lookup
   try {
     const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
     if (r.ok) {
@@ -432,40 +605,79 @@ async function getTokenMeta(mint) {
   return meta;
 }
 
-// Price: DexScreener, fallback Jupiter
+  } catch {}
+
+  const meta = {
+    symbol: "",
+    name: "",
+    logo: "",
+    tags: [],
+    isVerified: false,
+    decimals: undefined,
+  };
+  META_CACHE.set(mint, { ts: now, data: meta });
+  return meta;
+}
+
+// Price: DexScreener (primary), Jupiter (fallback) + WS tick broadcast
 async function getTokenUsd(mint) {
   const now = Date.now();
+
+  // Serve hot cache when fresh
   const cached = PRICE_CACHE.get(mint);
   if (cached && now - cached.ts < TTL_PRICE) return cached.priceUsd;
 
+  // Helper: set cache + broadcast tick if value changed and > 0
+  const setAndMaybeBroadcast = (val) => {
+    const prev = PRICE_CACHE.get(mint)?.priceUsd;
+    PRICE_CACHE.set(mint, { ts: now, priceUsd: val });
+
+    if (typeof wsBroadcastAll === "function" && val > 0 && val !== prev) {
+      try {
+        wsBroadcastAll({ type: "price", mint, priceUsd: val });
+      } catch {}
+    }
+    return val;
+  };
+
+  // ---------- DexScreener primary ----------
   try {
-    const r = await fetch(
-      `https://api.dexscreener.com/latest/dex/search?q=${mint}`
-    );
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`, {
+      headers: { "Cache-Control": "no-cache" }
+    });
+
     if (r.ok) {
       const j = await r.json();
-      const p = Number(j?.pairs?.[0]?.priceUsd) || 0;
-      if (p > 0) {
-        PRICE_CACHE.set(mint, { ts: now, priceUsd: p });
-        return p;
-      }
-    }
-  } catch {}
+      const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
 
+      // Prefer exact baseToken.address==mint on Solana; else fall back to first
+      const best =
+        pairs.find(p => p?.chainId === "solana" && p?.baseToken?.address === mint) ||
+        pairs.find(p => p?.baseToken?.address === mint) ||
+        pairs[0];
+
+      const p = Number(best?.priceUsd) || 0;
+      if (p > 0) return setAndMaybeBroadcast(p);
+    }
+  } catch {
+    // swallow; try fallback
+  }
+
+  // ---------- Jupiter fallback ----------
   try {
-    const r2 = await fetch(
-      `https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`
-    );
+    const r2 = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`, {
+      headers: { "Cache-Control": "no-cache" }
+    });
     if (r2.ok) {
       const j2 = await r2.json();
       const p2 = Number(j2?.data?.[mint]?.price) || 0;
-      if (p2 > 0) {
-        PRICE_CACHE.set(mint, { ts: now, priceUsd: p2 });
-        return p2;
-      }
+      if (p2 > 0) return setAndMaybeBroadcast(p2);
     }
-  } catch {}
+  } catch {
+    // swallow; will return 0 below
+  }
 
+  // No price found — cache zero (no broadcast)
   PRICE_CACHE.set(mint, { ts: now, priceUsd: 0 });
   return 0;
 }
