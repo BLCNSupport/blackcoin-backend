@@ -1,6 +1,9 @@
-// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.3 — Solscan meta + nocache on token-meta
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.3 — Jupiter V2 tokens + Solscan meta + nocache on token-meta
 /* Key points:
- * - Adds Solscan as a metadata source (price, market cap, holders, name/symbol/logo when available).
+ * - Adds Jupiter Tokens API v2:
+ *      • GET /api/jup/tokens/search?query=... (backend proxy + 15m cache)
+ *      • fetchJupiterV2ByMint(mint) for meta resolution
+ * - Keeps Solscan as a metadata source (price, market cap, holders, name/symbol/logo when available).
  * - Uses env SOLSCAN_KEY (Render: add "SOLSCAN_KEY" in Environment tab).
  * - /api/token-meta supports ?nocache=true to bypass memo + stale DB cache for that call.
  * - Keeps all v11.2 features (chart poller, profiles, avatar upload, balances, refund log/history, /api/rpc, WS).
@@ -368,9 +371,11 @@ if (!SOLSCAN_KEY) warn("SOLSCAN_KEY not set — Solscan metadata will be skipped
 const SOL_CACHE   = { priceUsd: null, ts: 0 };
 const META_CACHE  = new Map();  // mint -> { data, ts }
 const PRICE_CACHE = new Map();  // mint -> { priceUsd, ts }
+const JUP_V2_CACHE = new Map(); // query -> { data, ts }
 const TTL_PRICE   = 15_000;     // 15s prices
 const TTL_META    = 6 * 60 * 60 * 1000;
 const TTL_SOL     = 25_000;
+const TTL_JUP_V2  = 15 * 60 * 1000; // 15m for token search
 
 /* ---------- Token Meta Resolver (shared) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
@@ -383,6 +388,38 @@ function memoGetMeta(mint){
 }
 function memoSetMeta(mint, v){ MEMO_META.set(mint, { v, t: Date.now() }); }
 
+/* ------- Jupiter Tokens API v2 helpers ------- */
+async function jupV2Search(query) {
+  const key = `q:${query}`;
+  const now = Date.now();
+  const cached = JUP_V2_CACHE.get(key);
+  if (cached && now - cached.ts < TTL_JUP_V2) return cached.data;
+  const url = `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(query)}`;
+  const r = await fetch(url, { headers: { accept: "application/json" } });
+  if (!r.ok) throw new Error(`Jupiter v2 search HTTP ${r.status}`);
+  const data = await r.json();
+  JUP_V2_CACHE.set(key, { data, ts: now });
+  return data;
+}
+
+async function fetchJupiterV2ByMint(mint) {
+  try {
+    const list = await jupV2Search(mint);
+    if (!Array.isArray(list) || !list.length) return null;
+    const hit = list.find(t => (t.mint || "").toLowerCase() === mint.toLowerCase()) || list[0];
+    return {
+      name: hit?.name || null,
+      symbol: hit?.symbol || null,
+      decimals: typeof hit?.decimals === "number" ? hit.decimals : undefined,
+      image: hit?.logoURI || null,
+      tags: Array.isArray(hit?.tags) ? hit.tags : undefined
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* ------- Other sources ------- */
 async function fetchHeliusDAS(mint){
   try{
     const r = await fetch(HELIUS_RPC, {
@@ -400,19 +437,6 @@ async function fetchHeliusDAS(mint){
     const decimals = Number(a?.token_info?.decimals ?? 0);
     const supply   = Number(a?.token_info?.supply ?? 0);
     return { name, symbol, image, description: desc, decimals, supply };
-  }catch{ return null; }
-}
-async function fetchJupiterMetaLoose(mint){
-  try{
-    const r = await fetch(`https://tokens.jup.ag/token/${mint}`, { cache:"no-store" });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return {
-      name: j?.name || null,
-      symbol: j?.symbol || null,
-      decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
-      image: j?.logoURI || null
-    };
   }catch{ return null; }
 }
 async function fetchDexscreenerMeta(mint){
@@ -448,7 +472,6 @@ async function fetchSolscanMeta(mint){
     const r = await fetch(`https://pro-api.solscan.io/v1.1/token/meta?tokenAddress=${mint}`, { headers });
     if (r.ok) {
       const j = await r.json();
-      // Some tenants return { data: {...} }, some inline
       const d = j?.data || j;
       if (d) {
         const price = Number(d?.priceUsdt ?? d?.price_usd ?? 0);
@@ -525,16 +548,16 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
     }
   }
 
-  // fan-out (now with Solscan)
-  const [hel, jup, dskr, pump, solscan] = await Promise.all([
+  // fan-out (Jupiter v2 preferred)
+  const [jupV2, hel, dskr, pump, solscan] = await Promise.all([
+    fetchJupiterV2ByMint(mint),
     fetchHeliusDAS(mint),
-    fetchJupiterMetaLoose(mint),
     fetchDexscreenerMeta(mint),
     fetchPumpFunMeta(mint),
     fetchSolscanMeta(mint)
   ]);
 
-  let merged = mergeMetaParts(solscan, hel, jup, pump, dskr);
+  let merged = mergeMetaParts(solscan, jupV2, hel, pump, dskr);
 
   // compute market cap if missing but price & supply are present
   if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
@@ -544,19 +567,19 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
 
   const payload = {
     mint,
-    name: merged.name || jup?.name || hel?.name || null,
-    symbol: merged.symbol || jup?.symbol || hel?.symbol || null,
+    name: merged.name || jupV2?.name || hel?.name || null,
+    symbol: merged.symbol || jupV2?.symbol || hel?.symbol || null,
     decimals: typeof merged.decimals === "number" ? merged.decimals :
-              (typeof jup?.decimals === "number" ? jup.decimals :
+              (typeof jupV2?.decimals === "number" ? jupV2.decimals :
                (typeof hel?.decimals === "number" ? hel.decimals : 0)),
-    image: merged.image || jup?.image || hel?.image || null,
+    image: merged.image || jupV2?.image || hel?.image || null,
     description: merged.description || pump?.description || null,
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
     market_cap_usd: Number(merged.market_cap_usd || 0),
     holders: typeof merged.holders === "number" ? merged.holders : null,
     source: {
-      helius: !!hel, jupiter: !!jup, dexscreener: !!dskr, pump: !!pump, solscan: !!solscan
+      jupiter_v2: !!jupV2, helius: !!hel, dexscreener: !!dskr, pump: !!pump, solscan: !!solscan
     },
     updated_at: new Date().toISOString()
   };
@@ -583,6 +606,19 @@ app.get("/api/token-meta", async (req, res) => {
   }catch(e){
     err("token-meta error:", e);
     res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
+  }
+});
+
+/* ---------- Jupiter v2 proxy (for UI search/autocomplete, optional) ---------- */
+app.get("/api/jup/tokens/search", async (req, res) => {
+  try {
+    const query = (req.query.query || "").trim();
+    if (!query) return res.status(400).json({ error: "missing_query" });
+    const data = await jupV2Search(query);
+    res.json(data);
+  } catch (e) {
+    warn("Jupiter v2 proxy error:", e?.message || e);
+    res.status(502).json({ error: "jupiter_v2_failed" });
   }
 });
 
@@ -636,27 +672,19 @@ async function getTokenMeta(mint) {
     META_CACHE.set(mint, { ts: now, data: meta });
     return meta;
   } catch {
-    // fallback to Jupiter-only (best-effort)
+    // fallback: Jupiter v2 direct
     try {
-      const r = await fetch(`https://tokens.jup.ag/token/${mint}`);
-      if (r.ok) {
-        const j = await r.json();
-        const meta = {
-          symbol: j?.symbol || "",
-          name: j?.name || "",
-          logo: j?.logoURI || "",
-          tags: Array.isArray(j?.tags) ? j.tags : [],
-          isVerified: Boolean(
-            j?.extensions?.coingeckoId ||
-            j?.daily_volume ||
-            j?.liquidity ||
-            j?.verified
-          ),
-          decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
-        };
-        META_CACHE.set(mint, { ts: now, data: meta });
-        return meta;
-      }
+      const v2 = await fetchJupiterV2ByMint(mint);
+      const meta = {
+        symbol: v2?.symbol || "",
+        name: v2?.name || "",
+        logo: v2?.image || "",
+        tags: Array.isArray(v2?.tags) ? v2.tags : [],
+        isVerified: Boolean(v2?.symbol && v2?.name),
+        decimals: typeof v2?.decimals === "number" ? v2.decimals : undefined,
+      };
+      META_CACHE.set(mint, { ts: now, data: meta });
+      return meta;
     } catch {}
     const meta = { symbol:"", name:"", logo:"", tags:[], isVerified:false, decimals: undefined };
     META_CACHE.set(mint, { ts: now, data: meta });
