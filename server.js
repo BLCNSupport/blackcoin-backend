@@ -23,7 +23,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(express.static("public")); // serves OperatorHub.html etc.
+app.use(express.static("public")); // serves OperatorHub.html / index.html etc.
 
 /* ---------- tiny log helpers ---------- */
 function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
@@ -47,6 +47,11 @@ app.get("/healthz", (_req, res) =>
 
 /* ---------- Chart Poller (DexScreener) ---------- */
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
+
+// Homepage “vaults” (same as in your HTML)
+const CTO_WALLET = "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3";
+const UTILITY_WALLET = "8XuN2RbJHKHkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
+
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
 let isBackoff = false, fetchInProgress = false, pollTimer = null;
@@ -787,6 +792,44 @@ async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
   return Array.from(byMint.values());
 }
 
+/* === Small helper for homepage CTO / Utility wallets === */
+async function getWalletSnapshot(owner, mint, commitment = "confirmed") {
+  const [bal, tokens] = await Promise.all([
+    rpc("getBalance", [owner, { commitment }]),
+    getAllSplTokenAccounts(owner, commitment),
+  ]);
+
+  const sol = Number(bal?.value || 0) / 1e9;
+  const tok = (tokens || []).find((t) => t.mint === mint);
+  const tokenAmount = tok ? tok.amount : 0;
+  return { sol, token: tokenAmount };
+}
+
+/* Simple JSON for homepage vault cards:
+ * {
+ *   cto:      { sol, token },
+ *   utility:  { sol, token }
+ * }
+ */
+app.get("/api/wallets", async (_req, res) => {
+  try {
+    if (!HELIUS_KEY) {
+      return res.status(400).json({ error: "HELIUS_API_KEY not configured on backend" });
+    }
+
+    const [cto, utility] = await Promise.all([
+      getWalletSnapshot(CTO_WALLET, TOKEN_MINT),
+      getWalletSnapshot(UTILITY_WALLET, TOKEN_MINT),
+    ]);
+
+    res.json({ cto, utility });
+  } catch (e) {
+    err("/api/wallets error:", e);
+    res.status(500).json({ error: "Failed to fetch wallet snapshots" });
+  }
+});
+
+/* ---------- Balances endpoint ---------- */
 app.post("/api/balances", async (req, res) => {
   try {
     const wallet = req.body?.wallet?.trim();
@@ -1128,5 +1171,5 @@ subscribeToBroadcasts();
 server.listen(PORT, () => {
   log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
-  log(`Frontend:  http://localhost:${PORT}/OperatorHub.html`);
+  log(`Frontend:  http://localhost:${PORT}/`);
 });
