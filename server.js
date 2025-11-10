@@ -235,50 +235,74 @@ app.get("/api/latest", async (_req, res) => {
 /* ---------- Profile + Avatar ---------- */
 app.post("/api/profile", async (req, res) => {
   try {
-    let { wallet, handle, avatar_url } = req.body;
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
-    if (typeof handle === "string") handle = handle.trim();
-    if (!handle) handle = "@Operator";
-
-    const { data, error } = await supabase
-      .from("hub_profiles")
-      .upsert(
-        {
-          wallet,
-          handle,
-          avatar_url: avatar_url ?? null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "wallet" }
-      )
-      .select()
-      .maybeSingle();
-
-    if (error) throw error;
-    res.json({ success: true, profile: data });
-  } catch (e) {
-    err("Profile save error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/profile", async (req, res) => {
-  try {
-    const { wallet } = req.query;
+    // Required
+    const wallet = String(req.body.wallet || "").trim();
     if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
-    const { data, error } = await supabase
+    // Optional fields — treat empty strings and null/undefined as "not provided"
+    let handle = req.body.handle;
+    if (typeof handle === "string") {
+      handle = handle.trim();
+      if (handle === "") handle = undefined;
+    } else if (handle == null) {
+      handle = undefined;
+    }
+
+    let avatar_url = req.body.avatar_url;
+    if (typeof avatar_url === "string") {
+      avatar_url = avatar_url.trim();
+      if (avatar_url === "") avatar_url = undefined;
+    } else if (avatar_url == null) {
+      avatar_url = undefined;
+    }
+
+    // If neither field provided, nothing to do
+    if (handle === undefined && avatar_url === undefined) {
+      return res.status(400).json({ error: "no fields to update" });
+    }
+
+    // Fetch existing row (if any)
+    const { data: existing, error: selErr } = await supabase
       .from("hub_profiles")
-      .select("*")
+      .select("wallet, handle, avatar_url")
       .eq("wallet", wallet)
       .maybeSingle();
 
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: "Not found" });
-    res.json(data);
+    if (selErr) {
+      return res.status(500).json({ error: "select_failed", detail: selErr.message });
+    }
+
+    // Build PATCH with only provided keys
+    const patch = { updated_at: new Date().toISOString() };
+    if (handle !== undefined) patch.handle = handle;
+    if (avatar_url !== undefined) patch.avatar_url = avatar_url;
+
+    if (existing) {
+      // Update only provided columns
+      const { data, error } = await supabase
+        .from("hub_profiles")
+        .update(patch)
+        .eq("wallet", wallet)
+        .select()
+        .maybeSingle();
+
+      if (error) return res.status(500).json({ error: "update_failed", detail: error.message });
+      return res.json({ success: true, profile: data });
+    } else {
+      // Insert minimal new row with only provided columns
+      const insertRow = { wallet, ...patch };
+      const { data, error } = await supabase
+        .from("hub_profiles")
+        .insert(insertRow)
+        .select()
+        .maybeSingle();
+
+      if (error) return res.status(500).json({ error: "insert_failed", detail: error.message });
+      return res.json({ success: true, profile: data });
+    }
   } catch (e) {
-    err("Profile get error:", e);
-    res.status(500).json({ error: e.message });
+    err("Profile save error:", e);
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
