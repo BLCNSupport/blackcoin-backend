@@ -25,6 +25,13 @@ import {
 } from "@solana/spl-token";
 import bs58 from "bs58";
 
+import crypto from "crypto";
+import nacl from "tweetnacl";
+import { TextEncoder } from "util";
+
+const encoder = new TextEncoder();
+
+
 dotenv.config();
 
 const app = express();
@@ -36,9 +43,15 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "x-bc-session",
+    ],
   })
 );
+
 // Handle preflight
 app.options("*", cors());
 
@@ -1366,6 +1379,152 @@ app.get("/api/rpc", (_req, res) => {
 /* =======================  STAKING TERMINAL BACKEND  ===================== */
 /* ======================================================================== */
 
+
+/* === Signed-session auth (Phantom message) === */
+
+const pendingNonces = new Map(); // wallet -> { nonce, created }
+const sessions = new Map();      // token  -> { wallet, created, expiresAt }
+
+function buildAuthMessage(wallet, nonce) {
+  return [
+    "BlackCoin Operator Session v1",
+    `Wallet: ${wallet}`,
+    `Nonce: ${nonce}`,
+    `Time: ${new Date().toISOString()}`,
+  ].join("\n");
+}
+
+// 1) Frontend asks for a nonce/message to sign
+app.get("/api/auth/nonce", (req, res) => {
+  try {
+    const wallet = String(req.query.wallet || "").trim();
+    if (!wallet) {
+      return res.status(400).json({ error: "wallet required" });
+    }
+
+    // very basic Solana pubkey validation via web3.PublicKey
+    try {
+      new web3.PublicKey(wallet);
+    } catch {
+      return res.status(400).json({ error: "invalid wallet" });
+    }
+
+    const nonce = crypto.randomBytes(32).toString("hex");
+    pendingNonces.set(wallet, { nonce, created: Date.now() });
+
+    const message = buildAuthMessage(wallet, nonce);
+    return res.json({ wallet, nonce, message });
+  } catch (e) {
+    err("[auth/nonce] error:", e?.message || e);
+    return res.status(500).json({ error: "internal error" });
+  }
+});
+
+// 2) Frontend posts signed message; we verify + issue session token
+app.post("/api/auth/verify", (req, res) => {
+  try {
+    const { wallet, message, signature } = req.body || {};
+
+    if (!wallet || !message || !Array.isArray(signature)) {
+      return res
+        .status(400)
+        .json({ error: "wallet, message, signature[] required" });
+    }
+
+    const pending = pendingNonces.get(wallet);
+    if (!pending) {
+      return res.status(400).json({ error: "no nonce for wallet" });
+    }
+
+    // expire nonce after 5 minutes
+    if (Date.now() - pending.created > 5 * 60 * 1000) {
+      pendingNonces.delete(wallet);
+      return res.status(400).json({ error: "nonce expired" });
+    }
+
+    // Rebuild the exact message the backend expects for this nonce
+    const expectedMessage = buildAuthMessage(wallet, pending.nonce);
+
+    // Extra safety: make sure the message they sent back is EXACTLY what we expect
+    if (message !== expectedMessage) {
+      return res.status(400).json({ error: "message does not match nonce" });
+    }
+
+    // Verify signature over the expected message
+    const msgBytes = encoder.encode(expectedMessage);
+    const sigBytes = Uint8Array.from(signature);
+
+    let pubKey;
+    try {
+      pubKey = new web3.PublicKey(wallet);
+    } catch {
+      return res.status(400).json({ error: "invalid wallet" });
+    }
+
+    const ok = nacl.sign.detached.verify(
+      msgBytes,
+      sigBytes,
+      pubKey.toBytes()
+    );
+
+    if (!ok) {
+      return res
+        .status(401)
+        .json({ error: "signature verification failed" });
+    }
+
+    // signature valid → create session token (2 hours)
+    const token = crypto.randomBytes(32).toString("hex");
+    const now = Date.now();
+    const expiresAt = now + 2 * 60 * 60 * 1000;
+
+    sessions.set(token, { wallet, created: now, expiresAt });
+    pendingNonces.delete(wallet); // one-time use
+
+    return res.json({
+      ok: true,
+      session: token,
+      wallet,
+      expiresAt,
+    });
+  } catch (e) {
+    err("[auth/verify] error:", e?.message || e);
+    return res.status(500).json({ error: "internal error" });
+  }
+});
+
+// 3) Middleware: protect staking POST routes
+function requireSession(req, res, next) {
+  const token = req.header("x-bc-session");
+  const wallet =
+    (req.body && req.body.wallet) ||
+    (req.query && req.query.wallet) ||
+    "";
+
+  if (!token || !wallet) {
+    return res
+      .status(401)
+      .json({ error: "session and wallet required" });
+  }
+
+  const session = sessions.get(token);
+  if (!session) {
+    return res.status(401).json({ error: "invalid session" });
+  }
+
+  if (session.wallet !== wallet) {
+    return res.status(401).json({ error: "wallet mismatch for session" });
+  }
+
+  if (Date.now() > session.expiresAt) {
+    sessions.delete(token);
+    return res.status(401).json({ error: "session expired" });
+  }
+
+  req.auth = { wallet: session.wallet, token };
+  next();
+}
+
 /* ---- Staking + reward pool config ---- */
 
 const STAKE_REWARD_RATES = { 30: 0.05, 60: 0.125, 90: 0.25 }; // matches UI
@@ -1602,7 +1761,7 @@ app.get("/api/staking/state", async (req, res) => {
 POST /api/staking/stake
   { wallet, amount, duration_days }
 */
-app.post("/api/staking/stake", async (req, res) => {
+app.post("/api/staking/stake", requireSession, async (req, res) => {
   const { wallet, amount, duration_days } = req.body || {};
   const w = String(wallet || "").trim();
   const amt = Number(amount || 0);
@@ -1709,7 +1868,7 @@ app.post("/api/staking/stake", async (req, res) => {
 POST /api/staking/claim
   { wallet }
 */
-app.post("/api/staking/claim", async (req, res) => {
+app.post("/api/staking/claim", requireSession, async (req, res) => {
   const { wallet } = req.body || {};
   const w = String(wallet || "").trim();
   if (!w) return res.status(400).json({ error: "wallet is required" });
@@ -1822,7 +1981,7 @@ app.post("/api/staking/claim", async (req, res) => {
 POST /api/staking/unstake
   { wallet, stake_id }
 */
-app.post("/api/staking/unstake", async (req, res) => {
+app.post("/api/staking/unstake", requireSession, async (req, res) => {
   const { wallet, stake_id } = req.body || {};
   const w = String(wallet || "").trim();
 
