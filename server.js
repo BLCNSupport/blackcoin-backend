@@ -16,6 +16,15 @@ import multer from "multer";
 import { WebSocketServer } from "ws";
 import http from "http";
 
+/* === NEW: Solana + SPL Token for staking payouts === */
+import * as web3 from "@solana/web3.js";
+import {
+  getOrCreateAssociatedTokenAccount,
+  createTransferInstruction,
+  TOKEN_PROGRAM_ID as SPL_TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
+import bs58 from "bs58";
+
 dotenv.config();
 
 const app = express();
@@ -1351,6 +1360,567 @@ app.get("/api/rpc", (_req, res) => {
       .json({ error: "HELIUS_API_KEY not configured" });
   }
   return res.json({ rpc: HELIUS_RPC });
+});
+
+/* ======================================================================== */
+/* =======================  STAKING TERMINAL BACKEND  ===================== */
+/* ======================================================================== */
+
+/* ---- Staking + reward pool config ---- */
+
+const STAKE_REWARD_RATES = { 30: 0.05, 60: 0.125, 90: 0.25 }; // matches UI
+const STAKE_CAP_PER_WALLET = 100000;
+const STAKE_GLOBAL_CAP = Number(process.env.STAKE_GLOBAL_CAP || "0");
+
+const REWARD_POOL_PUBKEY = process.env.REWARD_POOL_PUBKEY || "";
+const REWARD_POOL_SECRET = process.env.REWARD_POOL_SECRET || "";
+const FART_MINT_STR =
+  process.env.FART_MINT || "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
+const FART_DECIMALS = Number(process.env.FART_DECIMALS || "6");
+const SOLANA_RPC_URL =
+  process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com";
+
+if (!REWARD_POOL_PUBKEY) {
+  warn("[staking] REWARD_POOL_PUBKEY not set — /api/staking/claim will fail");
+}
+if (!REWARD_POOL_SECRET) {
+  warn("[staking] REWARD_POOL_SECRET not set — /api/staking/claim will fail");
+}
+
+const stakingConnection = new web3.Connection(SOLANA_RPC_URL, "confirmed");
+
+/* ---- Staking helpers ---- */
+
+function getRewardRate(durationDays) {
+  return STAKE_REWARD_RATES[durationDays] ?? 0;
+}
+
+function calcEndsAt(startedAt, durationDays) {
+  const ms = durationDays * 24 * 60 * 60 * 1000;
+  return new Date(startedAt.getTime() + ms);
+}
+
+// "all at the end" reward: 0 until matured, full reward when finished
+function computeStakeAccrual(stakeRow, now = new Date()) {
+  const {
+    amount,
+    duration_days,
+    started_at,
+    ends_at,
+    claimed_total = 0,
+    reward_rate,
+  } = stakeRow;
+
+  const amt = Number(amount || 0);
+  const durationDays = Number(duration_days || 0);
+  const rate =
+    reward_rate != null ? Number(reward_rate) : getRewardRate(durationDays);
+  const maxReward = +(amt * rate).toFixed(6);
+
+  if (!amt || !durationDays || !rate) {
+    return { maxReward: 0, accrued: 0, unclaimed: 0, matured: false };
+  }
+
+  const start = new Date(started_at);
+  const end = ends_at ? new Date(ends_at) : calcEndsAt(start, durationDays);
+  const matured = now.getTime() >= end.getTime();
+
+  if (!matured) {
+    return { maxReward, accrued: 0, unclaimed: 0, matured: false };
+  }
+
+  const accrued = maxReward;
+  const unclaimed = Math.max(
+    0,
+    +(accrued - Number(claimed_total || 0)).toFixed(6)
+  );
+
+  return { maxReward, accrued, unclaimed, matured: true };
+}
+
+function loadPoolKeypair() {
+  if (!REWARD_POOL_SECRET) throw new Error("REWARD_POOL_SECRET not set");
+  try {
+    // JSON array case
+    const arr = JSON.parse(REWARD_POOL_SECRET);
+    return web3.Keypair.fromSecretKey(Uint8Array.from(arr));
+  } catch {
+    // base58 case (Phantom style)
+    const secret = bs58.decode(REWARD_POOL_SECRET);
+    return web3.Keypair.fromSecretKey(secret);
+  }
+}
+
+/**
+ * Send FART from pool wallet to `toWallet`.
+ * amountFart is in human units, e.g. 123.45
+ */
+async function sendFartFromPool(toWallet, amountFart) {
+  const poolKp = loadPoolKeypair();
+  const poolPubkey = poolKp.publicKey;
+  const userPubkey = new web3.PublicKey(toWallet);
+  const mint = new web3.PublicKey(FART_MINT_STR);
+
+  // convert to smallest units
+  const raw = Math.round(amountFart * Math.pow(10, FART_DECIMALS));
+  if (!Number.isFinite(raw) || raw <= 0) {
+    throw new Error(`Invalid FART amount: ${amountFart}`);
+  }
+
+  const amountRaw = BigInt(raw);
+
+  const poolAta = await getOrCreateAssociatedTokenAccount(
+    stakingConnection,
+    poolKp,
+    mint,
+    poolPubkey
+  );
+
+  const userAta = await getOrCreateAssociatedTokenAccount(
+    stakingConnection,
+    poolKp,
+    mint,
+    userPubkey
+  );
+
+  const ix = createTransferInstruction(
+    poolAta.address,
+    userAta.address,
+    poolPubkey,
+    Number(amountRaw),
+    [],
+    SPL_TOKEN_PROGRAM_ID
+  );
+
+  const tx = new web3.Transaction().add(ix);
+  tx.feePayer = poolPubkey;
+  const { blockhash } = await stakingConnection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+
+  const sig = await web3.sendAndConfirmTransaction(
+    stakingConnection,
+    tx,
+    [poolKp],
+    { commitment: "confirmed" }
+  );
+
+  log("[staking] FART sent from pool →", toWallet, "amount=", amountFart);
+  return sig;
+}
+
+/* ---- /api/staking/state ---- */
+/*
+GET /api/staking/state?wallet=<pubkey>
+  -> {
+       wallet,
+       black: { available, staked_total },
+       fart:  { claimable },
+       stakes: [
+         { id, amount, duration_days, start_ts, end_ts, status, reward_est, tx? }
+       ]
+     }
+*/
+app.get("/api/staking/state", async (req, res) => {
+  const wallet = String(req.query.wallet || "").trim();
+  if (!wallet) {
+    return res.status(400).json({ error: "wallet is required" });
+  }
+
+  try {
+    const { data: stakeRows, error } = await supabase
+      .from("hub_stakes")
+      .select("*")
+      .eq("wallet", wallet)
+      .order("started_at", { ascending: false });
+
+    if (error) {
+      err("[staking/state] select error:", error.message);
+      return res.status(500).json({ error: "Failed to load stakes" });
+    }
+
+    let walletStakedTotal = 0;
+    let walletClaimableTotal = 0;
+    const now = new Date();
+
+    const stakes = (stakeRows || []).map((row) => {
+      const { maxReward, unclaimed, matured } = computeStakeAccrual(row, now);
+
+      if (row.status === "active") {
+        walletStakedTotal += Number(row.amount || 0);
+      }
+
+      if (matured && unclaimed > 0 && (row.status === "active" || row.status === "settled")) {
+        walletClaimableTotal += unclaimed;
+      }
+
+      return {
+        id: row.id,
+        wallet: row.wallet,
+        amount: Number(row.amount || 0),
+        duration_days: Number(row.duration_days || 0),
+        reward_rate: Number(
+          row.reward_rate != null
+            ? row.reward_rate
+            : getRewardRate(row.duration_days)
+        ),
+        max_reward: maxReward,
+        start_ts: row.started_at,
+        end_ts: row.ends_at,
+        status: row.status,
+        claimed_total: Number(row.claimed_total || 0),
+        reward_est: maxReward,
+        tx: row.tx || null,
+      };
+    });
+
+    // For now, "available" = remaining room under per-wallet cap
+    // so UI can stake up to the cap without on-chain BAL yet.
+    const blackAvailable = Math.max(
+      0,
+      STAKE_CAP_PER_WALLET - walletStakedTotal
+    );
+
+    return res.json({
+      wallet,
+      black: {
+        available: blackAvailable,
+        staked_total: walletStakedTotal,
+      },
+      fart: {
+        claimable: walletClaimableTotal,
+      },
+      stakes,
+    });
+  } catch (e) {
+    err("[staking/state] exception:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/* ---- /api/staking/stake ---- */
+/*
+POST /api/staking/stake
+  { wallet, amount, duration_days }
+*/
+app.post("/api/staking/stake", async (req, res) => {
+  const { wallet, amount, duration_days } = req.body || {};
+  const w = String(wallet || "").trim();
+  const amt = Number(amount || 0);
+  const dur = Number(duration_days || 0);
+
+  if (!w || !amt || !dur) {
+    return res
+      .status(400)
+      .json({ error: "wallet, amount, duration_days required" });
+  }
+  if (!STAKE_REWARD_RATES[dur]) {
+    return res.status(400).json({ error: "Invalid duration" });
+  }
+  if (amt <= 0) {
+    return res.status(400).json({ error: "Amount must be > 0" });
+  }
+
+  try {
+    // Per-wallet cap
+    const { data: activeRows, error: actErr } = await supabase
+      .from("hub_stakes")
+      .select("amount")
+      .eq("wallet", w)
+      .eq("status", "active");
+
+    if (actErr) {
+      err("[staking/stake] walletActive error:", actErr.message);
+      return res
+        .status(500)
+        .json({ error: "Failed to check wallet cap" });
+    }
+
+    const currentActive = (activeRows || []).reduce(
+      (sum, r) => sum + Number(r.amount || 0),
+      0
+    );
+    if (currentActive + amt > STAKE_CAP_PER_WALLET) {
+      return res.status(400).json({
+        error: `Per-wallet cap exceeded (${STAKE_CAP_PER_WALLET.toLocaleString()} BLACK)`,
+      });
+    }
+
+    // Optional global cap
+    if (STAKE_GLOBAL_CAP > 0) {
+      const { data: allActive, error: gErr } = await supabase
+        .from("hub_stakes")
+        .select("amount")
+        .eq("status", "active");
+
+      if (gErr) {
+        err("[staking/stake] globalActive error:", gErr.message);
+        return res
+          .status(500)
+          .json({ error: "Failed to check global cap" });
+      }
+
+      const globalActive = (allActive || []).reduce(
+        (sum, r) => sum + Number(r.amount || 0),
+        0
+      );
+      if (globalActive + amt > STAKE_GLOBAL_CAP) {
+        return res
+          .status(400)
+          .json({ error: "Global staking cap reached." });
+      }
+    }
+
+    const now = new Date();
+    const rewardRate = getRewardRate(dur);
+    const maxReward = +(amt * rewardRate).toFixed(6);
+    const endsAt = calcEndsAt(now, dur);
+
+    const { data: inserted, error: insErr } = await supabase
+      .from("hub_stakes")
+      .insert({
+        wallet: w,
+        amount: amt,
+        duration_days: dur,
+        reward_rate: rewardRate,
+        max_reward: maxReward,
+        status: "active",
+        started_at: now.toISOString(),
+        ends_at: endsAt.toISOString(),
+        last_claim_at: now.toISOString(),
+        claimed_total: 0,
+      })
+      .select()
+      .maybeSingle();
+
+    if (insErr) {
+      err("[staking/stake] insert error:", insErr.message);
+      return res.status(500).json({ error: "Failed to create stake" });
+    }
+
+    return res.json({ ok: true, stake: inserted });
+  } catch (e) {
+    err("[staking/stake] exception:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/* ---- /api/staking/claim ---- */
+/*
+POST /api/staking/claim
+  { wallet }
+*/
+app.post("/api/staking/claim", async (req, res) => {
+  const { wallet } = req.body || {};
+  const w = String(wallet || "").trim();
+  if (!w) return res.status(400).json({ error: "wallet is required" });
+
+  try {
+    const { data: stakeRows, error } = await supabase
+      .from("hub_stakes")
+      .select("*")
+      .eq("wallet", w)
+      .in("status", ["active", "settled"]);
+
+    if (error) {
+      err("[staking/claim] select error:", error.message);
+      return res.status(500).json({ error: "Failed to load stakes" });
+    }
+
+    const now = new Date();
+    let totalClaimed = 0;
+    const updates = [];
+    const claimRows = [];
+
+    for (const row of stakeRows || []) {
+      const { maxReward, unclaimed, matured } = computeStakeAccrual(
+        row,
+        now
+      );
+      if (!matured || unclaimed <= 0) continue;
+
+      totalClaimed += unclaimed;
+
+      const newClaimedTotal = +(
+        Number(row.claimed_total || 0) + unclaimed
+      ).toFixed(6);
+
+      const update = {
+        id: row.id,
+        claimed_total: newClaimedTotal,
+        last_claim_at: now.toISOString(),
+      };
+
+      if (newClaimedTotal >= maxReward && row.status === "active") {
+        update.status = "settled";
+        update.ends_at = row.ends_at || now.toISOString();
+      }
+
+      updates.push(update);
+      claimRows.push({
+        wallet: w,
+        stake_id: row.id,
+        amount: unclaimed,
+        claimed_at: now.toISOString(),
+        tx: null,
+      });
+    }
+
+    if (totalClaimed <= 0) {
+      return res.json({ ok: true, amount_claimed: 0 });
+    }
+
+    // Send FART from pool → user
+    let txSig;
+    try {
+      txSig = await sendFartFromPool(w, totalClaimed);
+    } catch (sendErr) {
+      err("[staking/claim] sendFartFromPool error:", sendErr);
+      return res
+        .status(500)
+        .json({ error: "Reward transfer failed" });
+    }
+
+    const claimRowsWithTx = claimRows.map((c) => ({
+      ...c,
+      tx: txSig,
+    }));
+
+    // Apply updates
+    for (const u of updates) {
+      const { error: updErr } = await supabase
+        .from("hub_stakes")
+        .update({
+          claimed_total: u.claimed_total,
+          last_claim_at: u.last_claim_at,
+          ...(u.status ? { status: u.status, ends_at: u.ends_at } : {}),
+        })
+        .eq("id", u.id);
+      if (updErr) {
+        err(
+          "[staking/claim] update stake error:",
+          updErr.message || updErr
+        );
+      }
+    }
+
+    const { error: insErr } = await supabase
+      .from("hub_stake_claims")
+      .insert(claimRowsWithTx);
+    if (insErr) {
+      err("[staking/claim] insert history error:", insErr.message);
+    }
+
+    return res.json({ ok: true, amount_claimed: totalClaimed, tx: txSig });
+  } catch (e) {
+    err("[staking/claim] exception:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/* ---- /api/staking/unstake ---- */
+/*
+POST /api/staking/unstake
+  { wallet, stake_id }
+*/
+app.post("/api/staking/unstake", async (req, res) => {
+  const { wallet, stake_id } = req.body || {};
+  const w = String(wallet || "").trim();
+
+  if (!w || !stake_id) {
+    return res
+      .status(400)
+      .json({ error: "wallet and stake_id required" });
+  }
+
+  try {
+    const { data: row, error } = await supabase
+      .from("hub_stakes")
+      .select("*")
+      .eq("id", stake_id)
+      .eq("wallet", w)
+      .maybeSingle();
+
+    if (error || !row) {
+      err("[staking/unstake] select error:", error?.message || error);
+      return res.status(404).json({ error: "Stake not found" });
+    }
+    if (row.status !== "active") {
+      return res.status(400).json({ error: "Stake not active" });
+    }
+
+    const now = new Date();
+    const end = row.ends_at
+      ? new Date(row.ends_at)
+      : calcEndsAt(new Date(row.started_at), row.duration_days);
+    const matured = now.getTime() >= end.getTime();
+
+    const newStatus = matured ? "settled" : "unstaked";
+
+    const { error: updErr } = await supabase
+      .from("hub_stakes")
+      .update({
+        status: newStatus,
+        ends_at: matured
+          ? row.ends_at || now.toISOString()
+          : now.toISOString(),
+      })
+      .eq("id", stake_id);
+
+    if (updErr) {
+      err("[staking/unstake] update error:", updErr.message);
+      return res.status(500).json({ error: "Failed to update stake" });
+    }
+
+    return res.json({ ok: true, status: newStatus });
+  } catch (e) {
+    err("[staking/unstake] exception:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/* ---- /api/fartcoin/pool-balance ---- */
+/*
+GET /api/fartcoin/pool-balance?wallet=<POOL_WALLET>
+  -> { wallet, fart_balance, updated_at }
+*/
+app.get("/api/fartcoin/pool-balance", async (req, res) => {
+  const wallet =
+    String(req.query.wallet || REWARD_POOL_PUBKEY || "").trim();
+  if (!wallet) {
+    return res.status(400).json({ error: "wallet required" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("hub_stake_pool")
+      .select("wallet, fart_balance, updated_at")
+      .eq("wallet", wallet)
+      .maybeSingle();
+
+    if (error) {
+      err("[pool-balance] select error:", error.message);
+      return res
+        .status(500)
+        .json({ error: "Failed to load pool balance" });
+    }
+
+    if (!data) {
+      return res.json({
+        wallet,
+        fart_balance: 0,
+        updated_at: null,
+      });
+    }
+
+    return res.json({
+      wallet: data.wallet,
+      fart_balance: Number(data.fart_balance || 0),
+      updated_at: data.updated_at,
+    });
+  } catch (e) {
+    err("[pool-balance] exception:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
 });
 
 /* ---------- WebSocket + Realtime ---------- */
