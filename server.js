@@ -814,6 +814,175 @@ async function getSolUsd() {
   return SOL_CACHE.priceUsd ?? 0;
 }
 
+/* ---------- Automatic burn watcher (CTO → burn wallet) ---------- */
+
+const BURN_POLL_INTERVAL_MS = 60_000;
+let burnPollInFlight = false;
+let burnPollTimer = null;
+
+function sumUiTokenAmount(arr) {
+  return arr.reduce((sum, b) => {
+    const ui =
+      b?.uiTokenAmount?.uiAmountString ??
+      b?.uiTokenAmount?.uiAmount ??
+      "0";
+    return sum + Number(ui || 0);
+  }, 0);
+}
+
+async function pullAndRecordNewBurns() {
+  if (!HELIUS_KEY) return;
+  if (!BURN_DESTINATION_WALLET) return;
+
+  try {
+    // 1) Get recent signatures for the burn source (CTO wallet by default)
+    const sigInfos = await rpc("getSignaturesForAddress", [
+      BURN_SOURCE_WALLET,
+      { limit: 25, commitment: "confirmed" },
+    ]);
+
+    if (!Array.isArray(sigInfos) || !sigInfos.length) return;
+
+    for (const info of sigInfos) {
+      const sig = info.signature;
+      if (!sig) continue;
+
+      // 2) Skip if we already have this signature recorded
+      let existing = null;
+      try {
+        const { data, error } = await supabase
+          .from("hub_burns")
+          .select("signature")
+          .eq("signature", sig)
+          .maybeSingle();
+        if (error) {
+          warn("[burn] existing check error:", error.message);
+        }
+        existing = data;
+      } catch (e) {
+        warn("[burn] existing check exception:", e?.message || e);
+      }
+      if (existing) continue;
+
+      // 3) Load the full transaction (parsed)
+      let tx;
+      try {
+        tx = await rpc("getTransaction", [
+          sig,
+          {
+            encoding: "jsonParsed",
+            maxSupportedTransactionVersion: 0,
+          },
+        ]);
+      } catch (txErr) {
+        warn("[burn] getTransaction failed:", txErr?.message || txErr);
+        continue;
+      }
+
+      const meta = tx?.meta;
+      if (!meta) continue;
+      const pre = meta.preTokenBalances || [];
+      const post = meta.postTokenBalances || [];
+
+      // Only care about balances for the BLACK mint at the burn destination wallet
+      const preDest = pre.filter(
+        (b) =>
+          b.mint === TOKEN_MINT &&
+          b.owner === BURN_DESTINATION_WALLET
+      );
+      const postDest = post.filter(
+        (b) =>
+          b.mint === TOKEN_MINT &&
+          b.owner === BURN_DESTINATION_WALLET
+      );
+
+      const preDestAmount = sumUiTokenAmount(preDest);
+      const postDestAmount = sumUiTokenAmount(postDest);
+      const diff = +(postDestAmount - preDestAmount).toFixed(6);
+
+      // If the destination's BLACK balance increased, treat that increase as a burn
+      if (diff <= 0) continue;
+
+      const ts = (
+        info.blockTime
+          ? new Date(info.blockTime * 1000)
+          : new Date()
+      ).toISOString();
+
+      const { error: insErr } = await supabase
+        .from("hub_burns")
+        .insert({
+          wallet: BURN_SOURCE_WALLET,
+          token: TOKEN_MINT,
+          signature: sig,
+          amount: diff,      // amount in BLACK UI units
+          timestamp: ts,
+        });
+
+      if (insErr) {
+        // Ignore duplicate-key errors (in case of race / restart)
+        if (
+          insErr.code === "23505" ||
+          (insErr.details &&
+            insErr.details.includes("duplicate key value"))
+        ) {
+          continue;
+        }
+        warn("[burn] insert hub_burns error:", insErr.message);
+      } else {
+        log(
+          "[burn] Recorded burn",
+          diff,
+          "BLACK from",
+          BURN_SOURCE_WALLET,
+          "→",
+          BURN_DESTINATION_WALLET,
+          "tx=",
+          sig
+        );
+      }
+    }
+  } catch (e) {
+    err("[burn] pullAndRecordNewBurns exception:", e?.message || e);
+  }
+}
+
+function startBurnWatcher() {
+  if (!HELIUS_KEY) {
+    warn("[burn] HELIUS_API_KEY missing — burn watcher disabled");
+    return;
+  }
+  if (!BURN_DESTINATION_WALLET) {
+    warn(
+      "[burn] BURN_DESTINATION_WALLET not set — automatic burn tracking disabled"
+    );
+    return;
+  }
+
+  async function loop() {
+    if (burnPollInFlight) {
+      burnPollTimer = setTimeout(loop, BURN_POLL_INTERVAL_MS);
+      return;
+    }
+    burnPollInFlight = true;
+    try {
+      await pullAndRecordNewBurns();
+    } finally {
+      burnPollInFlight = false;
+      burnPollTimer = setTimeout(loop, BURN_POLL_INTERVAL_MS);
+    }
+  }
+
+  log(
+    "[burn] Starting automatic burn watcher for",
+    BURN_SOURCE_WALLET,
+    "→",
+    BURN_DESTINATION_WALLET
+  );
+  loop();
+}
+
+
 /* ---------- Server-side getTokenMeta uses local resolver (no HTTP) ---------- */
 async function getTokenMeta(mint) {
   const now = Date.now();
@@ -1034,25 +1203,116 @@ async function getWalletSnapshot(
   return { sol, token: tokenAmount };
 }
 
-/* === Latest burn info for CTO wallet (static for now) === */
-async function getLatestBurnTx() {
-  // TODO: update these to match the real burn data if needed
-  const signature =
-    "LHuJKS5eSaby7mSgYp8gC7sv4w5y76kipajqsDcZDaA6fGnFF6zYjYM5r8B6Rs6o8m7NmitapXuvGafNeSZvumU";
+/* === Latest burn info for CTO wallet (auto via Helius) === */
 
-  // Amount in BLACK (UI units, NOT raw on-chain units)
-  const amountUi = 1180000; // 1,180,000 $BlackCoin burned
+// simple in-memory cache so we don't hammer Helius
+const BURN_CACHE = { ts: 0, payload: null };
+const BURN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const BURN_SEARCH_LIMIT = 50; // how many recent txs from CTO wallet to scan
 
-  // When the burn tx happened (UTC, ISO8601)
-  const timestamp = "2025-01-31T17:42:00Z";
+function extractBurnFromParsedTx(tx) {
+  const matches = [];
 
-  return {
-    amount: amountUi,
-    amountDisplay: `${amountUi.toLocaleString()} $BlackCoin`,
-    timestamp,
-    signature,
-    explorer: `https://solscan.io/tx/${signature}`,
+  const pushIx = (ix) => {
+    if (!ix) return;
+    const parsed = ix.parsed;
+    if (!parsed || typeof parsed !== "object") return;
+    const type = parsed.type;
+    const info = parsed.info || {};
+    if (type === "burn" && info.mint === TOKEN_MINT) {
+      matches.push(info);
+    }
   };
+
+  // top-level instructions
+  const topIxs = tx?.transaction?.message?.instructions || [];
+  for (const ix of topIxs) pushIx(ix);
+
+  // inner instructions (in case burn is inside another program)
+  const inner = tx?.meta?.innerInstructions || [];
+  for (const innerIx of inner) {
+    if (Array.isArray(innerIx.instructions)) {
+      for (const ix of innerIx.instructions) pushIx(ix);
+    }
+  }
+
+  return matches[0] || null;
+}
+
+async function fetchLatestBurnFromHelius() {
+  // 1) grab recent signatures for the CTO wallet
+  const sigInfos = await rpc("getSignaturesForAddress", [
+    CTO_WALLET,
+    { limit: BURN_SEARCH_LIMIT },
+  ]);
+
+  if (!Array.isArray(sigInfos) || !sigInfos.length) return null;
+
+  // 2) we need decimals + symbol to convert amount
+  const meta = await getTokenMeta(TOKEN_MINT);
+  const decimals =
+    typeof meta.decimals === "number" ? meta.decimals : 6;
+  const symbol = meta.symbol || "BlackCoin";
+
+  // 3) walk newest → oldest until we find a burn for our mint
+  for (const info of sigInfos) {
+    const sig = info.signature;
+    let tx;
+    try {
+      tx = await rpc("getParsedTransaction", [
+        sig,
+        { maxSupportedTransactionVersion: 0, commitment: "confirmed" },
+      ]);
+    } catch (e) {
+      warn("[burn] getParsedTransaction error:", e?.message || e);
+      continue;
+    }
+    if (!tx) continue;
+
+    const burnInfo = extractBurnFromParsedTx(tx);
+    if (!burnInfo) continue;
+    if (burnInfo.mint !== TOKEN_MINT) continue;
+
+    const rawAmount = Number(burnInfo.amount || 0);
+    if (!rawAmount) continue;
+
+    const amountUi = rawAmount / Math.pow(10, decimals);
+
+    const ts = info.blockTime
+      ? new Date(info.blockTime * 1000).toISOString()
+      : new Date().toISOString();
+
+    return {
+      amount: amountUi,
+      amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
+      timestamp: ts,
+      signature: sig,
+      explorer: `https://solscan.io/tx/${sig}`,
+    };
+  }
+
+  return null;
+}
+
+async function getLatestBurnTx() {
+  const now = Date.now();
+  if (BURN_CACHE.payload && now - BURN_CACHE.ts < BURN_CACHE_TTL) {
+    return BURN_CACHE.payload;
+  }
+
+  try {
+    const payload = await fetchLatestBurnFromHelius();
+    if (payload) {
+      BURN_CACHE.payload = payload;
+      BURN_CACHE.ts = now;
+      return payload;
+    }
+  } catch (e) {
+    warn("getLatestBurnTx() failed:", e?.message || e);
+  }
+
+  // fall back to whatever we last had (or null)
+  return BURN_CACHE.payload;
 }
 
 
@@ -2263,6 +2523,9 @@ setInterval(() => {
     // ignore
   }
 }, 60_000);
+
+// start automatic burn watcher (CTO → burn wallet)
+startBurnWatcher();
 
 server.listen(PORT, () => {
   log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
