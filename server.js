@@ -381,7 +381,8 @@ if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances and /api/wallets
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNvLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+// ✅ FIXED: correct SPL Token-2022 program id
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /* ---------- Solscan ---------- */
 const SOLSCAN_KEY = process.env.SOLSCAN_KEY || "";
@@ -844,17 +845,26 @@ function parseParsedAccount(acc) {
   };
 }
 
+// ✅ UPDATED: make Token-2022 lookup non-fatal
 async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
+  // Always fetch legacy SPL token accounts
   const legacy = await rpc("getTokenAccountsByOwner", [
     owner,
     { programId: TOKEN_PROGRAM_ID },
     { encoding: "jsonParsed", commitment },
   ]);
-  const t22 = await rpc("getTokenAccountsByOwner", [
-    owner,
-    { programId: TOKEN_2022_PROGRAM_ID },
-    { encoding: "jsonParsed", commitment },
-  ]);
+
+  // Token-2022 is best-effort only
+  let t22 = { value: [] };
+  try {
+    t22 = await rpc("getTokenAccountsByOwner", [
+      owner,
+      { programId: TOKEN_2022_PROGRAM_ID },
+      { encoding: "jsonParsed", commitment },
+    ]);
+  } catch (e) {
+    warn("getAllSplTokenAccounts: token-2022 lookup failed (non-fatal):", e?.message || e);
+  }
 
   const list = []
     .concat(legacy?.value || [], t22?.value || [])
