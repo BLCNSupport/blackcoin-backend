@@ -533,7 +533,7 @@ async function fetchHoldersViaHelius(mint) {
 
     const owners = new Set();
 
-    for (const acc of result || []) {
+    for (const acc of (result || [])) {
       const info = acc?.account?.data?.parsed?.info || {};
       const owner = info.owner || null;
 
@@ -714,12 +714,17 @@ async function getTokenMeta(mint) {
   try {
     const j = await resolveTokenMetaCombined(mint);
     const meta = {
-      symbol: j?.symbol || "",
-      name: j?.name || "",
-      logo: j?.image || "",
+      symbol:   j?.symbol || "",
+      name:     j?.name   || "",
+      logo:     j?.image  || "",
       decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
       tags: [],
       isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
+
+      // keep these so balances can use them
+      market_cap_usd: typeof j?.market_cap_usd === "number" ? j.market_cap_usd : undefined,
+      holders:        typeof j?.holders        === "number" ? j.holders        : undefined,
+      supply:         typeof j?.supply         === "number" ? j.supply         : undefined,
     };
     META_CACHE.set(mint, { ts: now, data: meta });
     return meta;
@@ -729,9 +734,9 @@ async function getTokenMeta(mint) {
       const v2 = await fetchJupiterV2ByMint(mint);
       const meta = {
         symbol: v2?.symbol || "",
-        name: v2?.name || "",
-        logo: v2?.image || "",
-        tags: Array.isArray(v2?.tags) ? v2.tags : [],
+        name:   v2?.name   || "",
+        logo:   v2?.image  || "",
+        tags:   Array.isArray(v2?.tags) ? v2.tags : [],
         isVerified: Boolean(v2?.symbol && v2?.name),
         decimals: typeof v2?.decimals === "number" ? v2.decimals : undefined,
       };
@@ -969,12 +974,17 @@ app.post("/api/balances", async (req, res) => {
           amount: t.amount,
           decimals,
           symbol: meta.symbol || "",
-          name: meta.name || "",
-          logo: meta.logo || "",
-          tags: meta.tags || [],
+          name:   meta.name   || "",
+          logo:   meta.logo   || "",
+          tags:   meta.tags   || [],
           isVerified: Boolean(meta.isVerified),
           priceUsd,
           usd,
+
+          // NEW: expose meta fields to frontend for wallet token popup
+          marketCapUsd: typeof meta.market_cap_usd === "number" ? meta.market_cap_usd : null,
+          holders:      typeof meta.holders        === "number" ? meta.holders        : null,
+          supply:       typeof meta.supply         === "number" ? meta.supply         : null,
         };
       })
     );
