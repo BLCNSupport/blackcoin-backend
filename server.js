@@ -28,25 +28,27 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:10000",
   "https://blackcoin-backend-1.onrender.com",
-  // Add your deployed Operator Hub / MainSite domains here, e.g.:
+  // Add your deployed frontends here, e.g.:
   // "https://blackcoin-operator-hub.onrender.com",
-  // "https://your-mainsite-domain.com",
+  // "https://your-main-site-domain.com",
 ];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow no-origin (Render health checks, curl, Postman, backend-to-backend, etc.)
+      // 1) Allow NO-ORIGIN calls (Render health checks, curl, Postman, etc.)
       if (!origin) {
         return callback(null, true);
       }
 
+      // 2) Allow whitelisted origins
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
+      // 3) For everything else: don't throw, just deny CORS quietly
       console.warn("[CORS] Blocked origin:", origin);
-      return callback(new Error("Origin not allowed by CORS"));
+      return callback(null, false); // <-- IMPORTANT: no Error here
     },
     credentials: true,
   })
