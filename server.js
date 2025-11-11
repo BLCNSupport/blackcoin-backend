@@ -1034,9 +1034,31 @@ async function getWalletSnapshot(
   return { sol, token: tokenAmount };
 }
 
+/* === Latest burn info for CTO wallet (static for now) === */
+async function getLatestBurnTx() {
+  // TODO: update these to match the real burn data if needed
+  const signature =
+    "LHuJKS5eSaby7mSgYp8gC7sv4w5y76kipajqsDcZDaA6fGnFF6zYjYM5r8B6Rs6o8m7NmitapXuvGafNeSZvumU";
+
+  // Amount in BLACK (UI units, NOT raw on-chain units)
+  const amountUi = 1180000; // 1,180,000 $BlackCoin burned
+
+  // When the burn tx happened (UTC, ISO8601)
+  const timestamp = "2025-01-31T17:42:00Z";
+
+  return {
+    amount: amountUi,
+    amountDisplay: `${amountUi.toLocaleString()} $BlackCoin`,
+    timestamp,
+    signature,
+    explorer: `https://solscan.io/tx/${signature}`,
+  };
+}
+
+
 /* Simple JSON for homepage vault cards:
  * {
- *   cto:      { sol, token },
+ *   cto:      { sol, token, burn?: { ... } },
  *   utility:  { sol, token }
  * }
  */
@@ -1048,12 +1070,22 @@ app.get("/api/wallets", async (_req, res) => {
         .json({ error: "HELIUS_API_KEY not configured on backend" });
     }
 
-    const [cto, utility] = await Promise.all([
+    const [ctoSnap, utilitySnap, burn] = await Promise.all([
       getWalletSnapshot(CTO_WALLET, TOKEN_MINT),
       getWalletSnapshot(UTILITY_WALLET, TOKEN_MINT),
+      getLatestBurnTx().catch((e) => {
+        warn("getLatestBurnTx failed (non-fatal):", e?.message || e);
+        return null;
+      }),
     ]);
 
-    res.json({ cto, utility });
+    res.json({
+      cto: {
+        ...ctoSnap,
+        burn: burn || null,
+      },
+      utility: utilitySnap,
+    });
   } catch (e) {
     err("/api/wallets error:", e);
     res
