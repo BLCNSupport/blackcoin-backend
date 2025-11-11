@@ -21,38 +21,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔒 Allowed frontends (add your production site when ready)
-const allowedOrigins = [
-  "http://127.0.0.1:8080",
-  "http://localhost:8080",
-  "https://blackcoin-backend-1.onrender.com",
-  // "https://your-main-site.com",   // ← add your real site here when deployed
-];
-
-app.use(
-  cors({
-    origin(origin, callback) {
-      // allow non-browser tools (curl, Postman, etc.) with no origin
-      if (!origin) return callback(null, true);
-
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      // Block anything else
-      return callback(new Error(`Origin ${origin} not allowed by CORS`));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-// Handle preflight requests explicitly
-app.options("*", cors());
-
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static("public")); // serves OperatorHub.html / index.html / Terminal Hub, etc.
-
 
 /* ---------- tiny log helpers ---------- */
 function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
@@ -562,7 +533,7 @@ async function fetchHoldersViaHelius(mint) {
 
     const owners = new Set();
 
-    for (const acc of (result || [])) {
+    for (const acc of result || []) {
       const info = acc?.account?.data?.parsed?.info || {};
       const owner = info.owner || null;
 
@@ -678,81 +649,15 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
 
 /* ---------- /api/token-meta HTTP ---------- */
 app.get("/api/token-meta", async (req, res) => {
-  // Explicit CORS just for this route (in addition to app.use(cors()))
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  try {
-    const mintRaw = req.query.mint;
-    const mint = (mintRaw ? String(mintRaw) : "").trim();
+  try{
+    const mint = String(req.query.mint || "").trim();
+    if (!mint) return res.status(400).json({ error:"mint required" });
     const nocache = String(req.query.nocache || "").toLowerCase() === "true";
-
-    if (!mint) {
-      return res.status(400).json({ error: "mint required" });
-    }
-
-    // Hard timeout so Render never 502s from a hung upstream
-    const TIMEOUT_MS = 8000;
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("resolveTokenMetaCombined timeout")), TIMEOUT_MS)
-    );
-
-    let payload;
-    try {
-      payload = await Promise.race([
-        resolveTokenMetaCombined(mint, { nocache }),
-        timeoutPromise,
-      ]);
-    } catch (inner) {
-      err("token-meta resolver error:", inner);
-      // Fallback minimal payload so the route still returns 200 JSON
-      payload = {
-        mint,
-        name: null,
-        symbol: null,
-        decimals: 0,
-        image: null,
-        description: null,
-        supply: 0,
-        price_usd: 0,
-        market_cap_usd: 0,
-        holders: null,
-        source: {
-          jupiter_v2: false,
-          helius: false,
-          dexscreener: false,
-          pump: false,
-          solscan: false,
-        },
-        updated_at: new Date().toISOString(),
-      };
-    }
-
+    const payload = await resolveTokenMetaCombined(mint, { nocache });
     res.json(payload);
-  } catch (e) {
-    err("token-meta outer error:", e);
-    // Still make sure the client gets *some* JSON rather than a 502 from the platform
-    res.status(200).json({
-      mint: null,
-      name: null,
-      symbol: null,
-      decimals: 0,
-      image: null,
-      description: null,
-      supply: 0,
-      price_usd: 0,
-      market_cap_usd: 0,
-      holders: null,
-      source: {
-        jupiter_v2: false,
-        helius: false,
-        dexscreener: false,
-        pump: false,
-        solscan: false,
-      },
-      updated_at: new Date().toISOString(),
-      error: "meta_failed",
-    });
+  }catch(e){
+    err("token-meta error:", e);
+    res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
   }
 });
 
@@ -809,17 +714,12 @@ async function getTokenMeta(mint) {
   try {
     const j = await resolveTokenMetaCombined(mint);
     const meta = {
-      symbol:   j?.symbol || "",
-      name:     j?.name   || "",
-      logo:     j?.image  || "",
+      symbol: j?.symbol || "",
+      name: j?.name || "",
+      logo: j?.image || "",
       decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
       tags: [],
       isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
-
-      // keep these so balances can use them
-      market_cap_usd: typeof j?.market_cap_usd === "number" ? j.market_cap_usd : undefined,
-      holders:        typeof j?.holders        === "number" ? j.holders        : undefined,
-      supply:         typeof j?.supply         === "number" ? j.supply         : undefined,
     };
     META_CACHE.set(mint, { ts: now, data: meta });
     return meta;
@@ -829,9 +729,9 @@ async function getTokenMeta(mint) {
       const v2 = await fetchJupiterV2ByMint(mint);
       const meta = {
         symbol: v2?.symbol || "",
-        name:   v2?.name   || "",
-        logo:   v2?.image  || "",
-        tags:   Array.isArray(v2?.tags) ? v2.tags : [],
+        name: v2?.name || "",
+        logo: v2?.image || "",
+        tags: Array.isArray(v2?.tags) ? v2.tags : [],
         isVerified: Boolean(v2?.symbol && v2?.name),
         decimals: typeof v2?.decimals === "number" ? v2.decimals : undefined,
       };
@@ -1069,17 +969,12 @@ app.post("/api/balances", async (req, res) => {
           amount: t.amount,
           decimals,
           symbol: meta.symbol || "",
-          name:   meta.name   || "",
-          logo:   meta.logo   || "",
-          tags:   meta.tags   || [],
+          name: meta.name || "",
+          logo: meta.logo || "",
+          tags: meta.tags || [],
           isVerified: Boolean(meta.isVerified),
           priceUsd,
           usd,
-
-          // NEW: expose meta fields to frontend for wallet token popup
-          marketCapUsd: typeof meta.market_cap_usd === "number" ? meta.market_cap_usd : null,
-          holders:      typeof meta.holders        === "number" ? meta.holders        : null,
-          supply:       typeof meta.supply         === "number" ? meta.supply         : null,
         };
       })
     );
