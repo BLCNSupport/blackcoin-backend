@@ -1582,7 +1582,7 @@ app.get("/api/staking/state", async (req, res) => {
 
     return res.json({
       wallet,
-      black: {
+      BlackCoin: {
         available: blackAvailable,
         staked_total: walletStakedTotal,
       },
