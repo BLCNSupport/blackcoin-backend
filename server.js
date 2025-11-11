@@ -515,6 +515,49 @@ async function fetchSolscanMeta(mint){
   return null;
 }
 
+/* --- ADDED: Holder count via Helius RPC (distinct owners with > 0 balance) --- */
+async function fetchHoldersViaHelius(mint) {
+  if (!HELIUS_KEY) return null;
+  try {
+    const result = await rpc("getProgramAccounts", [
+      TOKEN_PROGRAM_ID,
+      {
+        encoding: "jsonParsed",
+        commitment: "confirmed",
+        filters: [
+          { dataSize: 165 },                // standard SPL token account size
+          { memcmp: { offset: 0, bytes: mint } }, // mint at offset 0
+        ],
+      },
+    ]);
+
+    const owners = new Set();
+
+    for (const acc of result || []) {
+      const info = acc?.account?.data?.parsed?.info || {};
+      const owner = info.owner || null;
+
+      const amt =
+        info.tokenAmount ||
+        info.uiTokenAmount ||
+        {};
+
+      const rawAmountStr = amt?.amount != null ? String(amt.amount) : null;
+
+      if (owner && rawAmountStr && rawAmountStr !== "0") {
+        owners.add(owner);
+      }
+    }
+
+    const count = owners.size;
+    log(`Helius holder count for ${mint}: ${count}`);
+    return count;
+  } catch (e) {
+    warn("fetchHoldersViaHelius failed:", e?.message || e);
+    return null;
+  }
+}
+
 function mergeMetaParts(...parts){
   const out = {};
   for (const p of parts) {
@@ -559,6 +602,14 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
   ]);
 
   let merged = mergeMetaParts(solscan, jupV2, hel, pump, dskr);
+
+  /* --- ADDED: if holders still missing, compute via Helius RPC --- */
+  if ((merged.holders == null || merged.holders === 0) && HELIUS_KEY) {
+    const hCount = await fetchHoldersViaHelius(mint);
+    if (typeof hCount === "number" && hCount > 0) {
+      merged.holders = hCount;
+    }
+  }
 
   // compute market cap if missing but price & supply are present
   if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
