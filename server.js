@@ -378,16 +378,34 @@ const TTL_META    = 6 * 60 * 60 * 1000;
 const TTL_SOL     = 25_000;
 const TTL_JUP_V2  = 15 * 60 * 1000; // 15m for token search
 
+// Limit size of in-memory caches to avoid unbounded growth
+const CACHE_LIMIT = 500;
+function setWithLimit(map, key, value) {
+  if (map.size >= CACHE_LIMIT) {
+    const firstKey = map.keys().next().value;
+    if (firstKey !== undefined) map.delete(firstKey);
+  }
+  map.set(key, value);
+}
+
+
 /* ---------- Token Meta Resolver (shared) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 const MEMO_META = new Map();
-function memoGetMeta(mint){
+
+function memoGetMeta(mint) {
   const e = MEMO_META.get(mint);
   if (!e) return null;
-  if (Date.now() - e.t > META_TTL_MS) { MEMO_META.delete(mint); return null; }
+  if (Date.now() - e.t > META_TTL_MS) {
+    MEMO_META.delete(mint);
+    return null;
+  }
   return e.v;
 }
-function memoSetMeta(mint, v){ MEMO_META.set(mint, { v, t: Date.now() }); }
+
+function memoSetMeta(mint, v) {
+  setWithLimit(MEMO_META, mint, { v, t: Date.now() });
+}
 
 /* ------- Jupiter Tokens API v2 helpers ------- */
 async function jupV2Search(query) {
@@ -399,7 +417,7 @@ async function jupV2Search(query) {
   const r = await fetch(url, { headers: { accept: "application/json" } });
   if (!r.ok) throw new Error(`Jupiter v2 search HTTP ${r.status}`);
   const data = await r.json();
-  JUP_V2_CACHE.set(key, { data, ts: now });
+  setWithLimit(JUP_V2_CACHE, key, { data, ts: now });
   return data;
 }
 
@@ -726,7 +744,7 @@ async function getTokenMeta(mint) {
       holders:        typeof j?.holders        === "number" ? j.holders        : undefined,
       supply:         typeof j?.supply         === "number" ? j.supply         : undefined,
     };
-    META_CACHE.set(mint, { ts: now, data: meta });
+    setWithLimit(META_CACHE, mint, { ts: now, data: meta });
     return meta;
   } catch {
     // fallback: Jupiter v2 direct
@@ -740,11 +758,11 @@ async function getTokenMeta(mint) {
         isVerified: Boolean(v2?.symbol && v2?.name),
         decimals: typeof v2?.decimals === "number" ? v2.decimals : undefined,
       };
-      META_CACHE.set(mint, { ts: now, data: meta });
+      setWithLimit(META_CACHE, mint, { ts: now, data: meta });
       return meta;
     } catch {}
     const meta = { symbol:"", name:"", logo:"", tags:[], isVerified:false, decimals: undefined };
-    META_CACHE.set(mint, { ts: now, data: meta });
+    setWithLimit(META_CACHE, mint, { ts: now, data: meta });
     return meta;
   }
 }
@@ -759,7 +777,7 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
 
   const setAndMaybeBroadcast = (val) => {
     const prev = PRICE_CACHE.get(mint)?.priceUsd;
-    PRICE_CACHE.set(mint, { ts: now, priceUsd: val });
+    setWithLimit(PRICE_CACHE, mint, { ts: now, priceUsd: val });
     if (typeof wsBroadcastAll === "function" && val > 0 && val !== prev) {
       try { wsBroadcastAll({ type: "price", mint, priceUsd: val }); } catch {}
     }
@@ -794,7 +812,7 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
     }
   } catch {}
 
-  PRICE_CACHE.set(mint, { ts: now, priceUsd: 0 });
+  setWithLimit(PRICE_CACHE, mint, { ts: now, priceUsd: 0 });
   return 0;
 }
 
@@ -1280,6 +1298,18 @@ function subscribeToBroadcasts() {
   }
 }
 subscribeToBroadcasts();
+
+// Periodic memory usage log to help detect leaks in production
+setInterval(() => {
+  try {
+    const { rss, heapUsed, heapTotal } = process.memoryUsage();
+    const mb = (n) => (n / 1024 / 1024).toFixed(1);
+    log(`[MEM] rss=${mb(rss)}MB heapUsed=${mb(heapUsed)}MB heapTotal=${mb(heapTotal)}MB`);
+  } catch (e) {
+    // non-fatal
+  }
+}, 60_000);
+
 
 /* ---------- Start ---------- */
 server.listen(PORT, () => {
