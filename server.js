@@ -649,15 +649,81 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
 
 /* ---------- /api/token-meta HTTP ---------- */
 app.get("/api/token-meta", async (req, res) => {
-  try{
-    const mint = String(req.query.mint || "").trim();
-    if (!mint) return res.status(400).json({ error:"mint required" });
+  // Explicit CORS just for this route (in addition to app.use(cors()))
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  try {
+    const mintRaw = req.query.mint;
+    const mint = (mintRaw ? String(mintRaw) : "").trim();
     const nocache = String(req.query.nocache || "").toLowerCase() === "true";
-    const payload = await resolveTokenMetaCombined(mint, { nocache });
+
+    if (!mint) {
+      return res.status(400).json({ error: "mint required" });
+    }
+
+    // Hard timeout so Render never 502s from a hung upstream
+    const TIMEOUT_MS = 8000;
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("resolveTokenMetaCombined timeout")), TIMEOUT_MS)
+    );
+
+    let payload;
+    try {
+      payload = await Promise.race([
+        resolveTokenMetaCombined(mint, { nocache }),
+        timeoutPromise,
+      ]);
+    } catch (inner) {
+      err("token-meta resolver error:", inner);
+      // Fallback minimal payload so the route still returns 200 JSON
+      payload = {
+        mint,
+        name: null,
+        symbol: null,
+        decimals: 0,
+        image: null,
+        description: null,
+        supply: 0,
+        price_usd: 0,
+        market_cap_usd: 0,
+        holders: null,
+        source: {
+          jupiter_v2: false,
+          helius: false,
+          dexscreener: false,
+          pump: false,
+          solscan: false,
+        },
+        updated_at: new Date().toISOString(),
+      };
+    }
+
     res.json(payload);
-  }catch(e){
-    err("token-meta error:", e);
-    res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
+  } catch (e) {
+    err("token-meta outer error:", e);
+    // Still make sure the client gets *some* JSON rather than a 502 from the platform
+    res.status(200).json({
+      mint: null,
+      name: null,
+      symbol: null,
+      decimals: 0,
+      image: null,
+      description: null,
+      supply: 0,
+      price_usd: 0,
+      market_cap_usd: 0,
+      holders: null,
+      source: {
+        jupiter_v2: false,
+        helius: false,
+        dexscreener: false,
+        pump: false,
+        solscan: false,
+      },
+      updated_at: new Date().toISOString(),
+      error: "meta_failed",
+    });
   }
 });
 
