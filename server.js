@@ -21,9 +21,38 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// 🔒 Allowed frontends (add your production site when ready)
+const allowedOrigins = [
+  "http://127.0.0.1:8080",
+  "http://localhost:8080",
+  "https://blackcoin-backend-1.onrender.com",
+  // "https://your-main-site.com",   // ← add your real site here when deployed
+];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // allow non-browser tools (curl, Postman, etc.) with no origin
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // Block anything else
+      return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// Handle preflight requests explicitly
+app.options("*", cors());
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static("public")); // serves OperatorHub.html / index.html / Terminal Hub, etc.
+
 
 /* ---------- tiny log helpers ---------- */
 function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
