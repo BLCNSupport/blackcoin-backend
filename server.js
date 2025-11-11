@@ -1586,7 +1586,7 @@ app.get("/api/staking/state", async (req, res) => {
         available: blackAvailable,
         staked_total: walletStakedTotal,
       },
-      fart: {
+      Fartcoin: {
         claimable: walletClaimableTotal,
       },
       stakes,
