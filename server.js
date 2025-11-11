@@ -9,7 +9,7 @@
 
 import express from "express";
 import fetch from "node-fetch";
-import cors from "cors"; // kept import, even though we now use a custom handler
+import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
@@ -21,40 +21,38 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- Strong CORS + preflight handler ---------- */
-// This ensures ALL routes (including /api/balances) always send CORS headers,
-// and that OPTIONS preflight requests succeed cleanly.
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
-  );
-
-  if (req.method === "OPTIONS") {
-    // Short-circuit preflight with 200 + headers
-    return res.sendStatus(200);
-  }
-
-  next();
-});
+/* ---------- CORS ---------- */
+// Use cors() so all routes (/api/balances, /api/token-meta, etc.) are CORS-safe.
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  })
+);
+// Handle preflight
+app.options("*", cors());
 
 // Body parsing + static files
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static("public")); // serves OperatorHub.html / index.html / Terminal Hub, etc.
 
 /* ---------- tiny log helpers ---------- */
-function ts() { return `[${new Date().toTimeString().slice(0, 8)}]`; }
-const log  = (...a) => console.log(ts(), ...a);
+function ts() {
+  return `[${new Date().toTimeString().slice(0, 8)}]`;
+}
+const log = (...a) => console.log(ts(), ...a);
 const warn = (...a) => console.warn(ts(), ...a);
-const err  = (...a) => console.error(ts(), ...a);
+const err = (...a) => console.error(ts(), ...a);
 
 /* ---------- Supabase ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  err("Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY).");
+  err(
+    "Missing required env vars: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)."
+  );
   process.exit(1);
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -73,7 +71,9 @@ const UTILITY_WALLET = "8XuN2RbJHKHkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
-let isBackoff = false, fetchInProgress = false, pollTimer = null;
+let isBackoff = false,
+  fetchInProgress = false,
+  pollTimer = null;
 let memoryCache = [];
 
 async function insertPoint(point) {
@@ -161,18 +161,26 @@ pollLoop();
 /* ---------- Chart API ---------- */
 function bucketMs(interval) {
   switch (interval) {
-    case "1m":  return 60e3;
-    case "5m":  return 300e3;
-    case "30m": return 1800e3;
-    case "1h":  return 3600e3;
-    case "D":   return 86400e3;
-    default:    return 60e3;
+    case "1m":
+      return 60e3;
+    case "5m":
+      return 300e3;
+    case "30m":
+      return 1800e3;
+    case "1h":
+      return 3600e3;
+    case "D":
+      return 86400e3;
+    default:
+      return 60e3;
   }
 }
 function getWindow(interval) {
   const now = Date.now();
-  if (interval === "D")  return new Date(now - 30 * 86400e3).toISOString();
-  if (interval === "1h") return new Date(now - 7  * 86400e3).toISOString();
+  if (interval === "D")
+    return new Date(now - 30 * 86400e3).toISOString();
+  if (interval === "1h")
+    return new Date(now - 7 * 86400e3).toISOString();
   return new Date(now - 86400e3).toISOString();
 }
 function floorToBucketUTC(tsISO, interval) {
@@ -184,7 +192,9 @@ function bucketize(rows, interval) {
   const m = new Map();
   for (const r of rows) {
     const key = floorToBucketUTC(r.timestamp, interval).toISOString();
-    const price = +r.price, change = +r.change, vol = +r.volume;
+    const price = +r.price,
+      change = +r.change,
+      vol = +r.volume;
     if (!m.has(key)) {
       m.set(key, { timestamp: key, price, change, volume: 0 });
     }
@@ -217,7 +227,9 @@ app.get("/api/chart", async (req, res) => {
 
     const raw = data?.length
       ? data
-      : memoryCache.filter((p) => new Date(p.timestamp) >= new Date(cutoff));
+      : memoryCache.filter(
+          (p) => new Date(p.timestamp) >= new Date(cutoff)
+        );
 
     const points = bucketize(raw, interval);
     const latest = raw.length ? raw[raw.length - 1] : memoryCache.at(-1);
@@ -302,7 +314,9 @@ app.post("/api/profile", async (req, res) => {
       .maybeSingle();
 
     if (selErr) {
-      return res.status(500).json({ error: "select_failed", detail: selErr.message });
+      return res
+        .status(500)
+        .json({ error: "select_failed", detail: selErr.message });
     }
 
     const patch = { updated_at: new Date().toISOString() };
@@ -317,7 +331,10 @@ app.post("/api/profile", async (req, res) => {
         .select()
         .maybeSingle();
 
-      if (error) return res.status(500).json({ error: "update_failed", detail: error.message });
+      if (error)
+        return res
+          .status(500)
+          .json({ error: "update_failed", detail: error.message });
       return res.json({ success: true, profile: data });
     } else {
       const insertRow = { wallet, ...patch };
@@ -327,7 +344,10 @@ app.post("/api/profile", async (req, res) => {
         .select()
         .maybeSingle();
 
-      if (error) return res.status(500).json({ error: "insert_failed", detail: error.message });
+      if (error)
+        return res
+          .status(500)
+          .json({ error: "insert_failed", detail: error.message });
       return res.json({ success: true, profile: data });
     }
   } catch (e) {
@@ -337,66 +357,76 @@ app.post("/api/profile", async (req, res) => {
 });
 
 const upload = multer({ storage: multer.memoryStorage() });
-app.post("/api/avatar-upload", upload.single("avatar"), async (req, res) => {
-  try {
-    const { wallet } = req.body;
-    const file = req.file;
-    if (!wallet || !file) return res.status(400).json({ error: "Missing" });
+app.post(
+  "/api/avatar-upload",
+  upload.single("avatar"),
+  async (req, res) => {
+    try {
+      const { wallet } = req.body;
+      const file = req.file;
+      if (!wallet || !file)
+        return res.status(400).json({ error: "Missing" });
 
-    const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
-    const { error: uploadErr } = await supabase.storage
-      .from("hub_avatars")
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: true,
-      });
+      const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
+      const { error: uploadErr } = await supabase.storage
+        .from("hub_avatars")
+        .upload(fileName, file.buffer, {
+          contentType: file.mimetype,
+          upsert: true,
+        });
 
-    if (uploadErr) throw uploadErr;
+      if (uploadErr) throw uploadErr;
 
-    const { data: urlData } = supabase
-      .storage
-      .from("hub_avatars")
-      .getPublicUrl(fileName);
-    const url = urlData?.publicUrl || null;
+      const { data: urlData } = supabase.storage
+        .from("hub_avatars")
+        .getPublicUrl(fileName);
+      const url = urlData?.publicUrl || null;
 
-    const { error: updErr } = await supabase
-      .from("hub_profiles")
-      .upsert(
-        { wallet, avatar_url: url, updated_at: new Date().toISOString() },
-        { onConflict: "wallet" }
-      );
+      const { error: updErr } = await supabase
+        .from("hub_profiles")
+        .upsert(
+          { wallet, avatar_url: url, updated_at: new Date().toISOString() },
+          { onConflict: "wallet" }
+        );
 
-    if (updErr) throw updErr;
+      if (updErr) throw updErr;
 
-    res.json({ success: true, url });
-  } catch (e) {
-    err("Avatar upload error:", e);
-    res.status(500).json({ error: e.message });
+      res.json({ success: true, url });
+    } catch (e) {
+      err("Avatar upload error:", e);
+      res.status(500).json({ error: e.message });
+    }
   }
-});
+);
 
 /* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
-if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances and /api/wallets will 400 if called.");
+if (!HELIUS_KEY)
+  warn(
+    "HELIUS_API_KEY missing — /api/balances and /api/wallets will 400 if called."
+  );
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
-const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-// ✅ FIXED: correct SPL Token-2022 program id
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_PROGRAM_ID =
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+// ✅ correct SPL Token-2022 program id
+const TOKEN_2022_PROGRAM_ID =
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /* ---------- Solscan ---------- */
 const SOLSCAN_KEY = process.env.SOLSCAN_KEY || "";
-if (!SOLSCAN_KEY) warn("SOLSCAN_KEY not set — Solscan metadata will be skipped.");
+if (!SOLSCAN_KEY)
+  warn("SOLSCAN_KEY not set — Solscan metadata will be skipped.");
 
 /* ---------- Caches ---------- */
-const SOL_CACHE   = { priceUsd: null, ts: 0 };
-const META_CACHE  = new Map();  // mint -> { data, ts }
-const PRICE_CACHE = new Map();  // mint -> { priceUsd, ts }
+const SOL_CACHE = { priceUsd: null, ts: 0 };
+const META_CACHE = new Map(); // mint -> { data, ts }
+const PRICE_CACHE = new Map(); // mint -> { priceUsd, ts }
 const JUP_V2_CACHE = new Map(); // query -> { data, ts }
-const TTL_PRICE   = 15_000;     // 15s prices
-const TTL_META    = 6 * 60 * 60 * 1000;
-const TTL_SOL     = 25_000;
-const TTL_JUP_V2  = 15 * 60 * 1000; // 15m for token search
+const TTL_PRICE = 15_000; // 15s prices
+const TTL_META = 6 * 60 * 60 * 1000;
+const TTL_SOL = 25_000;
+const TTL_JUP_V2 = 15 * 60 * 1000; // 15m for token search
 
 const CACHE_LIMIT = 500;
 function setWithLimit(map, key, value) {
@@ -410,13 +440,18 @@ function setWithLimit(map, key, value) {
 /* ---------- Token Meta Resolver (shared) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 const MEMO_META = new Map();
-function memoGetMeta(mint){
+function memoGetMeta(mint) {
   const e = MEMO_META.get(mint);
   if (!e) return null;
-  if (Date.now() - e.t > META_TTL_MS) { MEMO_META.delete(mint); return null; }
+  if (Date.now() - e.t > META_TTL_MS) {
+    MEMO_META.delete(mint);
+    return null;
+  }
   return e.v;
 }
-function memoSetMeta(mint, v){ setWithLimit(MEMO_META, mint, { v, t: Date.now() }); }
+function memoSetMeta(mint, v) {
+  setWithLimit(MEMO_META, mint, { v, t: Date.now() });
+}
 
 /* ------- Jupiter Tokens API v2 helpers ------- */
 async function jupV2Search(query) {
@@ -424,7 +459,9 @@ async function jupV2Search(query) {
   const now = Date.now();
   const cached = JUP_V2_CACHE.get(key);
   if (cached && now - cached.ts < TTL_JUP_V2) return cached.data;
-  const url = `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(query)}`;
+  const url = `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(
+    query
+  )}`;
   const r = await fetch(url, { headers: { accept: "application/json" } });
   if (!r.ok) throw new Error(`Jupiter v2 search HTTP ${r.status}`);
   const data = await r.json();
@@ -436,13 +473,17 @@ async function fetchJupiterV2ByMint(mint) {
   try {
     const list = await jupV2Search(mint);
     if (!Array.isArray(list) || !list.length) return null;
-    const hit = list.find(t => (t.mint || "").toLowerCase() === mint.toLowerCase()) || list[0];
+    const hit =
+      list.find(
+        (t) => (t.mint || "").toLowerCase() === mint.toLowerCase()
+      ) || list[0];
     return {
       name: hit?.name || null,
       symbol: hit?.symbol || null,
-      decimals: typeof hit?.decimals === "number" ? hit.decimals : undefined,
+      decimals:
+        typeof hit?.decimals === "number" ? hit.decimals : undefined,
       image: hit?.logoURI || null,
-      tags: Array.isArray(hit?.tags) ? hit.tags : undefined
+      tags: Array.isArray(hit?.tags) ? hit.tags : undefined,
     };
   } catch {
     return null;
@@ -450,62 +491,90 @@ async function fetchJupiterV2ByMint(mint) {
 }
 
 /* ------- Other sources ------- */
-async function fetchHeliusDAS(mint){
-  try{
+async function fetchHeliusDAS(mint) {
+  try {
     const r = await fetch(HELIUS_RPC, {
       method: "POST",
-      headers: {"content-type":"application/json"},
-      body: JSON.stringify({ jsonrpc:"2.0", id:1, method:"getAsset", params:{ id: mint } })
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getAsset",
+        params: { id: mint },
+      }),
     });
     const j = await r.json();
     const a = j?.result;
     if (!a) return null;
-    const name   = a?.content?.metadata?.name || a?.token_info?.symbol || null;
-    const symbol = a?.token_info?.symbol || a?.content?.metadata?.symbol || null;
-    const image  = a?.content?.links?.image || null;
-    const desc   = a?.content?.metadata?.description || null;
+    const name =
+      a?.content?.metadata?.name || a?.token_info?.symbol || null;
+    const symbol =
+      a?.token_info?.symbol || a?.content?.metadata?.symbol || null;
+    const image = a?.content?.links?.image || null;
+    const desc = a?.content?.metadata?.description || null;
     const decimals = Number(a?.token_info?.decimals ?? 0);
-    const supply   = Number(a?.token_info?.supply ?? 0);
+    const supply = Number(a?.token_info?.supply ?? 0);
     return { name, symbol, image, description: desc, decimals, supply };
-  }catch{ return null; }
+  } catch {
+    return null;
+  }
 }
-async function fetchDexscreenerMeta(mint){
-  try{
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`);
+async function fetchDexscreenerMeta(mint) {
+  try {
+    const r = await fetch(
+      `https://api.dexscreener.com/latest/dex/search?q=${mint}`
+    );
     const j = await r.json();
     const p = j?.pairs?.[0];
     if (!p) return null;
     const holders = Number(p?.holders || 0);
     return {
       price_usd: Number(p?.priceUsd) || 0,
-      market_cap_usd: Number(p?.fdv || p?.marketCap || 0),
-      holders: holders > 0 ? holders : null
+      market_cap_usd:
+        Number(p?.fdv || p?.marketCap || 0),
+      holders: holders > 0 ? holders : null,
     };
-  }catch{ return null; }
+  } catch {
+    return null;
+  }
 }
-async function fetchPumpFunMeta(mint){
-  try{
-    const r = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
+async function fetchPumpFunMeta(mint) {
+  try {
+    const r = await fetch(
+      `https://frontend-api.pump.fun/coins/${mint}`
+    );
     if (!r.ok) return null;
     const j = await r.json();
-    return { description: j?.description || null, image: j?.image_uri || null };
-  }catch{ return null; }
+    return {
+      description: j?.description || null,
+      image: j?.image_uri || null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /* NEW: Solscan Pro token meta */
-async function fetchSolscanMeta(mint){
+async function fetchSolscanMeta(mint) {
   if (!SOLSCAN_KEY) return null;
   const headers = { accept: "application/json", token: SOLSCAN_KEY };
 
   // Try v1.1 first
   try {
-    const r = await fetch(`https://pro-api.solscan.io/v1.1/token/meta?tokenAddress=${mint}`, { headers });
+    const r = await fetch(
+      `https://pro-api.solscan.io/v1.1/token/meta?tokenAddress=${mint}`,
+      { headers }
+    );
     if (r.ok) {
       const j = await r.json();
       const d = j?.data || j;
       if (d) {
-        const price = Number(d?.priceUsdt ?? d?.price_usd ?? 0);
-        const mc    = Number(d?.marketCap ?? d?.market_cap ?? 0);
+        const price = Number(
+          d?.priceUsdt ?? d?.price_usd ?? 0
+        );
+        const mc = Number(
+          d?.marketCap ?? d?.market_cap ?? 0
+        );
         const holders = Number(d?.holder ?? d?.holders ?? 0);
         return {
           name: d?.name || null,
@@ -513,7 +582,7 @@ async function fetchSolscanMeta(mint){
           image: d?.icon || d?.image || null,
           price_usd: price > 0 ? price : undefined,
           market_cap_usd: mc > 0 ? mc : undefined,
-          holders: holders > 0 ? holders : undefined
+          holders: holders > 0 ? holders : undefined,
         };
       }
     }
@@ -521,13 +590,20 @@ async function fetchSolscanMeta(mint){
 
   // Fallback: v1
   try {
-    const r = await fetch(`https://pro-api.solscan.io/v1/token/meta?tokenAddress=${mint}`, { headers });
+    const r = await fetch(
+      `https://pro-api.solscan.io/v1/token/meta?tokenAddress=${mint}`,
+      { headers }
+    );
     if (r.ok) {
       const j = await r.json();
       const d = j?.data || j;
       if (d) {
-        const price = Number(d?.priceUsdt ?? d?.price_usd ?? 0);
-        const mc    = Number(d?.marketCap ?? d?.market_cap ?? 0);
+        const price = Number(
+          d?.priceUsdt ?? d?.price_usd ?? 0
+        );
+        const mc = Number(
+          d?.marketCap ?? d?.market_cap ?? 0
+        );
         const holders = Number(d?.holder ?? d?.holders ?? 0);
         return {
           name: d?.name || null,
@@ -535,7 +611,7 @@ async function fetchSolscanMeta(mint){
           image: d?.icon || d?.image || null,
           price_usd: price > 0 ? price : undefined,
           market_cap_usd: mc > 0 ? mc : undefined,
-          holders: holders > 0 ? holders : undefined
+          holders: holders > 0 ? holders : undefined,
         };
       }
     }
@@ -544,54 +620,11 @@ async function fetchSolscanMeta(mint){
   return null;
 }
 
-/* --- ADDED: Holder count via Helius RPC (distinct owners with > 0 balance) --- */
-async function fetchHoldersViaHelius(mint) {
-  if (!HELIUS_KEY) return null;
-  try {
-    const result = await rpc("getProgramAccounts", [
-      TOKEN_PROGRAM_ID,
-      {
-        encoding: "jsonParsed",
-        commitment: "confirmed",
-        filters: [
-          { dataSize: 165 },                // standard SPL token account size
-          { memcmp: { offset: 0, bytes: mint } }, // mint at offset 0
-        ],
-      },
-    ]);
-
-    const owners = new Set();
-
-    for (const acc of (result || [])) {
-      const info = acc?.account?.data?.parsed?.info || {};
-      const owner = info.owner || null;
-
-      const amt =
-        info.tokenAmount ||
-        info.uiTokenAmount ||
-        {};
-
-      const rawAmountStr = amt?.amount != null ? String(amt.amount) : null;
-
-      if (owner && rawAmountStr && rawAmountStr !== "0") {
-        owners.add(owner);
-      }
-    }
-
-    const count = owners.size;
-    log(`Helius holder count for ${mint}: ${count}`);
-    return count;
-  } catch (e) {
-    warn("fetchHoldersViaHelius failed:", e?.message || e);
-    return null;
-  }
-}
-
-function mergeMetaParts(...parts){
+function mergeMetaParts(...parts) {
   const out = {};
   for (const p of parts) {
     if (!p) continue;
-    for (const [k,v] of Object.entries(p)) {
+    for (const [k, v] of Object.entries(p)) {
       if (v == null || v === "" || v === 0) continue;
       if (out[k] == null || out[k] === "" || out[k] === 0) out[k] = v;
     }
@@ -600,7 +633,10 @@ function mergeMetaParts(...parts){
 }
 
 // shared implementation
-async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
+async function resolveTokenMetaCombined(
+  mint,
+  { nocache = false } = {}
+) {
   // in-memory memo
   if (!nocache) {
     const memo = memoGetMeta(mint);
@@ -615,7 +651,11 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
       .eq("mint", mint)
       .maybeSingle();
 
-    if (cached && (Date.now() - new Date(cached.updated_at).getTime() < META_TTL_MS)) {
+    if (
+      cached &&
+      Date.now() - new Date(cached.updated_at).getTime() <
+        META_TTL_MS
+    ) {
       memoSetMeta(mint, cached);
       return cached;
     }
@@ -627,22 +667,20 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
     fetchHeliusDAS(mint),
     fetchDexscreenerMeta(mint),
     fetchPumpFunMeta(mint),
-    fetchSolscanMeta(mint)
+    fetchSolscanMeta(mint),
   ]);
 
   let merged = mergeMetaParts(solscan, jupV2, hel, pump, dskr);
 
-  /* --- ADDED: if holders still missing, compute via Helius RPC --- */
-  if ((merged.holders == null || merged.holders === 0) && HELIUS_KEY) {
-    const hCount = await fetchHoldersViaHelius(mint);
-    if (typeof hCount === "number" && hCount > 0) {
-      merged.holders = hCount;
-    }
-  }
+  // NOTE: no heavy Helius holder scan here; we rely on Solscan/Dexscreener snapshot
+  // to avoid massive getProgramAccounts over the full token set.
 
   // compute market cap if missing but price & supply are present
-  if ((!merged.market_cap_usd || merged.market_cap_usd === 0) &&
-      merged.price_usd && merged.supply) {
+  if (
+    (!merged.market_cap_usd || merged.market_cap_usd === 0) &&
+    merged.price_usd &&
+    merged.supply
+  ) {
     merged.market_cap_usd = merged.price_usd * merged.supply;
   }
 
@@ -650,24 +688,36 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
     mint,
     name: merged.name || jupV2?.name || hel?.name || null,
     symbol: merged.symbol || jupV2?.symbol || hel?.symbol || null,
-    decimals: typeof merged.decimals === "number" ? merged.decimals :
-              (typeof jupV2?.decimals === "number" ? jupV2.decimals :
-               (typeof hel?.decimals === "number" ? hel.decimals : 0)),
+    decimals:
+      typeof merged.decimals === "number"
+        ? merged.decimals
+        : typeof jupV2?.decimals === "number"
+        ? jupV2.decimals
+        : typeof hel?.decimals === "number"
+        ? hel.decimals
+        : 0,
     image: merged.image || jupV2?.image || hel?.image || null,
     description: merged.description || pump?.description || null,
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
     market_cap_usd: Number(merged.market_cap_usd || 0),
-    holders: typeof merged.holders === "number" ? merged.holders : null,
+    holders:
+      typeof merged.holders === "number" ? merged.holders : null,
     source: {
-      jupiter_v2: !!jupV2, helius: !!hel, dexscreener: !!dskr, pump: !!pump, solscan: !!solscan
+      jupiter_v2: !!jupV2,
+      helius: !!hel,
+      dexscreener: !!dskr,
+      pump: !!pump,
+      solscan: !!solscan,
     },
-    updated_at: new Date().toISOString()
+    updated_at: new Date().toISOString(),
   };
 
   // upsert cache unless nocache requested
   try {
-    await supabase.from("token_meta").upsert(payload, { onConflict: "mint" });
+    await supabase
+      .from("token_meta")
+      .upsert(payload, { onConflict: "mint" });
   } catch (e) {
     warn("token_meta upsert failed (non-fatal):", e?.message || e);
   }
@@ -678,15 +728,18 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}){
 
 /* ---------- /api/token-meta HTTP ---------- */
 app.get("/api/token-meta", async (req, res) => {
-  try{
+  try {
     const mint = String(req.query.mint || "").trim();
-    if (!mint) return res.status(400).json({ error:"mint required" });
-    const nocache = String(req.query.nocache || "").toLowerCase() === "true";
+    if (!mint) return res.status(400).json({ error: "mint required" });
+    const nocache =
+      String(req.query.nocache || "").toLowerCase() === "true";
     const payload = await resolveTokenMetaCombined(mint, { nocache });
     res.json(payload);
-  }catch(e){
+  } catch (e) {
     err("token-meta error:", e);
-    res.status(500).json({ error:"meta_failed", detail:String(e?.message || e) });
+    res
+      .status(500)
+      .json({ error: "meta_failed", detail: String(e?.message || e) });
   }
 });
 
@@ -694,7 +747,8 @@ app.get("/api/token-meta", async (req, res) => {
 app.get("/api/jup/tokens/search", async (req, res) => {
   try {
     const query = (req.query.query || "").trim();
-    if (!query) return res.status(400).json({ error: "missing_query" });
+    if (!query)
+      return res.status(400).json({ error: "missing_query" });
     const data = await jupV2Search(query);
     res.json(data);
   } catch (e) {
@@ -712,13 +766,17 @@ async function rpc(method, params) {
   });
   if (!r.ok) throw new Error(`RPC ${method} HTTP ${r.status}`);
   const j = await r.json();
-  if (j.error) throw new Error(`RPC ${method} error: ${j.error.message || "unknown"}`);
+  if (j.error)
+    throw new Error(
+      `RPC ${method} error: ${j.error.message || "unknown"}`
+    );
   return j.result;
 }
 
 async function getSolUsd() {
   const now = Date.now();
-  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL_SOL) return SOL_CACHE.priceUsd;
+  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL_SOL)
+    return SOL_CACHE.priceUsd;
   try {
     const r = await fetch(
       "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=false"
@@ -743,17 +801,25 @@ async function getTokenMeta(mint) {
   try {
     const j = await resolveTokenMetaCombined(mint);
     const meta = {
-      symbol:   j?.symbol || "",
-      name:     j?.name   || "",
-      logo:     j?.image  || "",
-      decimals: typeof j?.decimals === "number" ? j.decimals : undefined,
+      symbol: j?.symbol || "",
+      name: j?.name || "",
+      logo: j?.image || "",
+      decimals:
+        typeof j?.decimals === "number" ? j.decimals : undefined,
       tags: [],
-      isVerified: Boolean(j?.market_cap_usd || j?.price_usd || j?.supply),
+      isVerified: Boolean(
+        j?.market_cap_usd || j?.price_usd || j?.supply
+      ),
 
       // keep these so balances can use them
-      market_cap_usd: typeof j?.market_cap_usd === "number" ? j.market_cap_usd : undefined,
-      holders:        typeof j?.holders        === "number" ? j.holders        : undefined,
-      supply:         typeof j?.supply         === "number" ? j.supply         : undefined,
+      market_cap_usd:
+        typeof j?.market_cap_usd === "number"
+          ? j.market_cap_usd
+          : undefined,
+      holders:
+        typeof j?.holders === "number" ? j.holders : undefined,
+      supply:
+        typeof j?.supply === "number" ? j.supply : undefined,
     };
     setWithLimit(META_CACHE, mint, { ts: now, data: meta });
     return meta;
@@ -763,16 +829,26 @@ async function getTokenMeta(mint) {
       const v2 = await fetchJupiterV2ByMint(mint);
       const meta = {
         symbol: v2?.symbol || "",
-        name:   v2?.name   || "",
-        logo:   v2?.image  || "",
-        tags:   Array.isArray(v2?.tags) ? v2.tags : [],
+        name: v2?.name || "",
+        logo: v2?.image || "",
+        tags: Array.isArray(v2?.tags) ? v2.tags : [],
         isVerified: Boolean(v2?.symbol && v2?.name),
-        decimals: typeof v2?.decimals === "number" ? v2.decimals : undefined,
+        decimals:
+          typeof v2?.decimals === "number"
+            ? v2.decimals
+            : undefined,
       };
       setWithLimit(META_CACHE, mint, { ts: now, data: meta });
       return meta;
     } catch {}
-    const meta = { symbol:"", name:"", logo:"", tags:[], isVerified:false, decimals: undefined };
+    const meta = {
+      symbol: "",
+      name: "",
+      logo: "",
+      tags: [],
+      isVerified: false,
+      decimals: undefined,
+    };
     setWithLimit(META_CACHE, mint, { ts: now, data: meta });
     return meta;
   }
@@ -789,16 +865,29 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
   const setAndMaybeBroadcast = (val) => {
     const prev = PRICE_CACHE.get(mint)?.priceUsd;
     setWithLimit(PRICE_CACHE, mint, { ts: now, priceUsd: val });
-    if (typeof wsBroadcastAll === "function" && val > 0 && val !== prev) {
-      try { wsBroadcastAll({ type: "price", mint, priceUsd: val }); } catch {}
+    if (
+      typeof wsBroadcastAll === "function" &&
+      val > 0 &&
+      val !== prev
+    ) {
+      try {
+        wsBroadcastAll({ type: "price", mint, priceUsd: val });
+      } catch {}
     }
     return val;
   };
 
   // 1) Jupiter Price API v3 (Lite)
   try {
-    const url = `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(mint)}`;
-    const r = await fetch(url, { headers: { accept: "application/json", "Cache-Control":"no-cache" } });
+    const url = `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(
+      mint
+    )}`;
+    const r = await fetch(url, {
+      headers: {
+        accept: "application/json",
+        "Cache-Control": "no-cache",
+      },
+    });
     if (r.ok) {
       const j = await r.json();
       const p = Number(j?.data?.[mint]?.price) || 0;
@@ -808,15 +897,24 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
 
   // 2) Fallback: Dexscreener search
   try {
-    const r2 = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(mint)}`, {
-      headers: { "Cache-Control": "no-cache" }
-    });
+    const r2 = await fetch(
+      `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(
+        mint
+      )}`,
+      {
+        headers: { "Cache-Control": "no-cache" },
+      }
+    );
     if (r2.ok) {
       const j2 = await r2.json();
       const pairs = Array.isArray(j2?.pairs) ? j2.pairs : [];
       const best =
-        pairs.find(p => p?.chainId === "solana" && p?.baseToken?.address === mint) ||
-        pairs.find(p => p?.baseToken?.address === mint) ||
+        pairs.find(
+          (p) =>
+            p?.chainId === "solana" &&
+            p?.baseToken?.address === mint
+        ) ||
+        pairs.find((p) => p?.baseToken?.address === mint) ||
         pairs[0];
       const p2 = Number(best?.priceUsd) || 0;
       if (p2 > 0) return setAndMaybeBroadcast(p2);
@@ -830,13 +928,18 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
 /* ---------- Balance helpers ---------- */
 function parseParsedAccount(acc) {
   const info = acc?.account?.data?.parsed?.info;
-  const amt = info?.tokenAmount || info?.parsed?.info?.tokenAmount || info?.uiTokenAmount || {};
+  const amt =
+    info?.tokenAmount ||
+    info?.parsed?.info?.tokenAmount ||
+    info?.uiTokenAmount ||
+    {};
   const decimals = Number(amt?.decimals ?? info?.decimals ?? 0);
   const raw = amt?.amount != null ? String(amt.amount) : null;
 
-  const uiAmount = raw && decimals >= 0
-    ? Number(raw) / Math.pow(10, decimals)
-    : Number(amt?.uiAmount ?? 0);
+  const uiAmount =
+    raw && decimals >= 0
+      ? Number(raw) / Math.pow(10, decimals)
+      : Number(amt?.uiAmount ?? 0);
 
   return {
     mint: info?.mint || info?.parsed?.info?.mint || "",
@@ -845,7 +948,7 @@ function parseParsedAccount(acc) {
   };
 }
 
-// ✅ UPDATED: make Token-2022 lookup non-fatal
+// Token-2022 lookup is non-fatal (best-effort)
 async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
   // Always fetch legacy SPL token accounts
   const legacy = await rpc("getTokenAccountsByOwner", [
@@ -863,7 +966,10 @@ async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
       { encoding: "jsonParsed", commitment },
     ]);
   } catch (e) {
-    warn("getAllSplTokenAccounts: token-2022 lookup failed (non-fatal):", e?.message || e);
+    warn(
+      "getAllSplTokenAccounts: token-2022 lookup failed (non-fatal):",
+      e?.message || e
+    );
   }
 
   const list = []
@@ -876,7 +982,10 @@ async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
     const prev = byMint.get(t.mint);
     if (prev) {
       prev.amount += t.amount;
-      if (typeof prev.decimals !== "number" && typeof t.decimals === "number") {
+      if (
+        typeof prev.decimals !== "number" &&
+        typeof t.decimals === "number"
+      ) {
         prev.decimals = t.decimals;
       }
     } else {
@@ -887,7 +996,11 @@ async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
 }
 
 /* === Small helper for homepage CTO / Utility wallets === */
-async function getWalletSnapshot(owner, mint, commitment = "confirmed") {
+async function getWalletSnapshot(
+  owner,
+  mint,
+  commitment = "confirmed"
+) {
   const [bal, tokens] = await Promise.all([
     rpc("getBalance", [owner, { commitment }]),
     getAllSplTokenAccounts(owner, commitment),
@@ -908,7 +1021,9 @@ async function getWalletSnapshot(owner, mint, commitment = "confirmed") {
 app.get("/api/wallets", async (_req, res) => {
   try {
     if (!HELIUS_KEY) {
-      return res.status(400).json({ error: "HELIUS_API_KEY not configured on backend" });
+      return res
+        .status(400)
+        .json({ error: "HELIUS_API_KEY not configured on backend" });
     }
 
     const [cto, utility] = await Promise.all([
@@ -919,7 +1034,9 @@ app.get("/api/wallets", async (_req, res) => {
     res.json({ cto, utility });
   } catch (e) {
     err("/api/wallets error:", e);
-    res.status(500).json({ error: "Failed to fetch wallet snapshots" });
+    res
+      .status(500)
+      .json({ error: "Failed to fetch wallet snapshots" });
   }
 });
 
@@ -951,15 +1068,19 @@ app.get("/api/home", async (_req, res) => {
           l = data;
         }
         return l || null;
-      })()
+      })(),
     ]);
 
     const priceUsd = Number(meta?.price_usd || latest?.price || 0);
     const marketCapUsd = Number(meta?.market_cap_usd || 0);
-    const holders = meta?.holders != null ? Number(meta.holders) : 0;
-    const supply = meta?.supply != null ? Number(meta.supply) : 0;
-    const changePct24h = latest?.change != null ? Number(latest.change) : 0;
-    const volume24h = latest?.volume != null ? Number(latest.volume) : 0;
+    const holders =
+      meta?.holders != null ? Number(meta.holders) : 0;
+    const supply =
+      meta?.supply != null ? Number(meta.supply) : 0;
+    const changePct24h =
+      latest?.change != null ? Number(latest.change) : 0;
+    const volume24h =
+      latest?.volume != null ? Number(latest.volume) : 0;
 
     res.json({
       mint: TOKEN_MINT,
@@ -968,11 +1089,13 @@ app.get("/api/home", async (_req, res) => {
       holders,
       supply,
       changePct24h,
-      volume24h
+      volume24h,
     });
   } catch (e) {
     err("/api/home error:", e);
-    res.status(500).json({ error: "Failed to build home summary" });
+    res
+      .status(500)
+      .json({ error: "Failed to build home summary" });
   }
 });
 
@@ -980,8 +1103,11 @@ app.get("/api/home", async (_req, res) => {
 app.post("/api/balances", async (req, res) => {
   try {
     const wallet = req.body?.wallet?.trim();
-    const commitment = ["processed","confirmed","finalized"].includes(req.body?.commitment)
-      ? req.body.commitment : "confirmed";
+    const commitment = ["processed", "confirmed", "finalized"].includes(
+      req.body?.commitment
+    )
+      ? req.body.commitment
+      : "confirmed";
     const nocache = Boolean(req.body?.nocache);
 
     if (!wallet || !HELIUS_KEY) {
@@ -997,13 +1123,18 @@ app.post("/api/balances", async (req, res) => {
     const sol = Number(solBal?.value || 0) / 1e9;
     const solUsd = await getSolUsd();
 
-    const tokenAccounts = await getAllSplTokenAccounts(wallet, commitment);
+    const tokenAccounts = await getAllSplTokenAccounts(
+      wallet,
+      commitment
+    );
 
     const enriched = await Promise.all(
       tokenAccounts.map(async (t) => {
         const meta = await getTokenMeta(t.mint);
         const decimals =
-          typeof meta.decimals === "number" ? meta.decimals : t.decimals;
+          typeof meta.decimals === "number"
+            ? meta.decimals
+            : t.decimals;
         const priceUsd = await getTokenUsd(t.mint, { nocache });
         const usd = priceUsd * t.amount;
 
@@ -1012,17 +1143,22 @@ app.post("/api/balances", async (req, res) => {
           amount: t.amount,
           decimals,
           symbol: meta.symbol || "",
-          name:   meta.name   || "",
-          logo:   meta.logo   || "",
-          tags:   meta.tags   || [],
+          name: meta.name || "",
+          logo: meta.logo || "",
+          tags: meta.tags || [],
           isVerified: Boolean(meta.isVerified),
           priceUsd,
           usd,
 
-          // NEW: expose meta fields to frontend for wallet token popup
-          marketCapUsd: typeof meta.market_cap_usd === "number" ? meta.market_cap_usd : null,
-          holders:      typeof meta.holders        === "number" ? meta.holders        : null,
-          supply:       typeof meta.supply         === "number" ? meta.supply         : null,
+          // meta extras for wallet popup
+          marketCapUsd:
+            typeof meta.market_cap_usd === "number"
+              ? meta.market_cap_usd
+              : null,
+          holders:
+            typeof meta.holders === "number" ? meta.holders : null,
+          supply:
+            typeof meta.supply === "number" ? meta.supply : null,
         };
       })
     );
@@ -1119,11 +1255,12 @@ function normRefundRow(r) {
 
 app.post("/api/refund-log", async (req, res) => {
   try {
-    const { wallet, token, tx, date, status, rent_reclaimed } = req.body || {};
+    const { wallet, token, tx, date, status, rent_reclaimed } =
+      req.body || {};
     if (!wallet || !token || !tx) {
-      return res
-        .status(400)
-        .json({ error: "Missing required fields (wallet, token, tx)" });
+      return res.status(400).json({
+        error: "Missing required fields (wallet, token, tx)",
+      });
     }
     const payload = {
       wallet,
@@ -1156,11 +1293,14 @@ app.get("/api/refund-history", async (req, res) => {
   try {
     const wallet = (req.query.wallet || "").trim();
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    if (!wallet)
+      return res.status(400).json({ error: "Missing wallet" });
 
     const { data, error } = await supabase
       .from("hub_refund_history")
-      .select("id, wallet, token, tx, date, status, created_at, rent_reclaimed")
+      .select(
+        "id, wallet, token, tx, date, status, created_at, rent_reclaimed"
+      )
       .eq("wallet", wallet)
       .order("created_at", { ascending: false })
       .limit(limit);
@@ -1178,11 +1318,12 @@ app.post("/api/rpc", async (req, res) => {
   try {
     const { method, params } = req.body || {};
     if (!HELIUS_KEY) {
-      return res
-        .status(400)
-        .json({ error: "HELIUS_API_KEY not configured on backend" });
+      return res.status(400).json({
+        error: "HELIUS_API_KEY not configured on backend",
+      });
     }
-    if (!method) return res.status(400).json({ error: "Missing method" });
+    if (!method)
+      return res.status(400).json({ error: "Missing method" });
 
     const r = await fetch(HELIUS_RPC, {
       method: "POST",
@@ -1205,7 +1346,9 @@ app.post("/api/rpc", async (req, res) => {
 // Simple GET so the frontend can auto-detect the RPC URL
 app.get("/api/rpc", (_req, res) => {
   if (!HELIUS_KEY) {
-    return res.status(400).json({ error: "HELIUS_API_KEY not configured" });
+    return res
+      .status(400)
+      .json({ error: "HELIUS_API_KEY not configured" });
   }
   return res.json({ rpc: HELIUS_RPC });
 });
@@ -1219,9 +1362,15 @@ wss.on("connection", async (socket) => {
   socket.isAlive = true;
   clients.add(socket);
 
-  socket.on("pong", () => { socket.isAlive = true; });
-  socket.on("close", () => { clients.delete(socket); });
-  socket.on("error", (e) => { err("WS error:", e?.message || e); });
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+  socket.on("close", () => {
+    clients.delete(socket);
+  });
+  socket.on("error", (e) => {
+    err("WS error:", e?.message || e);
+  });
 
   // initial hello → last 25 broadcasts
   try {
@@ -1242,11 +1391,15 @@ wss.on("connection", async (socket) => {
 setInterval(() => {
   for (const s of clients) {
     if (s.isAlive === false) {
-      try { s.terminate(); } catch {}
+      try {
+        s.terminate();
+      } catch {}
       continue;
     }
     s.isAlive = false;
-    try { s.ping(); } catch {}
+    try {
+      s.ping();
+    } catch {}
   }
 }, 30000);
 
@@ -1262,7 +1415,9 @@ let rtChannel = null;
 function subscribeToBroadcasts() {
   try {
     if (rtChannel) {
-      try { supabase.removeChannel(rtChannel); } catch {}
+      try {
+        supabase.removeChannel(rtChannel);
+      } catch {}
       rtChannel = null;
     }
 
@@ -1272,7 +1427,11 @@ function subscribeToBroadcasts() {
       })
       .on(
         "postgres_changes",
-        { event: "INSERT", schema: "public", table: "hub_broadcasts" },
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "hub_broadcasts",
+        },
         (payload) => {
           const row = normRow(payload?.new || payload?.record);
           log("🔔 INSERT hub_broadcasts id=", row?.id);
@@ -1281,7 +1440,11 @@ function subscribeToBroadcasts() {
       )
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "hub_broadcasts" },
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "hub_broadcasts",
+        },
         (payload) => {
           const row = normRow(payload?.new || payload?.record);
           log("🔧 UPDATE hub_broadcasts id=", row?.id);
@@ -1290,7 +1453,11 @@ function subscribeToBroadcasts() {
       )
       .on(
         "postgres_changes",
-        { event: "DELETE", schema: "public", table: "hub_broadcasts" },
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "hub_broadcasts",
+        },
         (payload) => {
           const old = payload?.old || payload?.record || null;
           const id = old?.id;
@@ -1326,7 +1493,11 @@ setInterval(() => {
   try {
     const { rss, heapUsed, heapTotal } = process.memoryUsage();
     const mb = (n) => (n / 1024 / 1024).toFixed(1);
-    log(`[MEM] rss=${mb(rss)}MB heapUsed=${mb(heapUsed)}MB heapTotal=${mb(heapTotal)}MB`);
+    log(
+      `[MEM] rss=${mb(rss)}MB heapUsed=${mb(
+        heapUsed
+      )}MB heapTotal=${mb(heapTotal)}MB`
+    );
   } catch (e) {
     // ignore
   }
