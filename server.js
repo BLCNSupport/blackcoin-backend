@@ -9,7 +9,7 @@
 
 import express from "express";
 import fetch from "node-fetch";
-import cors from "cors";
+import cors from "cors"; // kept import, even though we now use a custom handler
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
@@ -21,7 +21,26 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+/* ---------- Strong CORS + preflight handler ---------- */
+// This ensures ALL routes (including /api/balances) always send CORS headers,
+// and that OPTIONS preflight requests succeed cleanly.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
+
+  if (req.method === "OPTIONS") {
+    // Short-circuit preflight with 200 + headers
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
+// Body parsing + static files
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static("public")); // serves OperatorHub.html / index.html / Terminal Hub, etc.
 
@@ -362,7 +381,7 @@ if (!HELIUS_KEY) warn("HELIUS_API_KEY missing — /api/balances and /api/wallets
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 const TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNvLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /* ---------- Solscan ---------- */
 const SOLSCAN_KEY = process.env.SOLSCAN_KEY || "";
