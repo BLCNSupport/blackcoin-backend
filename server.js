@@ -1082,7 +1082,7 @@ async function getWalletSnapshot(
 // simple in-memory cache so we don't hammer Helius
 const BURN_CACHE = { ts: 0, payload: null };
 const BURN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const BURN_SEARCH_LIMIT = 50; // how many recent txs from CTO wallet to scan
+const BURN_SEARCH_LIMIT = 15; // how many recent txs from CTO wallet to scan
 
 function extractBurnFromParsedTx(tx) {
   const matches = [];
@@ -1133,18 +1133,23 @@ async function fetchLatestBurnFromHelius() {
     const sig = info.signature;
     let tx;
     try {
-      tx = await rpcSolana("getParsedTransaction", [
+      tx = await rpcSolana("getTransaction", [
         sig,
         {
           maxSupportedTransactionVersion: 0,
           commitment: "confirmed",
+          encoding: "jsonParsed",
         },
       ]);
     } catch (e) {
-      warn(
-        "[burn] getParsedTransaction error (fallback RPC):",
-        e?.message || e
-      );
+      const msg = e?.message || String(e);
+      warn("[burn] getTransaction error (fallback RPC):", msg);
+
+      // If public RPC is rate-limiting us, stop scanning more txs this round
+      if (msg.includes("429") || msg.toLowerCase().includes("too many requests")) {
+        break;
+      }
+
       continue;
     }
     if (!tx) continue;
