@@ -92,7 +92,13 @@ const CTO_WALLET = "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3";
 const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 
 // Wallet that actually performs burns:
-const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
+// Wallets that actually perform burns (you can add/remove for backfill)
+const BURN_WALLETS = [
+  "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy", // main burn wallet
+  // "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3",
+  // "2JRM2YDLA5KRBeXqjLhE5GMd2uZaDv4khWyJD4F3AcNo",
+];
+
 
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
@@ -1131,124 +1137,145 @@ function extractBurnFromParsedTx(tx) {
  * - Logs every matching burn into hub_burns (upsert by signature).
  * - Returns the newest burn (for the UI /api/wallets card).
  */
+/**
+ * Use the burn RPC (Alchemy) to find SPL burns
+ * for our token mint from all BURN_WALLETS.
+ *
+ * - Logs every matching burn into hub_burns (upsert by signature).
+ * - Returns the newest burn (across all wallets) for the UI /api/wallets card.
+ */
 async function fetchLatestBurnFromRpc() {
-  let sigInfos;
-  try {
-    sigInfos = await rpcBurn("getSignaturesForAddress", [
-      BURN_WALLET,
-      { limit: BURN_SEARCH_LIMIT },
-    ]);
-  } catch (e) {
-    warn(
-      "[burn] getSignaturesForAddress error (burn RPC):",
-      e?.message || e
-    );
-    return null;
-  }
-
-  if (!Array.isArray(sigInfos) || !sigInfos.length) return null;
-
   // We need decimals + symbol to convert raw amount to UI amount
   const meta = await getTokenMeta(TOKEN_MINT);
   const decimals =
     typeof meta.decimals === "number" ? meta.decimals : 6;
   const symbol = meta.symbol || "BlackCoin";
 
-  // We'll fill this with the newest burn we see so that the UI
-  // still gets "the latest burn" while we log all matching burns.
   let latestPayload = null;
 
-  // Walk newest → oldest (as returned by getSignaturesForAddress)
-  for (const info of sigInfos) {
-    const sig =
-      info.signature || info.sign || info.tx || info.transaction || null;
-    if (!sig) continue;
-
-    let tx;
+  // Loop over each burn wallet
+  for (const burnWallet of BURN_WALLETS) {
+    let sigInfos;
     try {
-      tx = await rpcBurn("getTransaction", [
-        sig,
-        {
-          maxSupportedTransactionVersion: 0,
-          commitment: "confirmed",
-          encoding: "jsonParsed",
-        },
+      sigInfos = await rpcBurn("getSignaturesForAddress", [
+        burnWallet,
+        { limit: BURN_SEARCH_LIMIT },
       ]);
     } catch (e) {
-      const msg = e?.message || String(e);
-      warn("[burn] getTransaction error (burn RPC):", msg);
-
-      // If Alchemy / RPC is rate limiting, stop scanning this round
-      if (
-        msg.includes("429") ||
-        msg.toLowerCase().includes("too many requests")
-      ) {
-        break;
-      }
-
-      continue;
-    }
-
-    if (!tx) continue;
-
-    const burnInfo = extractBurnFromParsedTx(tx);
-    if (!burnInfo) continue;
-    if (burnInfo.mint !== TOKEN_MINT) continue;
-
-    const rawAmount = Number(
-      burnInfo.amount ??
-        burnInfo.tokenAmount ??
-        burnInfo.uiAmount ??
-        0
-    );
-    if (!rawAmount) continue;
-
-    const amountUi = rawAmount / Math.pow(10, decimals);
-
-    const blockTime = info.blockTime || info.block_time || 0;
-    const ts =
-      blockTime
-        ? new Date(blockTime * 1000).toISOString()
-        : new Date().toISOString();
-
-    const payload = {
-      amount: amountUi,
-      amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
-
-      // old + new field names so the frontend can use whatever it expects
-      timestamp: ts,
-      date: ts,
-
-      signature: sig,
-      tx: sig,
-
-      explorer: `https://solscan.io/tx/${sig}`,
-    };
-
-    // 🔹 Log / backfill into hub_burns using your schema
-    try {
-      await supabase
-        .from("hub_burns")
-        .upsert(
-          {
-            wallet: BURN_WALLET,   // burner wallet address
-            token: TOKEN_MINT,     // your BLACK token mint
-            signature: sig,        // unique signature
-            amount: amountUi,      // numeric (human units)
-            timestamp: ts,         // timestamptz
-          },
-          { onConflict: "signature" } // respect unique(signature)
-        );
-    } catch (e) {
       warn(
-        "[burn] hub_burns upsert failed (non-fatal):",
+        "[burn] getSignaturesForAddress error (burn RPC) wallet=" +
+          burnWallet +
+          ":",
         e?.message || e
       );
+      continue; // try next wallet
     }
 
-    // Track the newest burn we have in this batch
-    if (!latestPayload || ts > latestPayload.timestamp) {
-      latestPayload = payload;
+    if (!Array.isArray(sigInfos) || !sigInfos.length) continue;
+
+    // Walk newest → oldest for this wallet
+    for (const info of sigInfos) {
+      const sig =
+        info.signature ||
+        info.sign ||
+        info.tx ||
+        info.transaction ||
+        null;
+      if (!sig) continue;
+
+      let tx;
+      try {
+        tx = await rpcBurn("getTransaction", [
+          sig,
+          {
+            maxSupportedTransactionVersion: 0,
+            commitment: "confirmed",
+            encoding: "jsonParsed",
+          },
+        ]);
+      } catch (e) {
+        const msg = e?.message || String(e);
+        warn(
+          "[burn] getTransaction error (burn RPC) wallet=" +
+            burnWallet +
+            ":",
+          msg
+        );
+
+        // If RPC is rate limiting, stop scanning this wallet for now
+        if (
+          msg.includes("429") ||
+          msg.toLowerCase().includes("too many requests")
+        ) {
+          break;
+        }
+
+        continue;
+      }
+
+      if (!tx) continue;
+
+      const burnInfo = extractBurnFromParsedTx(tx);
+      if (!burnInfo) continue;
+      if (burnInfo.mint !== TOKEN_MINT) continue;
+
+      const rawAmount = Number(
+        burnInfo.amount ??
+          burnInfo.tokenAmount ??
+          burnInfo.uiAmount ??
+          0
+      );
+      if (!rawAmount) continue;
+
+      const amountUi = rawAmount / Math.pow(10, decimals);
+
+      const blockTime = info.blockTime || info.block_time || 0;
+      const ts =
+        blockTime
+          ? new Date(blockTime * 1000).toISOString()
+          : new Date().toISOString();
+
+      const payload = {
+        amount: amountUi,
+        amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
+
+        // old + new field names so the frontend can use whatever it expects
+        timestamp: ts,
+        date: ts,
+
+        signature: sig,
+        tx: sig,
+
+        explorer: `https://solscan.io/tx/${sig}`,
+      };
+
+      // 🔹 Log / backfill into hub_burns using your schema
+      try {
+        await supabase
+          .from("hub_burns")
+          .upsert(
+            {
+              wallet: burnWallet,  // ← this burn wallet
+              token: TOKEN_MINT,   // your BLACK token mint
+              signature: sig,      // unique signature
+              amount: amountUi,    // numeric (human units)
+              timestamp: ts,       // timestamptz
+            },
+            { onConflict: "signature" } // respect unique(signature)
+          );
+      } catch (e) {
+        warn(
+          "[burn] hub_burns upsert failed (non-fatal) wallet=" +
+            burnWallet +
+            ":",
+          e?.message || e
+        );
+      }
+
+      // Track newest burn across ALL wallets
+      if (!latestPayload || ts > latestPayload.timestamp) {
+        latestPayload = payload;
+      }
     }
   }
 
