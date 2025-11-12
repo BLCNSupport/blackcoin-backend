@@ -806,36 +806,6 @@ async function rpc(method, params) {
   return j.result;
 }
 
-// Fallback plain Solana RPC (for burn scanner only)
-const SOLANA_FALLBACK_RPC =
-  process.env.SOLANA_FALLBACK_RPC || "https://api.mainnet-beta.solana.com";
-
-async function rpcSolana(method, params) {
-  const r = await fetch(SOLANA_FALLBACK_RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-  });
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    err(
-      `Solana RPC ${method} HTTP ${r.status} — body snippet:`,
-      text.slice(0, 300)
-    );
-    throw new Error(`Solana RPC ${method} HTTP ${r.status}`);
-  }
-
-  const j = await r.json();
-  if (j.error) {
-    err(`Solana RPC ${method} JSON error:`, j.error);
-    throw new Error(
-      `Solana RPC ${method} error: ${j.error.message || "unknown"}`
-    );
-  }
-  return j.result;
-}
-
 
 async function getSolUsd() {
   const now = Date.now();
@@ -1077,142 +1047,137 @@ async function getWalletSnapshot(
   return { sol, token: tokenAmount };
 }
 
-/* === Latest burn info for CTO wallet (auto via Helius) === */
+/* === Latest burn info for CTO wallet (via Solscan Pro) === */
 
-// simple in-memory cache so we don't hammer Helius
+// simple in-memory cache so we don't hammer Solscan
 const BURN_CACHE = { ts: 0, payload: null };
 const BURN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const BURN_SEARCH_LIMIT = 15; // how many recent txs from CTO wallet to scan
 
-function extractBurnFromParsedTx(tx) {
-  const matches = [];
-
-  const pushIx = (ix) => {
-    if (!ix) return;
-    const parsed = ix.parsed;
-    if (!parsed || typeof parsed !== "object") return;
-    const type = parsed.type;
-    const info = parsed.info || {};
-    if (type === "burn" && info.mint === TOKEN_MINT) {
-      matches.push(info);
-    }
-  };
-
-  // top-level instructions
-  const topIxs = tx?.transaction?.message?.instructions || [];
-  for (const ix of topIxs) pushIx(ix);
-
-  // inner instructions (in case burn is inside another program)
-  const inner = tx?.meta?.innerInstructions || [];
-  for (const innerIx of inner) {
-    if (Array.isArray(innerIx.instructions)) {
-      for (const ix of innerIx.instructions) pushIx(ix);
-    }
+/**
+ * Use Solscan Pro /v2.0/account/transfer to find the latest
+ * SPL BURN (outgoing) for our token from the CTO_WALLET.
+ */
+async function fetchLatestBurnFromSolscan() {
+  if (!SOLSCAN_KEY) {
+    warn("[burn] SOLSCAN_KEY missing — cannot look up burns");
+    return null;
   }
 
-  return matches[0] || null;
-}
+  const headers = { accept: "application/json", token: SOLSCAN_KEY };
 
-async function fetchLatestBurnFromHelius() {
-  // 1) grab recent signatures for the CTO wallet (fallback Solana RPC)
-  const sigInfos = await rpcSolana("getSignaturesForAddress", [
-    CTO_WALLET,
-    { limit: BURN_SEARCH_LIMIT },
-  ]);
+  // We ask Solscan:
+  // - address = CTO wallet
+  // - token   = our token mint
+  // - activity = ACTIVITY_SPL_BURN (burns only)
+  // - flow   = out (sent from this wallet)
+  // - page 1, page_size 1, newest first
+  const qs = new URLSearchParams({
+    address: CTO_WALLET,
+    token: TOKEN_MINT,
+    activity: "ACTIVITY_SPL_BURN",
+    flow: "out",
+    page: "1",
+    page_size: "1",
+    sort_by: "block_time",
+    sort_order: "desc",
+  });
 
-  if (!Array.isArray(sigInfos) || !sigInfos.length) return null;
+  const url = `https://pro-api.solscan.io/v2.0/account/transfer?${qs.toString()}`;
 
-  // 2) we need decimals + symbol to convert amount
+  const res = await fetch(url, { headers });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    warn(
+      "[burn] Solscan /account/transfer HTTP",
+      res.status,
+      "body:",
+      text.slice(0, 200)
+    );
+    return null;
+  }
+
+  const json = await res.json();
+  const list = Array.isArray(json?.data) ? json.data : [];
+  if (!list.length) return null;
+
+  const item = list[0];
+
+  // Solscan returns amount in smallest units for SPL tokens
+  const rawAmount =
+    Number(item.amount ?? item.token_amount ?? item.tokenAmount ?? 0);
+  if (!rawAmount) return null;
+
+  // Need decimals + symbol to convert amount
   const meta = await getTokenMeta(TOKEN_MINT);
   const decimals =
     typeof meta.decimals === "number" ? meta.decimals : 6;
   const symbol = meta.symbol || "BlackCoin";
 
-  // 3) walk newest → oldest until we find a burn for our mint
-  for (const info of sigInfos) {
-    const sig = info.signature;
-    let tx;
-    try {
-      tx = await rpcSolana("getTransaction", [
-        sig,
-        {
-          maxSupportedTransactionVersion: 0,
-          commitment: "confirmed",
-          encoding: "jsonParsed",
-        },
-      ]);
-    } catch (e) {
-      const msg = e?.message || String(e);
-      warn("[burn] getTransaction error (fallback RPC):", msg);
+  const amountUi = rawAmount / Math.pow(10, decimals);
 
-      // If public RPC is rate-limiting us, stop scanning more txs this round
-      if (msg.includes("429") || msg.toLowerCase().includes("too many requests")) {
-        break;
-      }
-
-      continue;
-    }
-    if (!tx) continue;
-
-    const burnInfo = extractBurnFromParsedTx(tx);
-    if (!burnInfo) continue;
-    if (burnInfo.mint !== TOKEN_MINT) continue;
-
-    const rawAmount = Number(burnInfo.amount || 0);
-    if (!rawAmount) continue;
-
-    const amountUi = rawAmount / Math.pow(10, decimals);
-
-    const ts = info.blockTime
-      ? new Date(info.blockTime * 1000).toISOString()
+  // block_time is unix seconds on Solscan
+  const blockTime = Number(item.block_time ?? item.blockTime ?? 0);
+  const ts =
+    blockTime > 0
+      ? new Date(blockTime * 1000).toISOString()
       : new Date().toISOString();
 
-    return {
-      amount: amountUi,
-      amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
+  // transaction id / signature field names vary a bit, so try several
+  const sig =
+    item.trans_id ||
+    item.txHash ||
+    item.signature ||
+    item.tx ||
+    "";
 
-      // old + new field names so the frontend can use whatever it expects
-      timestamp: ts,
-      date: ts,
+  if (!sig) return null;
 
-      signature: sig,
-      tx: sig,
+  return {
+    amount: amountUi,
+    amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
 
-      explorer: `https://solscan.io/tx/${sig}`,
-    };
-  }
+    // old + new field names so the frontend can use whatever it expects
+    timestamp: ts,
+    date: ts,
 
-  return null;
+    signature: sig,
+    tx: sig,
+
+    explorer: `https://solscan.io/tx/${sig}`,
+  };
 }
 
-
+/**
+ * Cached wrapper for the UI (/api/wallets).
+ * Never hits Solscan more frequently than BURN_CACHE_TTL.
+ */
 async function getLatestBurnTx() {
   const now = Date.now();
 
-  // 🔒 hard throttle: never hit RPC more often than BURN_CACHE_TTL
+  // hard throttle: only refresh at most once per TTL
   if (now - BURN_CACHE.ts < BURN_CACHE_TTL) {
-    return BURN_CACHE.payload; // may be null if we've never found a burn
+    return BURN_CACHE.payload; // may be null
   }
 
   try {
-    const payload = await fetchLatestBurnFromHelius();
+    const payload = await fetchLatestBurnFromSolscan();
 
-    // we attempted a fetch → update the timestamp either way
+    // mark that we attempted a fetch
     BURN_CACHE.ts = now;
 
-    // if we found a burn, cache it
+    // if we actually found a burn, remember it
     if (payload) {
       BURN_CACHE.payload = payload;
     }
   } catch (e) {
     warn("getLatestBurnTx() failed:", e?.message || e);
-    // still respect TTL: we already set BURN_CACHE.ts = now above
+    // still respect TTL because we already updated BURN_CACHE.ts
   }
 
   // return last known burn (or null if none yet)
   return BURN_CACHE.payload;
 }
-
 
 
 /* Simple JSON for homepage vault cards:
