@@ -199,35 +199,66 @@ async function pollLoop() {
 pollLoop();
 
 /* ---------- Chart API ---------- */
+
+// Max bars per timeframe (TradingView-style)
+const MAX_BARS = 5000;
+
 function bucketMs(interval) {
   switch (interval) {
     case "1m":
-      return 60e3;
+      return 60e3;       // 1 minute
     case "5m":
-      return 300e3;
+      return 300e3;      // 5 minutes
     case "30m":
-      return 1800e3;
+      return 1800e3;     // 30 minutes
     case "1h":
-      return 3600e3;
+      return 3600e3;     // 1 hour
     case "D":
-      return 86400e3;
+      return 86400e3;    // 1 day
     default:
       return 60e3;
   }
 }
+
 function getWindow(interval) {
   const now = Date.now();
-  if (interval === "D")
-    return new Date(now - 30 * 86400e3).toISOString();
-  if (interval === "1h")
-    return new Date(now - 7 * 86400e3).toISOString();
-  return new Date(now - 86400e3).toISOString();
+  const MINUTE = 60 * 1000;
+  const HOUR   = 60 * MINUTE;
+  const DAY    = 24 * HOUR;
+
+  switch (interval) {
+    case "1m":
+      // 5000 × 1 minute ≈ 3.5 days
+      return new Date(now - MAX_BARS * 1 * MINUTE).toISOString();
+
+    case "5m":
+      // 5000 × 5 minutes ≈ 17.4 days
+      return new Date(now - MAX_BARS * 5 * MINUTE).toISOString();
+
+    case "30m":
+      // 5000 × 30 minutes ≈ 104 days
+      return new Date(now - MAX_BARS * 30 * MINUTE).toISOString();
+
+    case "1h":
+      // 5000 × 1 hour ≈ 208 days
+      return new Date(now - MAX_BARS * 1 * HOUR).toISOString();
+
+    case "D":
+      // 5000 × 1 day ≈ 13.7 years (you’ll just get all available data)
+      return new Date(now - MAX_BARS * 1 * DAY).toISOString();
+
+    default:
+      // Fallback: treat unknown intervals like 5m
+      return new Date(now - MAX_BARS * 5 * MINUTE).toISOString();
+  }
 }
+
 function floorToBucketUTC(tsISO, interval) {
   const ms = bucketMs(interval);
   const d = new Date(tsISO);
   return new Date(Math.floor(d.getTime() / ms) * ms);
 }
+
 function bucketize(rows, interval) {
   const m = new Map();
   for (const r of rows) {
@@ -252,7 +283,7 @@ app.get("/api/chart", async (req, res) => {
   try {
     const interval = req.query.interval || "D";
     const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 10000, 20000);
+    const limit = Math.min(parseInt(req.query.limit) || 20000, 20000);
     const offset = (page - 1) * limit;
     const cutoff = getWindow(interval);
 
