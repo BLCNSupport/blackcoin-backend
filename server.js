@@ -1070,7 +1070,7 @@ async function getWalletSnapshot(
 // simple in-memory cache so we don't hammer the burn RPC
 const BURN_CACHE = { ts: 0, payload: null };
 const BURN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const BURN_SEARCH_LIMIT = 500; // how many recent txs from CTO wallet to scan
+const BURN_SEARCH_LIMIT = 15; // how many recent txs from CTO wallet to scan
 
 // Dedicated RPC for burn scanning (use your Alchemy URL here via env)
 const BURN_RPC_URL =
