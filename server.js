@@ -230,16 +230,16 @@ function getWindow(interval) {
     case "1m":
     case "5m":
     case "30m":
-      // Very short timeframes: last 24h of ticks
-      return new Date(now - 24 * HOUR).toISOString();
+      // short TFs: last 24h
+      return new Date(now - 24 * DAY / 24).toISOString(); // == 24 * HOUR
 
     case "1h":
-      // 1h chart: last 30 days
-      return new Date(now - 30 * DAY).toISOString();
+      // IMPORTANT: no cutoff → use ALL rows in Supabase and bucket to 1h
+      return null;
 
     case "D":
     default:
-      // Daily chart: last 90 days
+      // daily: last 90 days
       return new Date(now - 90 * DAY).toISOString();
   }
 }
@@ -279,13 +279,13 @@ app.get("/api/chart", async (req, res) => {
     const offset = (page - 1) * limit;
     const cutoff = getWindow(interval);
 
-    // Build Supabase query
     let query = supabase
       .from("chart_data")
       .select("timestamp, price, change, volume", { count: "exact" })
       .order("timestamp", { ascending: true })
       .range(offset, offset + limit - 1);
 
+    // ⬅️ only apply cutoff if it’s not null
     if (cutoff) {
       query = query.gte("timestamp", cutoff);
     }
@@ -324,6 +324,7 @@ app.get("/api/chart", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch chart data" });
   }
 });
+
 
 
 app.get("/api/latest", async (_req, res) => {
