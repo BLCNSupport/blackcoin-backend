@@ -1188,24 +1188,31 @@ async function fetchLatestBurnFromHelius() {
 
 async function getLatestBurnTx() {
   const now = Date.now();
-  if (BURN_CACHE.payload && now - BURN_CACHE.ts < BURN_CACHE_TTL) {
-    return BURN_CACHE.payload;
+
+  // 🔒 hard throttle: never hit RPC more often than BURN_CACHE_TTL
+  if (now - BURN_CACHE.ts < BURN_CACHE_TTL) {
+    return BURN_CACHE.payload; // may be null if we've never found a burn
   }
 
   try {
     const payload = await fetchLatestBurnFromHelius();
+
+    // we attempted a fetch → update the timestamp either way
+    BURN_CACHE.ts = now;
+
+    // if we found a burn, cache it
     if (payload) {
       BURN_CACHE.payload = payload;
-      BURN_CACHE.ts = now;
-      return payload;
     }
   } catch (e) {
     warn("getLatestBurnTx() failed:", e?.message || e);
+    // still respect TTL: we already set BURN_CACHE.ts = now above
   }
 
-  // fall back to whatever we last had (or null)
+  // return last known burn (or null if none yet)
   return BURN_CACHE.payload;
 }
+
 
 
 /* Simple JSON for homepage vault cards:
