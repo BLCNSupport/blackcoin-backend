@@ -1114,11 +1114,17 @@ async function fetchLatestBurnFromHelius() {
       ? new Date(info.blockTime * 1000).toISOString()
       : new Date().toISOString();
 
-    return {
+        return {
       amount: amountUi,
       amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
+
+      // old + new field names so the frontend can use whatever it expects
       timestamp: ts,
+      date: ts,
+
       signature: sig,
+      tx: sig,
+
       explorer: `https://solscan.io/tx/${sig}`,
     };
   }
