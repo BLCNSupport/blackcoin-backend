@@ -223,35 +223,27 @@ function bucketMs(interval) {
 function getWindow(interval) {
   const now = Date.now();
   const MINUTE = 60 * 1000;
-  const HOUR   = 60 * MINUTE;
-  const DAY    = 24 * HOUR;
+  const HOUR = 60 * MINUTE;
+  const DAY = 24 * HOUR;
 
   switch (interval) {
     case "1m":
-      // 5000 × 1 minute ≈ 3.5 days
-      return new Date(now - MAX_BARS * 1 * MINUTE).toISOString();
-
     case "5m":
-      // 5000 × 5 minutes ≈ 17.4 days
-      return new Date(now - MAX_BARS * 5 * MINUTE).toISOString();
-
     case "30m":
-      // 5000 × 30 minutes ≈ 104 days
-      return new Date(now - MAX_BARS * 30 * MINUTE).toISOString();
+      // Very short timeframes: last 24h of ticks
+      return new Date(now - 24 * HOUR).toISOString();
 
     case "1h":
-      // 5000 × 1 hour ≈ 208 days
-      return new Date(now - MAX_BARS * 1 * HOUR).toISOString();
+      // 1h chart: last 30 days
+      return new Date(now - 30 * DAY).toISOString();
 
     case "D":
-      // 5000 × 1 day ≈ 13.7 years (you’ll just get all available data)
-      return new Date(now - MAX_BARS * 1 * DAY).toISOString();
-
     default:
-      // Fallback: treat unknown intervals like 5m
-      return new Date(now - MAX_BARS * 5 * MINUTE).toISOString();
+      // Daily chart: last 90 days
+      return new Date(now - 90 * DAY).toISOString();
   }
 }
+
 
 function floorToBucketUTC(tsISO, interval) {
   const ms = bucketMs(interval);
@@ -283,23 +275,28 @@ app.get("/api/chart", async (req, res) => {
   try {
     const interval = req.query.interval || "D";
     const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 20000, 20000);
+    const limit = Math.min(parseInt(req.query.limit) || 10000, 20000);
     const offset = (page - 1) * limit;
     const cutoff = getWindow(interval);
 
-    const { data, error, count } = await supabase
+    // Build Supabase query
+    let query = supabase
       .from("chart_data")
       .select("timestamp, price, change, volume", { count: "exact" })
-      .gte("timestamp", cutoff)
       .order("timestamp", { ascending: true })
       .range(offset, offset + limit - 1);
 
+    if (cutoff) {
+      query = query.gte("timestamp", cutoff);
+    }
+
+    const { data, error, count } = await query;
     if (error) throw error;
 
     const raw = data?.length
       ? data
       : memoryCache.filter(
-          (p) => new Date(p.timestamp) >= new Date(cutoff)
+          (p) => !cutoff || new Date(p.timestamp) >= new Date(cutoff)
         );
 
     const points = bucketize(raw, interval);
@@ -307,12 +304,27 @@ app.get("/api/chart", async (req, res) => {
     const totalCount = count || raw.length;
     const nextPage = offset + limit < totalCount ? page + 1 : null;
 
-    res.json({ points, latest, page, nextPage, hasMore: Boolean(nextPage) });
+    log(
+      "[chart] interval=%s cutoff=%s dbRows=%s buckets=%s",
+      interval,
+      cutoff,
+      data?.length ?? 0,
+      points.length
+    );
+
+    res.json({
+      points,
+      latest,
+      page,
+      nextPage,
+      hasMore: Boolean(nextPage),
+    });
   } catch (e) {
     err("Error /api/chart:", e);
     res.status(500).json({ error: "Failed to fetch chart data" });
   }
 });
+
 
 app.get("/api/latest", async (_req, res) => {
   try {
