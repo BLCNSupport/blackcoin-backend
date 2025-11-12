@@ -198,52 +198,33 @@ async function pollLoop() {
 }
 pollLoop();
 
-/* ---------- Chart API ---------- */
-
-// Max bars per timeframe (TradingView-style)
-const MAX_BARS = 5000;
-
 function bucketMs(interval) {
   switch (interval) {
-    case "1m":
-      return 60e3;       // 1 minute
-    case "5m":
-      return 300e3;      // 5 minutes
-    case "30m":
-      return 1800e3;     // 30 minutes
-    case "1h":
-      return 3600e3;     // 1 hour
-    case "D":
-      return 86400e3;    // 1 day
-    default:
-      return 60e3;
+    case "5m": return 5 * 60 * 1000;
+    case "30m": return 30 * 60 * 1000;
+    case "1h": return 60 * 60 * 1000;
+    case "D": return 24 * 60 * 60 * 1000;
+    default: return 5 * 60 * 1000; // fallback: treat unknown as 5m
   }
 }
 
+
+// Time window per interval:
+// - 1m / 5m / 30m: last 24h
+// - 1h: last 7 days
+// - D: last 30 days
 function getWindow(interval) {
   const now = Date.now();
-  const MINUTE = 60 * 1000;
-  const HOUR = 60 * MINUTE;
-  const DAY = 24 * HOUR;
+  const DAY = 24 * 60 * 60 * 1000;
 
-  switch (interval) {
-    case "1m":
-    case "5m":
-    case "30m":
-      // short TFs: last 24h
-      return new Date(now - 24 * DAY / 24).toISOString(); // == 24 * HOUR
+  if (interval === "D")
+    return new Date(now - 30 * DAY).toISOString();
+  if (interval === "1h")
+    return new Date(now - 7 * DAY).toISOString();
 
-    case "1h":
-      // IMPORTANT: no cutoff → use ALL rows in Supabase and bucket to 1h
-      return null;
-
-    case "D":
-    default:
-      // daily: last 90 days
-      return new Date(now - 90 * DAY).toISOString();
-  }
+  // 1m, 5m, 30m, others → 24h
+  return new Date(now - DAY).toISOString();
 }
-
 
 function floorToBucketUTC(tsISO, interval) {
   const ms = bucketMs(interval);
@@ -255,22 +236,24 @@ function bucketize(rows, interval) {
   const m = new Map();
   for (const r of rows) {
     const key = floorToBucketUTC(r.timestamp, interval).toISOString();
-    const price = +r.price,
-      change = +r.change,
-      vol = +r.volume;
+    const price  = +r.price;
+    const change = +r.change;
+    const vol    = +r.volume;
+
     if (!m.has(key)) {
       m.set(key, { timestamp: key, price, change, volume: 0 });
     }
     const b = m.get(key);
-    b.price = price;
-    b.change = change;
-    b.volume += Number.isNaN(vol) ? 0 : vol;
+    b.price  = price;                // last price in bucket
+    b.change = change;               // last 24h change in bucket
+    b.volume += Number.isNaN(vol) ? 0 : vol; // sum volume
   }
   return Array.from(m.values()).sort(
     (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
   );
 }
 
+// === Chart API ===
 app.get("/api/chart", async (req, res) => {
   try {
     const interval = req.query.interval || "D";
