@@ -89,7 +89,10 @@ const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 
 // Homepage “vaults” (same as in your HTML)
 const CTO_WALLET = "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3";
-const UTILITY_WALLET = "8XuN2RbJHKHkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
+const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
+
+// Wallet that actually performs burns:
+const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
 
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
@@ -1129,7 +1132,7 @@ async function fetchLatestBurnFromRpc() {
   let sigInfos;
   try {
     sigInfos = await rpcBurn("getSignaturesForAddress", [
-      CTO_WALLET,
+      BURN_WALLET,
       { limit: BURN_SEARCH_LIMIT },
     ]);
   } catch (e) {
