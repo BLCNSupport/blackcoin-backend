@@ -779,21 +779,63 @@ app.get("/api/jup/tokens/search", async (req, res) => {
   }
 });
 
-// Generic RPC helper
+// Generic RPC helper (Helius)
 async function rpc(method, params) {
   const r = await fetch(HELIUS_RPC, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
-  if (!r.ok) throw new Error(`RPC ${method} HTTP ${r.status}`);
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    err(
+      `RPC ${method} HTTP ${r.status} — body snippet:`,
+      text.slice(0, 300)
+    );
+    throw new Error(`RPC ${method} HTTP ${r.status}`);
+  }
+
   const j = await r.json();
-  if (j.error)
+  if (j.error) {
+    err(`RPC ${method} JSON error:`, j.error);
     throw new Error(
       `RPC ${method} error: ${j.error.message || "unknown"}`
     );
+  }
   return j.result;
 }
+
+// Fallback plain Solana RPC (for burn scanner only)
+const SOLANA_FALLBACK_RPC =
+  process.env.SOLANA_FALLBACK_RPC || "https://api.mainnet-beta.solana.com";
+
+async function rpcSolana(method, params) {
+  const r = await fetch(SOLANA_FALLBACK_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    err(
+      `Solana RPC ${method} HTTP ${r.status} — body snippet:`,
+      text.slice(0, 300)
+    );
+    throw new Error(`Solana RPC ${method} HTTP ${r.status}`);
+  }
+
+  const j = await r.json();
+  if (j.error) {
+    err(`Solana RPC ${method} JSON error:`, j.error);
+    throw new Error(
+      `Solana RPC ${method} error: ${j.error.message || "unknown"}`
+    );
+  }
+  return j.result;
+}
+
 
 async function getSolUsd() {
   const now = Date.now();
@@ -1072,8 +1114,8 @@ function extractBurnFromParsedTx(tx) {
 }
 
 async function fetchLatestBurnFromHelius() {
-  // 1) grab recent signatures for the CTO wallet
-  const sigInfos = await rpc("getSignaturesForAddress", [
+  // 1) grab recent signatures for the CTO wallet (fallback Solana RPC)
+  const sigInfos = await rpcSolana("getSignaturesForAddress", [
     CTO_WALLET,
     { limit: BURN_SEARCH_LIMIT },
   ]);
@@ -1091,12 +1133,18 @@ async function fetchLatestBurnFromHelius() {
     const sig = info.signature;
     let tx;
     try {
-      tx = await rpc("getParsedTransaction", [
+      tx = await rpcSolana("getParsedTransaction", [
         sig,
-        { maxSupportedTransactionVersion: 0, commitment: "confirmed" },
+        {
+          maxSupportedTransactionVersion: 0,
+          commitment: "confirmed",
+        },
       ]);
     } catch (e) {
-      warn("[burn] getParsedTransaction error:", e?.message || e);
+      warn(
+        "[burn] getParsedTransaction error (fallback RPC):",
+        e?.message || e
+      );
       continue;
     }
     if (!tx) continue;
@@ -1114,7 +1162,7 @@ async function fetchLatestBurnFromHelius() {
       ? new Date(info.blockTime * 1000).toISOString()
       : new Date().toISOString();
 
-        return {
+    return {
       amount: amountUi,
       amountDisplay: `${amountUi.toLocaleString()} ${symbol}`,
 
@@ -1131,6 +1179,7 @@ async function fetchLatestBurnFromHelius() {
 
   return null;
 }
+
 
 async function getLatestBurnTx() {
   const now = Date.now();
