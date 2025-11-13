@@ -2547,7 +2547,7 @@ setInterval(() => {
 
 
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.5 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend:  http://localhost:${PORT}/`);
 });
