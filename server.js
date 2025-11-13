@@ -78,22 +78,6 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// DEV / moderator wallets allowed to post Signal Room broadcasts
-const DEV_WALLETS = (process.env.DEV_WALLETS || "")
-  .split(",")
-  .map((w) => w.trim())
-  .filter(Boolean);
-console.log("[config] DEV_WALLETS =", DEV_WALLETS);
-
-function isDevWallet(wallet) {
-  if (!wallet) return false;
-  return DEV_WALLETS.includes(wallet.trim());
-}
-
-// Simple in-memory throttle to prevent spammy broadcast abuse
-const devBroadcastThrottle = new Map();
-
-
 
 /* ---------- Health ---------- */
 app.get("/healthz", (_req, res) =>
@@ -109,6 +93,12 @@ const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 
 // Wallet that actually performs burns:
 const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
+
+// Dev wallet allowed to post Signal Room broadcasts
+const DEV_WALLETS =
+  process.env.DEV_WALLETS ||
+  "94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru";
+
 
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
@@ -1543,100 +1533,49 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", async (req, res) => {
+app.post("/api/broadcast", requireSession, async (req, res) => {
   try {
-    // 1) Auth: require a valid signed session and wallet
-    const token =
-      req.headers["x-bc-session"] ||
-      req.headers["x-bc-session".toLowerCase()] ||
-      "";
-
-    const { wallet, message: rawMessage, level: rawLevel } = req.body || {};
-
-    if (!token || !wallet) {
-      return res.status(401).json({ error: "auth required" });
-    }
-
-    const session = sessions.get(token);
-    const now = Date.now();
-
-    if (
-      !session ||
-      session.wallet !== wallet ||
-      !session.expiresAt ||
-      session.expiresAt < now
-    ) {
-      console.warn("[/api/broadcast] invalid session for wallet", wallet);
-      return res.status(401).json({ error: "invalid or expired session" });
-    }
-
-    // 2) DEV-only check using DEV_WALLETS
-    if (!isDevWallet(wallet)) {
-      console.warn("[/api/broadcast] non-dev wallet tried to post:", wallet);
-      return res.status(403).json({ error: "dev wallet required" });
-    }
-
-    // 3) Basic message validation + normalization
-    const message = String(rawMessage || "").trim();
+    const message = String((req.body && req.body.message) || "").trim();
     if (!message) {
-      return res.status(400).json({ error: "empty message" });
-    }
-    if (message.length > 500) {
-      return res.status(400).json({ error: "message too long" });
+      return res.status(400).json({ error: "message required" });
     }
 
-    const allowedLevels = new Set(["info", "alert", "warning"]);
-    const level = allowedLevels.has(rawLevel) ? rawLevel : "info";
-
-    // 4) Fetch profile server-side to prevent handle/avatar spoofing
-    let profileHandle = null;
-    let profileAvatar = null;
-
-    try {
-      const { data: profile, error: profileErr } = await supabase
-        .from("hub_profiles")
-        .select("handle, avatar_url")
-        .eq("wallet", wallet)
-        .maybeSingle();
-
-      if (profileErr) {
-        console.warn("[/api/broadcast] profile lookup error:", profileErr);
-      } else if (profile) {
-        profileHandle = profile.handle || null;
-        profileAvatar = profile.avatar_url || null;
-      }
-    } catch (e) {
-      console.warn("[/api/broadcast] profile lookup exception:", e);
+    const devWalletEnv = String(DEV_WALLETS || "").trim();
+    if (!devWalletEnv) {
+      return res
+        .status(500)
+        .json({ error: "DEV_WALLETS not configured on backend" });
     }
 
-    // 5) Insert the broadcast row
-    const row = {
-      wallet,
-      message,
-      level,
-      handle: profileHandle,
-      avatar_url: profileAvatar,
-      is_deleted: false,
-      created_at: new Date().toISOString(),
-    };
+    const sessionWallet = req.auth?.wallet;
+    if (!sessionWallet || sessionWallet !== devWalletEnv) {
+      return res
+        .status(403)
+        .json({ error: "dev_only", detail: "Broadcasts are DEV-only" });
+    }
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert(row)
-      .select("*")
+      .insert([{ wallet: sessionWallet, message }])
+      .select()
       .maybeSingle();
 
-    if (error) {
-      console.error("[/api/broadcast] insert error:", error);
-      return res.status(500).json({ error: "db error" });
-    }
+    if (error) throw error;
+    const row = normRow(data);
 
-    // Supabase realtime will fan this out to WS clients;
-    // we just return the created row for confirmation.
-    return res.json({ ok: true, broadcast: data });
-  } catch (err) {
-    console.error("[/api/broadcast] unexpected error:", err);
-    return res.status(500).json({ error: "internal error" });
+    wsBroadcastAll({ type: "insert", row });
+
+    log(
+      "[broadcast] DEV message inserted by",
+      sessionWallet,
+      "id=",
+      row?.id
+    );
+
+    res.json({ success: true, data: row });
+  } catch (e) {
+    err("Broadcast error:", e);
+    res.status(500).json({ error: e.message || String(e) });
   }
 });
 
@@ -1787,16 +1726,21 @@ app.get("/api/rpc", (_req, res) => {
 const pendingNonces = new Map(); // wallet -> { nonce, created }
 const sessions = new Map();      // token  -> { wallet, created, expiresAt }
 
+/**
+ * Canonical message format signed by Phantom.
+ * This MUST match what the frontend shows in signMessage.
+ * Keep it stable (no dynamic timestamps) so we can
+ * reconstruct it exactly server-side.
+ */
 function buildAuthMessage(wallet, nonce) {
   return [
     "BlackCoin Operator Session v1",
     `Wallet: ${wallet}`,
     `Nonce: ${nonce}`,
-    `Time: ${new Date().toISOString()}`,
   ].join("\n");
 }
 
-// 1) Frontend asks for a nonce/message to sign
+// 1) Frontend asks backend for a nonce + message to sign
 app.get("/api/auth/nonce", (req, res) => {
   try {
     const wallet = String(req.query.wallet || "").trim();
@@ -1804,7 +1748,6 @@ app.get("/api/auth/nonce", (req, res) => {
       return res.status(400).json({ error: "wallet required" });
     }
 
-    // very basic Solana pubkey validation via web3.PublicKey
     try {
       new web3.PublicKey(wallet);
     } catch {
@@ -1822,15 +1765,25 @@ app.get("/api/auth/nonce", (req, res) => {
   }
 });
 
-// 2) Frontend posts signed message; we verify + issue session token
-app.post("/api/auth/verify", (req, res) => {
+/**
+ * 2) Frontend posts signed message; server verifies and
+ *    issues a short-lived session token.
+ *
+ *    Expected body:
+ *      {
+ *        wallet: "<pubkey>",
+ *        nonce: "<nonce from /api/auth/nonce>",
+ *        signature: [ <bytes...> ]   // Uint8Array → regular JS array
+ *      }
+ */
+app.post("/api/session", (req, res) => {
   try {
-    const { wallet, message, signature } = req.body || {};
+    const { wallet, nonce, signature } = req.body || {};
 
-    if (!wallet || !message || !Array.isArray(signature)) {
-      return res
-        .status(400)
-        .json({ error: "wallet, message, signature[] required" });
+    if (!wallet || !nonce || !Array.isArray(signature)) {
+      return res.status(400).json({
+        error: "wallet, nonce and signature[] are required",
+      });
     }
 
     const pending = pendingNonces.get(wallet);
@@ -1838,21 +1791,17 @@ app.post("/api/auth/verify", (req, res) => {
       return res.status(400).json({ error: "no nonce for wallet" });
     }
 
-    // expire nonce after 5 minutes
+    // Nonce must match and be fresh (5 min)
+    if (pending.nonce !== nonce) {
+      return res.status(400).json({ error: "nonce mismatch" });
+    }
     if (Date.now() - pending.created > 5 * 60 * 1000) {
       pendingNonces.delete(wallet);
       return res.status(400).json({ error: "nonce expired" });
     }
 
-    // Rebuild the exact message the backend expects for this nonce
-    const expectedMessage = buildAuthMessage(wallet, pending.nonce);
-
-    // Extra safety: make sure the message they sent back is EXACTLY what we expect
-    if (message !== expectedMessage) {
-      return res.status(400).json({ error: "message does not match nonce" });
-    }
-
-    // Verify signature over the expected message
+    // Rebuild the exact message that was shown to Phantom
+    const expectedMessage = buildAuthMessage(wallet, nonce);
     const msgBytes = encoder.encode(expectedMessage);
     const sigBytes = Uint8Array.from(signature);
 
@@ -1875,7 +1824,7 @@ app.post("/api/auth/verify", (req, res) => {
         .json({ error: "signature verification failed" });
     }
 
-    // signature valid → create session token (2 hours)
+    // Signature valid → issue session token (2 hours)
     const token = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
     const expiresAt = now + 2 * 60 * 60 * 1000;
@@ -1890,23 +1839,34 @@ app.post("/api/auth/verify", (req, res) => {
       expiresAt,
     });
   } catch (e) {
-    err("[auth/verify] error:", e?.message || e);
+    err("[session] error:", e?.message || e);
     return res.status(500).json({ error: "internal error" });
   }
 });
 
-// 3) Middleware: protect staking POST routes
+/**
+ * 3) Middleware: validates session for protected routes.
+ *
+ *    - Looks for token in Authorization: Bearer <token>
+ *      or legacy x-bc-session header.
+ *    - If body/query contains wallet, enforces that it matches
+ *      the session wallet; otherwise it just attaches req.auth.wallet.
+ */
 function requireSession(req, res, next) {
-  const token = req.header("x-bc-session");
-  const wallet =
-    (req.body && req.body.wallet) ||
-    (req.query && req.query.wallet) ||
-    "";
+  const authHeader =
+    req.header("authorization") || req.header("Authorization") || "";
+  let token = null;
 
-  if (!token || !wallet) {
-    return res
-      .status(401)
-      .json({ error: "session and wallet required" });
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    token = authHeader.slice(7).trim();
+  }
+
+  if (!token) {
+    token = req.header("x-bc-session") || "";
+  }
+
+  if (!token) {
+    return res.status(401).json({ error: "session required" });
   }
 
   const session = sessions.get(token);
@@ -1914,18 +1874,29 @@ function requireSession(req, res, next) {
     return res.status(401).json({ error: "invalid session" });
   }
 
-  if (session.wallet !== wallet) {
-    return res.status(401).json({ error: "wallet mismatch for session" });
-  }
-
   if (Date.now() > session.expiresAt) {
     sessions.delete(token);
     return res.status(401).json({ error: "session expired" });
   }
 
+  const walletFromReq =
+    (req.body && req.body.wallet) ||
+    (req.query && req.query.wallet) ||
+    null;
+
+  if (
+    walletFromReq &&
+    String(walletFromReq).trim() !== session.wallet
+  ) {
+    return res
+      .status(401)
+      .json({ error: "wallet mismatch for session" });
+  }
+
   req.auth = { wallet: session.wallet, token };
   next();
 }
+
 
 /* ---- Staking + reward pool config ---- */
 
@@ -2164,11 +2135,10 @@ POST /api/staking/stake
   { wallet, amount, duration_days }
 */
 app.post("/api/staking/stake", requireSession, async (req, res) => {
-  const { amount, duration_days } = req.body || {};
-  const sessionWallet = (req.auth && req.auth.wallet) || "";
-  const w = String(sessionWallet || "").trim();
+  const { wallet, amount, duration_days } = req.body || {};
+  const w = String(wallet || "").trim();
   const amt = Number(amount || 0);
-  const days = Number(duration_days || 0);
+  const dur = Number(duration_days || 0);
 
   if (!w || !amt || !dur) {
     return res
@@ -2272,8 +2242,8 @@ POST /api/staking/claim
   { wallet }
 */
 app.post("/api/staking/claim", requireSession, async (req, res) => {
-   const sessionWallet = (req.auth && req.auth.wallet) || "";
-  const w = String(sessionWallet || "").trim();
+  const { wallet } = req.body || {};
+  const w = String(wallet || "").trim();
   if (!w) return res.status(400).json({ error: "wallet is required" });
 
   try {
@@ -2385,11 +2355,8 @@ POST /api/staking/unstake
   { wallet, stake_id }
 */
 app.post("/api/staking/unstake", requireSession, async (req, res) => {
-  const { stake_id } = req.body || {};
-  const sessionWallet = (req.auth && req.auth.wallet) || "";
-  const w = String(sessionWallet || "").trim();
-  const id = String(stake_id || "").trim();
-
+  const { wallet, stake_id } = req.body || {};
+  const w = String(wallet || "").trim();
 
   if (!w || !stake_id) {
     return res
