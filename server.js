@@ -505,20 +505,10 @@ function setWithLimit(map, key, value) {
 }
 
 /* ---------- Token Meta Resolver (shared) ---------- */
-const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h
-const MEMO_META = new Map();
-function memoGetMeta(mint) {
-  const e = MEMO_META.get(mint);
-  if (!e) return null;
-  if (Date.now() - e.t > META_TTL_MS) {
-    MEMO_META.delete(mint);
-    return null;
-  }
-  return e.v;
-}
-function memoSetMeta(mint, v) {
-  setWithLimit(MEMO_META, mint, { v, t: Date.now() });
-}
+const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h, applied against token_meta.updated_at
+// In-process memo for token_meta removed so that manual edits in Supabase
+// (like logo_override) take effect on the very next request.
+
 
 /* ------- Jupiter Tokens API v2 helpers ------- */
 async function jupV2Search(query) {
@@ -704,13 +694,9 @@ async function resolveTokenMetaCombined(
   mint,
   { nocache = false } = {}
 ) {
-  // in-memory memo
-  if (!nocache) {
-    const memo = memoGetMeta(mint);
-    if (memo) return memo;
-  }
+  // 1) Check token_meta row in Supabase first
+  let existing = null;
 
-  // supabase cache (≤6h)
   if (!nocache) {
     const { data: cached } = await supabase
       .from("token_meta")
@@ -718,17 +704,22 @@ async function resolveTokenMetaCombined(
       .eq("mint", mint)
       .maybeSingle();
 
-    if (
-      cached &&
-      Date.now() - new Date(cached.updated_at).getTime() <
-        META_TTL_MS
-    ) {
-      memoSetMeta(mint, cached);
-      return cached;
+    if (cached) {
+      existing = cached;
+      const updated = cached.updated_at
+        ? new Date(cached.updated_at).getTime()
+        : 0;
+      const age = updated ? Date.now() - updated : Infinity;
+
+      // If row is "fresh" (within TTL), just use it as-is.
+      // This includes any manual logo_override you've set.
+      if (updated && age < META_TTL_MS && !nocache) {
+        return cached;
+      }
     }
   }
 
-  // fan-out (Jupiter v2 preferred)
+  // 2) Fan-out (Jupiter v2 preferred)
   const [jupV2, hel, dskr, pump, solscan] = await Promise.all([
     fetchJupiterV2ByMint(mint),
     fetchHeliusDAS(mint),
@@ -738,9 +729,6 @@ async function resolveTokenMetaCombined(
   ]);
 
   let merged = mergeMetaParts(solscan, jupV2, hel, pump, dskr);
-
-  // NOTE: no heavy Helius holder scan here; we rely on Solscan/Dexscreener snapshot
-  // to avoid massive getProgramAccounts over the full token set.
 
   // compute market cap if missing but price & supply are present
   if (
@@ -770,6 +758,10 @@ async function resolveTokenMetaCombined(
     market_cap_usd: Number(merged.market_cap_usd || 0),
     holders:
       typeof merged.holders === "number" ? merged.holders : null,
+
+    // 🔹 NEW: preserve any manual override already stored in token_meta
+    logo_override: existing?.logo_override ?? null,
+
     source: {
       jupiter_v2: !!jupV2,
       helius: !!hel,
@@ -780,7 +772,7 @@ async function resolveTokenMetaCombined(
     updated_at: new Date().toISOString(),
   };
 
-  // upsert cache unless nocache requested
+  // 3) Upsert back into token_meta (but do NOT touch logo_override)
   try {
     await supabase
       .from("token_meta")
@@ -789,7 +781,6 @@ async function resolveTokenMetaCombined(
     warn("token_meta upsert failed (non-fatal):", e?.message || e);
   }
 
-  memoSetMeta(mint, payload);
   return payload;
 }
 
