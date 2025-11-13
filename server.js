@@ -83,6 +83,7 @@ const DEV_WALLETS = (process.env.DEV_WALLETS || "")
   .split(",")
   .map((w) => w.trim())
   .filter(Boolean);
+console.log("[config] DEV_WALLETS =", DEV_WALLETS);
 
 function isDevWallet(wallet) {
   if (!wallet) return false;
