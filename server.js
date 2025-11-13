@@ -78,6 +78,21 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// DEV / moderator wallets allowed to post Signal Room broadcasts
+const DEV_WALLETS = (process.env.DEV_WALLETS || "")
+  .split(",")
+  .map((w) => w.trim())
+  .filter(Boolean);
+
+function isDevWallet(wallet) {
+  if (!wallet) return false;
+  return DEV_WALLETS.includes(wallet);
+}
+
+// Simple in-memory throttle to prevent spammy broadcast abuse
+const devBroadcastThrottle = new Map();
+
+
 
 /* ---------- Health ---------- */
 app.get("/healthz", (_req, res) =>
@@ -1527,16 +1542,42 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", async (req, res) => {
+app.post("/api/broadcast", requireSession, async (req, res) => {
   try {
-    const { wallet, message } = req.body;
-    if (!wallet || !message) {
-      return res.status(400).json({ error: "Missing" });
+    const session = req.auth || {};
+    const wallet = session.wallet;
+
+    if (!wallet) {
+      return res.status(401).json({ error: "No wallet on session" });
     }
+
+    // Only allow DEV wallets to post Signal Room messages
+    if (!isDevWallet(wallet)) {
+      return res.status(403).json({ error: "Not authorized to broadcast" });
+    }
+
+    // Basic message sanitization + length cap
+    let msg = (req.body && req.body.message) ?? "";
+    msg = String(msg).trim();
+
+    if (!msg) {
+      return res.status(400).json({ error: "Message required" });
+    }
+    if (msg.length > 400) {
+      msg = msg.slice(0, 400);
+    }
+
+    // Simple in-memory throttle: 1 broadcast every 3 seconds per dev wallet
+    const now = Date.now();
+    const last = devBroadcastThrottle.get(wallet) || 0;
+    if (now - last < 3000) {
+      return res.status(429).json({ error: "Too many broadcasts, slow down." });
+    }
+    devBroadcastThrottle.set(wallet, now);
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert([{ wallet, message }])
+      .insert([{ wallet, message: msg }])
       .select()
       .maybeSingle();
 
@@ -1548,9 +1589,10 @@ app.post("/api/broadcast", async (req, res) => {
     res.json({ success: true, data: row });
   } catch (e) {
     err("Broadcast error:", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Broadcast failed" });
   }
 });
+
 
 app.get("/api/broadcasts", async (_req, res) => {
   try {
