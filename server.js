@@ -740,6 +740,21 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
     merged.market_cap_usd = merged.price_usd * merged.supply;
   }
 
+  // Prefer manual image in token_meta.image if one is set
+  const overrideImage =
+    existing &&
+    typeof existing.image === "string" &&
+    existing.image.trim()
+      ? existing.image.trim()
+      : null;
+
+  const finalImage =
+    overrideImage ||
+    merged.image ||
+    jupV2?.image ||
+    hel?.image ||
+    null;
+
   const payload = {
     mint,
     name: merged.name || jupV2?.name || hel?.name || null,
@@ -752,7 +767,10 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
         : typeof hel?.decimals === "number"
         ? hel.decimals
         : 0,
-    image: merged.image || jupV2?.image || hel?.image || null,
+
+    // 🔹 This now respects your Supabase token_meta.image override
+    image: finalImage,
+
     description: merged.description || pump?.description || null,
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
@@ -760,7 +778,7 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
     holders:
       typeof merged.holders === "number" ? merged.holders : null,
 
-    // 🔹 NEW: preserve any manual override already stored in token_meta
+    // 🔹 Still preserve logo_override if you ever use that column separately
     logo_override: existing?.logo_override ?? null,
 
     source: {
