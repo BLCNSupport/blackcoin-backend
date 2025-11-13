@@ -87,7 +87,7 @@ console.log("[config] DEV_WALLETS =", DEV_WALLETS);
 
 function isDevWallet(wallet) {
   if (!wallet) return false;
-  return DEV_WALLETS.includes(wallet);
+  return DEV_WALLETS.includes(wallet.trim());
 }
 
 // Simple in-memory throttle to prevent spammy broadcast abuse
@@ -1543,54 +1543,100 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", requireSession, async (req, res) => {
+app.post("/api/broadcast", async (req, res) => {
   try {
-    const session = req.auth || {};
-    const wallet = session.wallet;
+    // 1) Auth: require a valid signed session and wallet
+    const token =
+      req.headers["x-bc-session"] ||
+      req.headers["x-bc-session".toLowerCase()] ||
+      "";
 
-    if (!wallet) {
-      return res.status(401).json({ error: "No wallet on session" });
+    const { wallet, message: rawMessage, level: rawLevel } = req.body || {};
+
+    if (!token || !wallet) {
+      return res.status(401).json({ error: "auth required" });
     }
 
-    // Only allow DEV wallets to post Signal Room messages
-    if (!isDevWallet(wallet)) {
-      return res.status(403).json({ error: "Not authorized to broadcast" });
-    }
-
-    // Basic message sanitization + length cap
-    let msg = (req.body && req.body.message) ?? "";
-    msg = String(msg).trim();
-
-    if (!msg) {
-      return res.status(400).json({ error: "Message required" });
-    }
-    if (msg.length > 400) {
-      msg = msg.slice(0, 400);
-    }
-
-    // Simple in-memory throttle: 1 broadcast every 3 seconds per dev wallet
+    const session = sessions.get(token);
     const now = Date.now();
-    const last = devBroadcastThrottle.get(wallet) || 0;
-    if (now - last < 3000) {
-      return res.status(429).json({ error: "Too many broadcasts, slow down." });
+
+    if (
+      !session ||
+      session.wallet !== wallet ||
+      !session.expiresAt ||
+      session.expiresAt < now
+    ) {
+      console.warn("[/api/broadcast] invalid session for wallet", wallet);
+      return res.status(401).json({ error: "invalid or expired session" });
     }
-    devBroadcastThrottle.set(wallet, now);
+
+    // 2) DEV-only check using DEV_WALLETS
+    if (!isDevWallet(wallet)) {
+      console.warn("[/api/broadcast] non-dev wallet tried to post:", wallet);
+      return res.status(403).json({ error: "dev wallet required" });
+    }
+
+    // 3) Basic message validation + normalization
+    const message = String(rawMessage || "").trim();
+    if (!message) {
+      return res.status(400).json({ error: "empty message" });
+    }
+    if (message.length > 500) {
+      return res.status(400).json({ error: "message too long" });
+    }
+
+    const allowedLevels = new Set(["info", "alert", "warning"]);
+    const level = allowedLevels.has(rawLevel) ? rawLevel : "info";
+
+    // 4) Fetch profile server-side to prevent handle/avatar spoofing
+    let profileHandle = null;
+    let profileAvatar = null;
+
+    try {
+      const { data: profile, error: profileErr } = await supabase
+        .from("hub_profiles")
+        .select("handle, avatar_url")
+        .eq("wallet", wallet)
+        .maybeSingle();
+
+      if (profileErr) {
+        console.warn("[/api/broadcast] profile lookup error:", profileErr);
+      } else if (profile) {
+        profileHandle = profile.handle || null;
+        profileAvatar = profile.avatar_url || null;
+      }
+    } catch (e) {
+      console.warn("[/api/broadcast] profile lookup exception:", e);
+    }
+
+    // 5) Insert the broadcast row
+    const row = {
+      wallet,
+      message,
+      level,
+      handle: profileHandle,
+      avatar_url: profileAvatar,
+      is_deleted: false,
+      created_at: new Date().toISOString(),
+    };
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert([{ wallet, message: msg }])
-      .select()
+      .insert(row)
+      .select("*")
       .maybeSingle();
 
-    if (error) throw error;
-    const row = normRow(data);
+    if (error) {
+      console.error("[/api/broadcast] insert error:", error);
+      return res.status(500).json({ error: "db error" });
+    }
 
-    wsBroadcastAll({ type: "insert", row });
-
-    res.json({ success: true, data: row });
-  } catch (e) {
-    err("Broadcast error:", e);
-    res.status(500).json({ error: "Broadcast failed" });
+    // Supabase realtime will fan this out to WS clients;
+    // we just return the created row for confirmation.
+    return res.json({ ok: true, broadcast: data });
+  } catch (err) {
+    console.error("[/api/broadcast] unexpected error:", err);
+    return res.status(500).json({ error: "internal error" });
   }
 });
 
