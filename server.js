@@ -2075,10 +2075,11 @@ POST /api/staking/stake
   { wallet, amount, duration_days }
 */
 app.post("/api/staking/stake", requireSession, async (req, res) => {
-  const { wallet, amount, duration_days } = req.body || {};
-  const w = String(wallet || "").trim();
+  const { amount, duration_days } = req.body || {};
+  const sessionWallet = (req.auth && req.auth.wallet) || "";
+  const w = String(sessionWallet || "").trim();
   const amt = Number(amount || 0);
-  const dur = Number(duration_days || 0);
+  const days = Number(duration_days || 0);
 
   if (!w || !amt || !dur) {
     return res
@@ -2182,8 +2183,8 @@ POST /api/staking/claim
   { wallet }
 */
 app.post("/api/staking/claim", requireSession, async (req, res) => {
-  const { wallet } = req.body || {};
-  const w = String(wallet || "").trim();
+   const sessionWallet = (req.auth && req.auth.wallet) || "";
+  const w = String(sessionWallet || "").trim();
   if (!w) return res.status(400).json({ error: "wallet is required" });
 
   try {
@@ -2295,8 +2296,11 @@ POST /api/staking/unstake
   { wallet, stake_id }
 */
 app.post("/api/staking/unstake", requireSession, async (req, res) => {
-  const { wallet, stake_id } = req.body || {};
-  const w = String(wallet || "").trim();
+  const { stake_id } = req.body || {};
+  const sessionWallet = (req.auth && req.auth.wallet) || "";
+  const w = String(sessionWallet || "").trim();
+  const id = String(stake_id || "").trim();
+
 
   if (!w || !stake_id) {
     return res
