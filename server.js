@@ -124,35 +124,6 @@ async function insertPoint(point) {
   }
 }
 
-/* ---------- CoinGecko simple price proxy (CORS-safe for browser) ---------- */
-app.get("/api/proxy/coingecko/simple-price", async (req, res) => {
-  try {
-    const ids = req.query.ids || "solana";
-    const vs  = req.query.vs_currencies || "usd";
-    const inc = req.query.include_24hr_change || "true";
-
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids)}&vs_currencies=${encodeURIComponent(vs)}&include_24hr_change=${encodeURIComponent(inc)}`;
-
-    const r = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        // If you have a CoinGecko key, uncomment the next line and set env COINGECKO_API_KEY
-        // "x-cg-demo-api-key": process.env.COINGECKO_API_KEY || ""
-      }
-    });
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      return res.status(r.status).json({ ok:false, upstreamStatus:r.status, error:text });
-    }
-
-    const data = await r.json();
-    res.json(data); // global cors() already adds CORS headers
-  } catch (e) {
-    res.status(502).json({ ok:false, error:String(e) });
-  }
-});
-
 
 async function fetchOneTick() {
   fetchInProgress = true;
