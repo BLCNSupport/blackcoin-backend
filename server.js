@@ -880,13 +880,17 @@ async function getTokenMeta(mint) {
 
   try {
     const j = await resolveTokenMetaCombined(mint);
+
     const meta = {
       symbol: j?.symbol || "",
       name: j?.name || "",
+      // auto-fetched logo from merged meta
       logo: j?.image || "",
+      // NEW: carry through manual override from token_meta row (if present)
+      logo_override: j?.logo_override || null,
       decimals:
         typeof j?.decimals === "number" ? j.decimals : undefined,
-      tags: [],
+      tags: Array.isArray(j?.tags) ? j.tags : [],
       isVerified: Boolean(
         j?.market_cap_usd || j?.price_usd || j?.supply
       ),
@@ -901,6 +905,7 @@ async function getTokenMeta(mint) {
       supply:
         typeof j?.supply === "number" ? j.supply : undefined,
     };
+
     setWithLimit(META_CACHE, mint, { ts: now, data: meta });
     return meta;
   } catch {
@@ -911,6 +916,8 @@ async function getTokenMeta(mint) {
         symbol: v2?.symbol || "",
         name: v2?.name || "",
         logo: v2?.image || "",
+        // NEW: no override from Jupiter, so always null here
+        logo_override: null,
         tags: Array.isArray(v2?.tags) ? v2.tags : [],
         isVerified: Boolean(v2?.symbol && v2?.name),
         decimals:
@@ -921,10 +928,12 @@ async function getTokenMeta(mint) {
       setWithLimit(META_CACHE, mint, { ts: now, data: meta });
       return meta;
     } catch {}
+
     const meta = {
       symbol: "",
       name: "",
       logo: "",
+      logo_override: null,
       tags: [],
       isVerified: false,
       decimals: undefined,
@@ -933,6 +942,7 @@ async function getTokenMeta(mint) {
     return meta;
   }
 }
+
 
 /* ---------- Price (Jupiter v3 primary, Dexscreener fallback) + WS tick ---------- */
 async function getTokenUsd(mint, { nocache = false } = {}) {
@@ -1455,40 +1465,47 @@ app.post("/api/balances", async (req, res) => {
       commitment
     );
 
-    const enriched = await Promise.all(
-      tokenAccounts.map(async (t) => {
-        const meta = await getTokenMeta(t.mint);
-        const decimals =
-          typeof meta.decimals === "number"
-            ? meta.decimals
-            : t.decimals;
-        const priceUsd = await getTokenUsd(t.mint, { nocache });
-        const usd = priceUsd * t.amount;
+   const enriched = await Promise.all(
+  tokenAccounts.map(async (t) => {
+    const meta = await getTokenMeta(t.mint);
+    const decimals =
+      typeof meta.decimals === "number"
+        ? meta.decimals
+        : t.decimals;
+    const priceUsd = await getTokenUsd(t.mint, { nocache });
+    const usd = priceUsd * t.amount;
 
-        return {
-          mint: t.mint,
-          amount: t.amount,
-          decimals,
-          symbol: meta.symbol || "",
-          name: meta.name || "",
-          logo: meta.logo || "",
-          tags: meta.tags || [],
-          isVerified: Boolean(meta.isVerified),
-          priceUsd,
-          usd,
+    // NEW: manual override wins, then auto logo, then empty string
+    const logoUrl =
+      (meta.logo_override &&
+        String(meta.logo_override).trim()) ||
+      (meta.logo && String(meta.logo).trim()) ||
+      "";
 
-          // meta extras for wallet popup
-          marketCapUsd:
-            typeof meta.market_cap_usd === "number"
-              ? meta.market_cap_usd
-              : null,
-          holders:
-            typeof meta.holders === "number" ? meta.holders : null,
-          supply:
-            typeof meta.supply === "number" ? meta.supply : null,
-        };
-      })
-    );
+    return {
+      mint: t.mint,
+      amount: t.amount,
+      decimals,
+      symbol: meta.symbol || "",
+      name: meta.name || "",
+      logo: logoUrl,
+      tags: meta.tags || [],
+      isVerified: Boolean(meta.isVerified),
+      priceUsd,
+      usd,
+
+      // meta extras for wallet popup
+      marketCapUsd:
+        typeof meta.market_cap_usd === "number"
+          ? meta.market_cap_usd
+          : null,
+      holders:
+        typeof meta.holders === "number" ? meta.holders : null,
+      supply:
+        typeof meta.supply === "number" ? meta.supply : null,
+    };
+  })
+);
 
     enriched.sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
