@@ -94,12 +94,6 @@ const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 // Wallet that actually performs burns:
 const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
 
-// Dev wallet allowed to post Signal Room broadcasts
-const DEV_WALLETS =
-  process.env.DEV_WALLETS ||
-  "94BkuiUMv7jMGKBEhQ87gJVqk9kyQiFus5HbR3hGzhru";
-
-
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
 let isBackoff = false,
@@ -1533,30 +1527,16 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", requireSession, async (req, res) => {
+app.post("/api/broadcast", async (req, res) => {
   try {
-    const message = String((req.body && req.body.message) || "").trim();
-    if (!message) {
-      return res.status(400).json({ error: "message required" });
-    }
-
-    const devWalletEnv = String(DEV_WALLETS || "").trim();
-    if (!devWalletEnv) {
-      return res
-        .status(500)
-        .json({ error: "DEV_WALLETS not configured on backend" });
-    }
-
-    const sessionWallet = req.auth?.wallet;
-    if (!sessionWallet || sessionWallet !== devWalletEnv) {
-      return res
-        .status(403)
-        .json({ error: "dev_only", detail: "Broadcasts are DEV-only" });
+    const { wallet, message } = req.body;
+    if (!wallet || !message) {
+      return res.status(400).json({ error: "Missing" });
     }
 
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert([{ wallet: sessionWallet, message }])
+      .insert([{ wallet, message }])
       .select()
       .maybeSingle();
 
@@ -1565,20 +1545,12 @@ app.post("/api/broadcast", requireSession, async (req, res) => {
 
     wsBroadcastAll({ type: "insert", row });
 
-    log(
-      "[broadcast] DEV message inserted by",
-      sessionWallet,
-      "id=",
-      row?.id
-    );
-
     res.json({ success: true, data: row });
   } catch (e) {
     err("Broadcast error:", e);
-    res.status(500).json({ error: e.message || String(e) });
+    res.status(500).json({ error: e.message });
   }
 });
-
 
 app.get("/api/broadcasts", async (_req, res) => {
   try {
@@ -1726,21 +1698,16 @@ app.get("/api/rpc", (_req, res) => {
 const pendingNonces = new Map(); // wallet -> { nonce, created }
 const sessions = new Map();      // token  -> { wallet, created, expiresAt }
 
-/**
- * Canonical message format signed by Phantom.
- * This MUST match what the frontend shows in signMessage.
- * Keep it stable (no dynamic timestamps) so we can
- * reconstruct it exactly server-side.
- */
 function buildAuthMessage(wallet, nonce) {
   return [
     "BlackCoin Operator Session v1",
     `Wallet: ${wallet}`,
     `Nonce: ${nonce}`,
+    `Time: ${new Date().toISOString()}`,
   ].join("\n");
 }
 
-// 1) Frontend asks backend for a nonce + message to sign
+// 1) Frontend asks for a nonce/message to sign
 app.get("/api/auth/nonce", (req, res) => {
   try {
     const wallet = String(req.query.wallet || "").trim();
@@ -1748,6 +1715,7 @@ app.get("/api/auth/nonce", (req, res) => {
       return res.status(400).json({ error: "wallet required" });
     }
 
+    // very basic Solana pubkey validation via web3.PublicKey
     try {
       new web3.PublicKey(wallet);
     } catch {
@@ -1765,25 +1733,15 @@ app.get("/api/auth/nonce", (req, res) => {
   }
 });
 
-/**
- * 2) Frontend posts signed message; server verifies and
- *    issues a short-lived session token.
- *
- *    Expected body:
- *      {
- *        wallet: "<pubkey>",
- *        nonce: "<nonce from /api/auth/nonce>",
- *        signature: [ <bytes...> ]   // Uint8Array → regular JS array
- *      }
- */
-app.post("/api/session", (req, res) => {
+// 2) Frontend posts signed message; we verify + issue session token
+app.post("/api/auth/verify", (req, res) => {
   try {
-    const { wallet, nonce, signature } = req.body || {};
+    const { wallet, message, signature } = req.body || {};
 
-    if (!wallet || !nonce || !Array.isArray(signature)) {
-      return res.status(400).json({
-        error: "wallet, nonce and signature[] are required",
-      });
+    if (!wallet || !message || !Array.isArray(signature)) {
+      return res
+        .status(400)
+        .json({ error: "wallet, message, signature[] required" });
     }
 
     const pending = pendingNonces.get(wallet);
@@ -1791,17 +1749,21 @@ app.post("/api/session", (req, res) => {
       return res.status(400).json({ error: "no nonce for wallet" });
     }
 
-    // Nonce must match and be fresh (5 min)
-    if (pending.nonce !== nonce) {
-      return res.status(400).json({ error: "nonce mismatch" });
-    }
+    // expire nonce after 5 minutes
     if (Date.now() - pending.created > 5 * 60 * 1000) {
       pendingNonces.delete(wallet);
       return res.status(400).json({ error: "nonce expired" });
     }
 
-    // Rebuild the exact message that was shown to Phantom
-    const expectedMessage = buildAuthMessage(wallet, nonce);
+    // Rebuild the exact message the backend expects for this nonce
+    const expectedMessage = buildAuthMessage(wallet, pending.nonce);
+
+    // Extra safety: make sure the message they sent back is EXACTLY what we expect
+    if (message !== expectedMessage) {
+      return res.status(400).json({ error: "message does not match nonce" });
+    }
+
+    // Verify signature over the expected message
     const msgBytes = encoder.encode(expectedMessage);
     const sigBytes = Uint8Array.from(signature);
 
@@ -1824,7 +1786,7 @@ app.post("/api/session", (req, res) => {
         .json({ error: "signature verification failed" });
     }
 
-    // Signature valid → issue session token (2 hours)
+    // signature valid → create session token (2 hours)
     const token = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
     const expiresAt = now + 2 * 60 * 60 * 1000;
@@ -1839,34 +1801,23 @@ app.post("/api/session", (req, res) => {
       expiresAt,
     });
   } catch (e) {
-    err("[session] error:", e?.message || e);
+    err("[auth/verify] error:", e?.message || e);
     return res.status(500).json({ error: "internal error" });
   }
 });
 
-/**
- * 3) Middleware: validates session for protected routes.
- *
- *    - Looks for token in Authorization: Bearer <token>
- *      or legacy x-bc-session header.
- *    - If body/query contains wallet, enforces that it matches
- *      the session wallet; otherwise it just attaches req.auth.wallet.
- */
+// 3) Middleware: protect staking POST routes
 function requireSession(req, res, next) {
-  const authHeader =
-    req.header("authorization") || req.header("Authorization") || "";
-  let token = null;
+  const token = req.header("x-bc-session");
+  const wallet =
+    (req.body && req.body.wallet) ||
+    (req.query && req.query.wallet) ||
+    "";
 
-  if (authHeader.toLowerCase().startsWith("bearer ")) {
-    token = authHeader.slice(7).trim();
-  }
-
-  if (!token) {
-    token = req.header("x-bc-session") || "";
-  }
-
-  if (!token) {
-    return res.status(401).json({ error: "session required" });
+  if (!token || !wallet) {
+    return res
+      .status(401)
+      .json({ error: "session and wallet required" });
   }
 
   const session = sessions.get(token);
@@ -1874,29 +1825,18 @@ function requireSession(req, res, next) {
     return res.status(401).json({ error: "invalid session" });
   }
 
+  if (session.wallet !== wallet) {
+    return res.status(401).json({ error: "wallet mismatch for session" });
+  }
+
   if (Date.now() > session.expiresAt) {
     sessions.delete(token);
     return res.status(401).json({ error: "session expired" });
   }
 
-  const walletFromReq =
-    (req.body && req.body.wallet) ||
-    (req.query && req.query.wallet) ||
-    null;
-
-  if (
-    walletFromReq &&
-    String(walletFromReq).trim() !== session.wallet
-  ) {
-    return res
-      .status(401)
-      .json({ error: "wallet mismatch for session" });
-  }
-
   req.auth = { wallet: session.wallet, token };
   next();
 }
-
 
 /* ---- Staking + reward pool config ---- */
 
