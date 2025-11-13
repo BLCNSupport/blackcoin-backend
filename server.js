@@ -690,34 +690,64 @@ function mergeMetaParts(...parts) {
 }
 
 // shared implementation
-async function resolveTokenMetaCombined(
-  mint,
-  { nocache = false } = {}
-) {
-  // 1) Check token_meta row in Supabase first
+async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
+  // 1) Always check token_meta row in Supabase first
   let existing = null;
 
-  if (!nocache) {
-    const { data: cached } = await supabase
+  try {
+    const { data: row, error: selErr } = await supabase
       .from("token_meta")
       .select("*")
       .eq("mint", mint)
       .maybeSingle();
 
-    if (cached) {
-      existing = cached;
-      const updated = cached.updated_at
-        ? new Date(cached.updated_at).getTime()
+    if (selErr) {
+      warn("token_meta select error (non-fatal):", selErr.message);
+    }
+    if (row) {
+      existing = row;
+      const updated = row.updated_at
+        ? new Date(row.updated_at).getTime()
         : 0;
       const age = updated ? Date.now() - updated : Infinity;
 
-      // If row is "fresh" (within TTL), just use it as-is.
-      // This includes any manual logo_override you've set.
-      if (updated && age < META_TTL_MS && !nocache) {
-        return cached;
+      // Only short-circuit when NOT forcing nocache
+      if (!nocache && updated && age < META_TTL_MS) {
+        return row;
       }
     }
+  } catch (e) {
+    warn("token_meta select exception (non-fatal):", e?.message || e);
   }
+
+  // 2) Fan-out (Jupiter, Helius, Pump, Solscan, Dexscreener) as you already do...
+  const [jupV2, hel, dskr, pump, solscan] = await Promise.all([
+    fetchJupiterV2ByMint(mint),
+    fetchHeliusDAS(mint),
+    fetchDexscreenerMeta(mint),
+    fetchPumpFunMeta(mint),
+    fetchSolscanMeta(mint),
+  ]);
+
+  let merged = mergeMetaParts(solscan, jupV2, hel, pump, dskr);
+
+  // ...rest of your function stays the same, **including**:
+  const payload = {
+    mint,
+    // ...
+    image: merged.image || jupV2?.image || hel?.image || null,
+
+    // 🔹 keep override from existing row, if present
+    logo_override: existing?.logo_override ?? null,
+
+    // ...
+    updated_at: new Date().toISOString(),
+  };
+
+  // upsert payload back into token_meta as you already do
+  // ...
+}
+
 
   // 2) Fan-out (Jupiter v2 preferred)
   const [jupV2, hel, dskr, pump, solscan] = await Promise.all([
