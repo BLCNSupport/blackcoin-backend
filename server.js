@@ -690,37 +690,36 @@ function mergeMetaParts(...parts) {
 }
 
 // shared implementation
-async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
-  // 1) Always check token_meta row in Supabase first
+async function resolveTokenMetaCombined(
+  mint,
+  { nocache = false } = {}
+) {
+  // 1) Check token_meta row in Supabase first
   let existing = null;
 
-  try {
-    const { data: row, error: selErr } = await supabase
+  if (!nocache) {
+    const { data: cached } = await supabase
       .from("token_meta")
       .select("*")
       .eq("mint", mint)
       .maybeSingle();
 
-    if (selErr) {
-      warn("token_meta select error (non-fatal):", selErr.message);
-    }
-    if (row) {
-      existing = row;
-      const updated = row.updated_at
-        ? new Date(row.updated_at).getTime()
+    if (cached) {
+      existing = cached;
+      const updated = cached.updated_at
+        ? new Date(cached.updated_at).getTime()
         : 0;
       const age = updated ? Date.now() - updated : Infinity;
 
-      // Only short-circuit when NOT forcing nocache
-      if (!nocache && updated && age < META_TTL_MS) {
-        return row;
+      // If row is "fresh" (within TTL), just use it as-is.
+      // This includes any manual logo_override you've set.
+      if (updated && age < META_TTL_MS && !nocache) {
+        return cached;
       }
     }
-  } catch (e) {
-    warn("token_meta select exception (non-fatal):", e?.message || e);
   }
 
-  // 2) Fan-out (Jupiter, Helius, Pump, Solscan, Dexscreener) as you already do...
+  // 2) Fan-out (Jupiter v2 preferred)
   const [jupV2, hel, dskr, pump, solscan] = await Promise.all([
     fetchJupiterV2ByMint(mint),
     fetchHeliusDAS(mint),
@@ -740,21 +739,6 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
     merged.market_cap_usd = merged.price_usd * merged.supply;
   }
 
-  // Prefer manual image in token_meta.image if one is set
-  const overrideImage =
-    existing &&
-    typeof existing.image === "string" &&
-    existing.image.trim()
-      ? existing.image.trim()
-      : null;
-
-  const finalImage =
-    overrideImage ||
-    merged.image ||
-    jupV2?.image ||
-    hel?.image ||
-    null;
-
   const payload = {
     mint,
     name: merged.name || jupV2?.name || hel?.name || null,
@@ -767,10 +751,7 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
         : typeof hel?.decimals === "number"
         ? hel.decimals
         : 0,
-
-    // 🔹 This now respects your Supabase token_meta.image override
-    image: finalImage,
-
+    image: merged.image || jupV2?.image || hel?.image || null,
     description: merged.description || pump?.description || null,
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
@@ -778,7 +759,7 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
     holders:
       typeof merged.holders === "number" ? merged.holders : null,
 
-    // 🔹 Still preserve logo_override if you ever use that column separately
+    // 🔹 NEW: preserve any manual override already stored in token_meta
     logo_override: existing?.logo_override ?? null,
 
     source: {
@@ -2566,7 +2547,7 @@ setInterval(() => {
 
 
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v11.5 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend:  http://localhost:${PORT}/`);
 });
