@@ -29,10 +29,6 @@ import {
   createTransferInstruction,
   TOKEN_PROGRAM_ID as SPL_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import bs58 from "bs58";
-
-import crypto from "crypto";
-import nacl from "tweetnacl";
 import { TextEncoder } from "util";
 
 const encoder = new TextEncoder();
@@ -142,13 +138,6 @@ const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 
 // Wallet that actually performs burns:
 const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
-
-// DEV wallets allowed to post to Signal Room (set in Render env: DEV_WALLETS="wallet1,wallet2")
-const DEV_WALLETS =
-  (process.env.DEV_WALLETS || "")
-    .split(",")
-    .map((w) => w.trim().toLowerCase())
-    .filter(Boolean);
 
 
 let FETCH_INTERVAL = 70000;
