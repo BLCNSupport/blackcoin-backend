@@ -751,7 +751,7 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
         : typeof hel?.decimals === "number"
         ? hel.decimals
         : 0,
-    image: merged.image || jupV2?.image || hel?.image || null,
+    image: existing?.logo_override || merged.image || jupV2?.image || hel?.image || null,
     description: merged.description || pump?.description || null,
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
