@@ -94,6 +94,14 @@ const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
 // Wallet that actually performs burns:
 const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
 
+// DEV wallets allowed to post to Signal Room (set in Render env: DEV_WALLETS="wallet1,wallet2")
+const DEV_WALLETS =
+  (process.env.DEV_WALLETS || "")
+    .split(",")
+    .map((w) => w.trim().toLowerCase())
+    .filter(Boolean);
+
+
 let FETCH_INTERVAL = 70000;
 const BACKOFF_INTERVAL = 180000;
 let isBackoff = false,
@@ -1527,16 +1535,47 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", async (req, res) => {
+app.post("/api/broadcast", requireSession, async (req, res) => {
   try {
-    const { wallet, message } = req.body;
-    if (!wallet || !message) {
-      return res.status(400).json({ error: "Missing" });
+    // Wallet from the verified session (set by requireSession)
+    const sessionWallet = (req.auth?.wallet || "").toLowerCase();
+
+    if (!sessionWallet) {
+      return res
+        .status(401)
+        .json({ error: "Missing session wallet" });
     }
 
+    // Only allow DEV wallets from Render env
+    if (!DEV_WALLETS.includes(sessionWallet)) {
+      warn(
+        "[broadcast] unauthorized attempt by",
+        sessionWallet,
+        "DEV_WALLETS=",
+        DEV_WALLETS
+      );
+      return res
+        .status(403)
+        .json({ error: "Not authorized to broadcast" });
+    }
+
+    // Read message from body and clamp length
+    const { message } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    const cleanMessage = message.trim().slice(0, 500);
+    if (!cleanMessage) {
+      return res
+        .status(400)
+        .json({ error: "Message cannot be empty" });
+    }
+
+    // Insert using the *session* wallet, ignore any wallet in body
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert([{ wallet, message }])
+      .insert([{ wallet: sessionWallet, message: cleanMessage }])
       .select()
       .maybeSingle();
 
@@ -1545,12 +1584,15 @@ app.post("/api/broadcast", async (req, res) => {
 
     wsBroadcastAll({ type: "insert", row });
 
-    res.json({ success: true, data: row });
+    return res.json({ success: true, data: row });
   } catch (e) {
     err("Broadcast error:", e);
-    res.status(500).json({ error: e.message });
+    return res
+      .status(500)
+      .json({ error: e.message || "broadcast_failed" });
   }
 });
+
 
 app.get("/api/broadcasts", async (_req, res) => {
   try {
