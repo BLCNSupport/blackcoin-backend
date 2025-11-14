@@ -946,12 +946,14 @@ async function getTokenUsd(mint, { nocache = false } = {}) {
   const setAndMaybeBroadcast = (val) => {
     const prev = PRICE_CACHE.get(mint)?.priceUsd;
     setWithLimit(PRICE_CACHE, mint, { ts: now, priceUsd: val });
- 
-   // ---- NEW: broadcast price change for ANY mint ----
-    if (typeof wsBroadcastAll === "function" && val > 0 && val !== prev) {
+    if (
+      typeof wsBroadcastAll === "function" &&
+      val > 0 &&
+      val !== prev
+    ) {
       try {
-        wsBroadcastAll({ type: "price_update", mint, priceUsd: val });
-      } catch (_) {}
+        wsBroadcastAll({ type: "price", mint, priceUsd: val });
+      } catch {}
     }
     return val;
   };
