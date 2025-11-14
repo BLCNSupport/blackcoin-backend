@@ -15,6 +15,12 @@ import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
 import { WebSocketServer } from "ws";
 import http from "http";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import crypto from "crypto";
+
+
+
 
 /* === NEW: Solana + SPL Token for staking payouts === */
 import * as web3 from "@solana/web3.js";
@@ -36,6 +42,49 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// --- DEV wallets + in-memory auth session store ---
+
+// DEV_WALLETS should be set in Render as a comma-separated list:
+// DEV_WALLETS=94BkuiU...,AnotherDevWallet...
+const DEV_WALLETS = new Set(
+  (process.env.DEV_WALLETS || "")
+    .split(",")
+    .map(w => w.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+// In-memory nonce + session stores (shared by OperatorHub + Staking)
+const NONCES   = new Map(); // wallet -> nonce
+const SESSIONS = new Map(); // token  -> { wallet, expiresAt }
+
+// Extract and validate wallet for a given session token
+function getSessionWalletFromHeader(req) {
+  const token = req.headers["x-bc-session"];
+  if (!token || typeof token !== "string") return null;
+
+  const entry = SESSIONS.get(token);
+  if (!entry) return null;
+
+  if (entry.expiresAt && entry.expiresAt < Date.now()) {
+    SESSIONS.delete(token);
+    return null;
+  }
+  return entry.wallet;
+}
+
+// Simple middleware: require a valid session to access the route
+function requireSession(req, res, next) {
+  const wallet = getSessionWalletFromHeader(req);
+  if (!wallet) {
+    return res
+      .status(401)
+      .json({ error: "missing_or_invalid_session" });
+  }
+  req.sessionWallet = wallet;
+  next();
+}
+
 
 /* ---------- CORS ---------- */
 // Use cors() so all routes (/api/balances, /api/token-meta, etc.) are CORS-safe.
@@ -1535,61 +1584,59 @@ function normRow(r) {
   };
 }
 
-app.post("/api/broadcast", requireSession, async (req, res) => {
+// --- Locked Signal Room broadcast: DEV_WALLETS only ---
+app.post("/api/broadcast", requireSession, express.json(), async (req, res) => {
   try {
-    // Wallet from the verified session (set by requireSession)
-    const sessionWallet = (req.auth?.wallet || "").toLowerCase();
+    const sessionWallet = req.sessionWallet;
+    const { wallet, message } = req.body || {};
 
-    if (!sessionWallet) {
-      return res
-        .status(401)
-        .json({ error: "Missing session wallet" });
+    // Basic validation
+    const msg = (message || "").trim();
+    if (!msg) {
+      return res.status(400).json({ error: "message_required" });
     }
 
-    // Only allow DEV wallets from Render env
-    if (!DEV_WALLETS.includes(sessionWallet)) {
-      warn(
-        "[broadcast] unauthorized attempt by",
-        sessionWallet,
-        "DEV_WALLETS=",
-        DEV_WALLETS
-      );
-      return res
-        .status(403)
-        .json({ error: "Not authorized to broadcast" });
+    // Enforce that the wallet in the body (if present) matches the session wallet
+    const effectiveWallet = (wallet || sessionWallet || "").trim();
+    if (!effectiveWallet) {
+      return res.status(400).json({ error: "wallet_required" });
+    }
+    if (effectiveWallet !== sessionWallet) {
+      return res.status(403).json({ error: "wallet_session_mismatch" });
     }
 
-    // Read message from body and clamp length
-    const { message } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Message is required" });
+    const normalized = effectiveWallet.toLowerCase();
+
+    // 🔒 HARD BACKEND GATE: only DEV_WALLETS can post
+    if (!DEV_WALLETS.has(normalized)) {
+      console.warn("[broadcast] non-dev wallet attempted post:", effectiveWallet);
+      return res.status(403).json({ error: "dev_wallet_required" });
     }
 
-    const cleanMessage = message.trim().slice(0, 500);
-    if (!cleanMessage) {
-      return res
-        .status(400)
-        .json({ error: "Message cannot be empty" });
-    }
+    const role = "DEV";
 
-    // Insert using the *session* wallet, ignore any wallet in body
+    // Insert into Supabase hub_broadcasts (adjust table/columns if needed)
     const { data, error } = await supabase
       .from("hub_broadcasts")
-      .insert([{ wallet: sessionWallet, message: cleanMessage }])
-      .select()
-      .maybeSingle();
+      .insert({
+        wallet: effectiveWallet,
+        message: msg,
+        role
+      })
+      .select("*")
+      .single();
 
-    if (error) throw error;
-    const row = normRow(data);
+    if (error) {
+      console.error("[broadcast] supabase insert error:", error);
+      return res.status(500).json({ error: "db_error" });
+    }
 
-    wsBroadcastAll({ type: "insert", row });
-
-    return res.json({ success: true, data: row });
+    // If you manually fan-out via WebSocket, you can also push here,
+    // but usually Supabase Realtime handles the WS broadcast for you.
+    return res.json({ ok: true, row: data });
   } catch (e) {
-    err("Broadcast error:", e);
-    return res
-      .status(500)
-      .json({ error: e.message || "broadcast_failed" });
+    console.error("[broadcast] server error:", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
@@ -1717,6 +1764,93 @@ app.post("/api/rpc", async (req, res) => {
   } catch (e) {
     err("RPC proxy error:", e);
     res.status(500).json({ error: "RPC proxy failed" });
+  }
+});
+
+// --- AUTH: nonce + verify (used by Staking + OperatorHub) ---
+
+// Step 1: client requests a message+nonce to sign
+app.get("/api/auth/nonce", (req, res) => {
+  try {
+    const wallet = String(req.query.wallet || "").trim();
+    if (!wallet) {
+      return res.status(400).json({ error: "wallet_required" });
+    }
+
+    const nonce = crypto.randomBytes(16).toString("hex");
+    NONCES.set(wallet, nonce);
+
+    const message = [
+      "✦ BlackCoin Network ✦",
+      "",
+      "Sign this message to authenticate your wallet.",
+      "",
+      `Wallet: ${wallet}`,
+      `Nonce: ${nonce}`,
+      `Timestamp: ${new Date().toISOString()}`,
+      "",
+      "No on-chain transaction will occur.",
+      "This signature is for authentication only."
+    ].join("\n");
+
+    return res.json({ ok: true, nonce, message });
+  } catch (e) {
+    console.error("[auth/nonce] error:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Step 2: client posts signed message → we verify and issue session token
+app.post("/api/auth/verify", express.json(), async (req, res) => {
+  try {
+    const { wallet, message, signature } = req.body || {};
+
+    if (!wallet || !message || !Array.isArray(signature)) {
+      return res.status(400).json({ error: "wallet_message_signature_required" });
+    }
+
+    const expectedNonce = NONCES.get(wallet);
+    if (!expectedNonce) {
+      return res.status(400).json({ error: "nonce_missing_or_expired" });
+    }
+
+    // Make sure the signed message contains the correct nonce
+    if (!message.includes(expectedNonce)) {
+      return res.status(400).json({ error: "nonce_mismatch" });
+    }
+
+    // Verify ed25519 signature (Solana wallet)
+    const msgBytes = new TextEncoder().encode(message);
+    const sigBytes = Uint8Array.from(signature);
+
+    let pubkeyBytes;
+    try {
+      pubkeyBytes = bs58.decode(wallet);
+    } catch {
+      return res.status(400).json({ error: "invalid_wallet_base58" });
+    }
+
+    const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubkeyBytes);
+    if (!ok) {
+      return res.status(401).json({ error: "invalid_signature" });
+    }
+
+    NONCES.delete(wallet);
+
+    // Create a session token valid for 12 hours
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
+
+    SESSIONS.set(token, { wallet, expiresAt });
+
+    return res.json({
+      ok: true,
+      session: token,
+      expiresAt
+    });
+  } catch (e) {
+    console.error("[auth/verify] error:", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
