@@ -1,4 +1,4 @@
-/ server.js — BLACKCOIN OPERATOR HUB BACKEND v11.5 — Jupiter v3 price + Jupiter v2 tokens + Solscan meta
+// server.js — BLACKCOIN OPERATOR HUB BACKEND v11.5 — Jupiter v3 price + Jupiter v2 tokens + Solscan meta
 /* Key points:
  * - Prices: PRIMARY = Jupiter Price API v3 (Lite) at https://lite-api.jup.ag/price/v3
  *            Fallback = Dexscreener search
