@@ -399,10 +399,15 @@ app.get("/api/profile", async (req, res) => {
   }
 });
 
-app.post("/api/profile", async (req, res) => {
+// 🔒 Profile updates are now tied to the authenticated session wallet
+app.post("/api/profile", requireSession, async (req, res) => {
   try {
-    const wallet = String(req.body.wallet || "").trim();
-    if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+    const wallet = req.sessionWallet;
+    if (!wallet) {
+      return res
+        .status(401)
+        .json({ error: "missing_or_invalid_session" });
+    }
 
     let handle = req.body.handle;
     if (typeof handle === "string") {
@@ -444,10 +449,11 @@ app.post("/api/profile", async (req, res) => {
         .select()
         .maybeSingle();
 
-      if (error)
+      if (error) {
         return res
           .status(500)
           .json({ error: "update_failed", detail: error.message });
+      }
       return res.json({ success: true, profile: data });
     } else {
       const insertRow = { wallet, ...patch };
@@ -457,10 +463,11 @@ app.post("/api/profile", async (req, res) => {
         .select()
         .maybeSingle();
 
-      if (error)
+      if (error) {
         return res
           .status(500)
           .json({ error: "insert_failed", detail: error.message });
+      }
       return res.json({ success: true, profile: data });
     }
   } catch (e) {
@@ -469,16 +476,24 @@ app.post("/api/profile", async (req, res) => {
   }
 });
 
+
 const upload = multer({ storage: multer.memoryStorage() });
+
+// 🔒 Avatar uploads are now tied to the authenticated session wallet
 app.post(
   "/api/avatar-upload",
+  requireSession,
   upload.single("avatar"),
   async (req, res) => {
     try {
-      const { wallet } = req.body;
+      const wallet = req.sessionWallet;
       const file = req.file;
-      if (!wallet || !file)
-        return res.status(400).json({ error: "Missing" });
+
+      if (!wallet || !file) {
+        return res
+          .status(400)
+          .json({ error: "wallet_and_file_required" });
+      }
 
       const fileName = `avatars/${wallet}_${Date.now()}.jpg`;
       const { error: uploadErr } = await supabase.storage
@@ -498,7 +513,11 @@ app.post(
       const { error: updErr } = await supabase
         .from("hub_profiles")
         .upsert(
-          { wallet, avatar_url: url, updated_at: new Date().toISOString() },
+          {
+            wallet,
+            avatar_url: url,
+            updated_at: new Date().toISOString(),
+          },
           { onConflict: "wallet" }
         );
 
@@ -511,6 +530,7 @@ app.post(
     }
   }
 );
+
 
 /* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
@@ -1666,17 +1686,30 @@ function normRefundRow(r) {
   };
 }
 
-app.post("/api/refund-log", async (req, res) => {
+// 🔒 Refund logs now tied to authenticated wallet to prevent spoofing
+app.post("/api/refund-log", requireSession, async (req, res) => {
   try {
+    const sessionWallet = req.sessionWallet;
     const { wallet, token, tx, date, status, rent_reclaimed } =
       req.body || {};
-    if (!wallet || !token || !tx) {
+
+    // body.wallet is optional; if present, it must match the session wallet
+    const effectiveWallet = (wallet || sessionWallet || "").trim();
+
+    if (!effectiveWallet || !token || !tx) {
       return res.status(400).json({
         error: "Missing required fields (wallet, token, tx)",
       });
     }
+
+    if (sessionWallet && effectiveWallet !== sessionWallet) {
+      return res
+        .status(403)
+        .json({ error: "wallet_session_mismatch" });
+    }
+
     const payload = {
-      wallet,
+      wallet: effectiveWallet,
       token,
       tx,
       date: date || new Date().toISOString(),
@@ -1701,6 +1734,7 @@ app.post("/api/refund-log", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 app.get("/api/refund-history", async (req, res) => {
   try {
