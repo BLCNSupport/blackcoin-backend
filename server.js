@@ -84,6 +84,56 @@ app.use("/api/rpc", rpcLimiter);
 app.use("/api/balances", balancesLimiter);
 app.use("/api/staking", stakingLimiter);
 
+// --- CSP header (Report-Only for now, safe for local dev) ---
+const CSP_SUPABASE = process.env.SUPABASE_URL || "";
+
+// Build a single CSP string. This is intentionally permissive so it
+// matches your current HTML and external CDNs without breaking anything.
+const CSP_HEADER_VALUE = [
+  "default-src 'self';",
+  "base-uri 'self';",
+  "frame-ancestors 'self';",
+  "object-src 'none';",
+
+  // Images: self + data URLs + a couple of known CDNs
+  "img-src 'self' data: https://static.wixstatic.com https://cdn.pixabay.com;",
+
+  // Styles: allow inline (because of existing inline <style>) + Google Fonts
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;",
+
+  // Fonts: self + Google Fonts + data URLs
+  "font-src 'self' https://fonts.gstatic.com data:;",
+
+  // Scripts: self, inline, eval (because of some libs) + CDNs you use
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://esm.sh;",
+
+  // Network calls: your backend, Solana infra, Jup, Dexscreener, Coingecko, Pump, Solscan, Supabase, WS
+  [
+    "connect-src 'self'",
+    "https://lite-api.jup.ag",
+    "https://api.dexscreener.com",
+    "https://api.coingecko.com",
+    "https://mainnet.helius-rpc.com",
+    "https://pro-api.solscan.io",
+    "https://frontend-api.pump.fun",
+    CSP_SUPABASE || "",
+    "ws:",
+    "wss:;"
+  ].filter(Boolean).join(" ")
+].join(" ");
+
+app.use((req, res, next) => {
+  // For now, stay in Report-Only so nothing breaks while you test.
+  // When you're ready for hard enforcement, set CSP_ENFORCE=true in Render/env.
+  const enforce = process.env.CSP_ENFORCE === "false";
+  const headerName = enforce
+    ? "Content-Security-Policy"
+    : "Content-Security-Policy-Report-Only";
+
+  res.setHeader(headerName, CSP_HEADER_VALUE);
+  next();
+});
+
 
 // --- DEV wallets + in-memory auth session store ---
 
