@@ -31,9 +31,6 @@ import {
 } from "@solana/spl-token";
 import { TextEncoder } from "util";
 
-const encoder = new TextEncoder();
-
-
 dotenv.config();
 
 const app = express();
@@ -1142,6 +1139,15 @@ async function getAllSplTokenAccounts(owner, commitment = "confirmed") {
   return Array.from(byMint.values());
 }
 
+// === BlackCoin balance helper (used by staking integrity) ===
+async function getBlackcoinBalanceForWallet(wallet, commitment = "confirmed") {
+  // Reuse the same SPL scan as /api/balances
+  const tokens = await getAllSplTokenAccounts(wallet, commitment);
+  const black = (tokens || []).find((t) => t.mint === TOKEN_MINT);
+  return black ? Number(black.amount || 0) : 0;
+}
+
+
 /* === Small helper for homepage CTO / Utility wallets === */
 async function getWalletSnapshot(
   owner,
@@ -1895,6 +1901,20 @@ app.get("/api/rpc", (_req, res) => {
 
 const STAKE_REWARD_RATES = { 30: 0.05, 60: 0.125, 90: 0.25 }; // matches UI
 const STAKE_CAP_PER_WALLET = 100000;
+
+// ---- Staking integrity (random check scheduling) ----
+const STAKE_CHECK_MIN_MINUTES = 3;  // lower bound between checks
+const STAKE_CHECK_MAX_MINUTES = 9;  // upper bound between checks
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function getRandomFutureTime() {
+  const minutes = randomInt(STAKE_CHECK_MIN_MINUTES, STAKE_CHECK_MAX_MINUTES);
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
 const STAKE_GLOBAL_CAP = Number(process.env.STAKE_GLOBAL_CAP || "0");
 
 const REWARD_POOL_PUBKEY = process.env.REWARD_POOL_PUBKEY || "";
@@ -2033,15 +2053,129 @@ async function sendFartFromPool(toWallet, amountFart) {
   return sig;
 }
 
+/* ---- Staking integrity loop (void-flag model) ---- */
+
+async function runStakeIntegrityCheckCycle() {
+  try {
+    const nowIso = new Date().toISOString();
+
+    // 1) Find active, non-void stakes that are due for a check
+    const { data: stakes, error } = await supabase
+      .from("hub_stakes")
+      .select("id, wallet, amount, next_check_at, is_void, status")
+      .eq("status", "active")
+      .eq("is_void", false)
+      .or(`next_check_at.lte.${nowIso},next_check_at.is.null`);
+
+    if (error) {
+      err("[staking/integrity] select error:", error.message);
+      return;
+    }
+    if (!stakes || stakes.length === 0) return;
+
+    // 2) Group by wallet so we hit RPC once per wallet
+    const byWallet = new Map();
+    for (const stake of stakes) {
+      if (!byWallet.has(stake.wallet)) byWallet.set(stake.wallet, []);
+      byWallet.get(stake.wallet).push(stake);
+    }
+
+    // 3) For each wallet, fetch current BLACKCOIN balance once
+    for (const [wallet, walletStakes] of byWallet.entries()) {
+      let balance;
+      try {
+        balance = await getBlackcoinBalanceForWallet(wallet, "confirmed");
+      } catch (e) {
+        err("[staking/integrity] balance fetch failed for", wallet, e);
+        continue;
+      }
+
+      const nowIsoLocal = new Date().toISOString();
+      const nextCheckAt = getRandomFutureTime();
+
+      for (const stake of walletStakes) {
+        const required = Number(stake.amount || 0);
+        const isBelow = balance < required;
+
+        if (isBelow) {
+          // 🔴 Mark stake as void on first failure
+          const { error: updErr } = await supabase
+            .from("hub_stakes")
+            .update({
+              is_void: true,
+              void_reason: "balance_below_stake",
+              void_at: nowIsoLocal,
+              last_check_at: nowIsoLocal,
+              last_check_balance: balance,
+            })
+            .eq("id", stake.id);
+
+          if (updErr) {
+            err(
+              "[staking/integrity] failed to mark void stake",
+              stake.id,
+              updErr.message || updErr
+            );
+          } else {
+            log(
+              "[staking/integrity] stake voided",
+              stake.id,
+              "wallet=",
+              wallet,
+              "balance=",
+              balance,
+              "required=",
+              required
+            );
+          }
+        } else {
+          // ✅ Check passed – just record and schedule next random check
+          const { error: updErr } = await supabase
+            .from("hub_stakes")
+            .update({
+              last_check_at: nowIsoLocal,
+              last_check_balance: balance,
+              next_check_at: nextCheckAt,
+            })
+            .eq("id", stake.id);
+
+          if (updErr) {
+            err(
+              "[staking/integrity] failed to update stake check info",
+              stake.id,
+              updErr.message || updErr
+            );
+          }
+        }
+      }
+    }
+  } catch (e) {
+    err("[staking/integrity] cycle exception:", e);
+  }
+}
+
+function startStakeIntegrityLoop() {
+  // Run one cycle on startup
+  runStakeIntegrityCheckCycle().catch((e) =>
+    err("[staking/integrity] initial cycle error:", e)
+  );
+  // Then repeat every 60s; actual checks are gated by next_check_at
+  setInterval(() => {
+    runStakeIntegrityCheckCycle().catch((e) =>
+      err("[staking/integrity] interval cycle error:", e)
+    );
+  }, 60 * 1000);
+}
+
 /* ---- /api/staking/state ---- */
 /*
 GET /api/staking/state?wallet=<pubkey>
   -> {
        wallet,
-       black: { available, staked_total },
+       black: { balance, available, staked_total, cap_remaining, cap_per_wallet },
        fart:  { claimable },
        stakes: [
-         { id, amount, duration_days, start_ts, end_ts, status, reward_est, tx? }
+         { id, amount, duration_days, start_ts, end_ts, status, reward_est, tx?, is_void, void_reason, ... }
        ]
      }
 */
@@ -2074,7 +2208,11 @@ app.get("/api/staking/state", async (req, res) => {
         walletStakedTotal += Number(row.amount || 0);
       }
 
-      if (matured && unclaimed > 0 && (row.status === "active" || row.status === "settled")) {
+      if (
+        matured &&
+        unclaimed > 0 &&
+        (row.status === "active" || row.status === "settled")
+      ) {
         walletClaimableTotal += unclaimed;
       }
 
@@ -2095,12 +2233,27 @@ app.get("/api/staking/state", async (req, res) => {
         claimed_total: Number(row.claimed_total || 0),
         reward_est: maxReward,
         tx: row.tx || null,
+
+        // NEW: integrity / void fields for the UI
+        is_void: Boolean(row.is_void),
+        void_reason: row.void_reason || null,
+        void_at: row.void_at || null,
+        last_check_at: row.last_check_at || null,
+        last_check_balance:
+          row.last_check_balance != null
+            ? Number(row.last_check_balance)
+            : null,
       };
     });
 
-    // For now, "available" = remaining room under per-wallet cap
-    // so UI can stake up to the cap without on-chain BAL yet.
-    const blackAvailable = Math.max(
+    // NEW: real on-chain BLACKCOIN balance
+    const realBlackBalance = await getBlackcoinBalanceForWallet(
+      wallet,
+      "confirmed"
+    );
+
+    // Remaining headroom under the 100k cap (informational)
+    const capRemaining = Math.max(
       0,
       STAKE_CAP_PER_WALLET - walletStakedTotal
     );
@@ -2108,8 +2261,11 @@ app.get("/api/staking/state", async (req, res) => {
     return res.json({
       wallet,
       BlackCoin: {
-        available: blackAvailable,
-        staked_total: walletStakedTotal,
+        balance: realBlackBalance,       // on-chain balance
+        available: realBlackBalance,     // what UI should show as "available to stake"
+        staked_total: walletStakedTotal, // sum of active stakes
+        cap_remaining: capRemaining,     // remaining room under the cap
+        cap_per_wallet: STAKE_CAP_PER_WALLET,
       },
       Fartcoin: {
         claimable: walletClaimableTotal,
@@ -2122,18 +2278,29 @@ app.get("/api/staking/state", async (req, res) => {
   }
 });
 
+
 /* ---- /api/staking/stake ---- */
 /*
 POST /api/staking/stake
   { wallet, amount, duration_days }
 */
 app.post("/api/staking/stake", requireSession, async (req, res) => {
-  const { wallet, amount, duration_days } = req.body || {};
-  const w = String(wallet || "").trim();
-  const amt = Number(amount || 0);
-  const dur = Number(duration_days || 0);
+  const sessionWallet = req.sessionWallet;
+  const bodyWallet = String((req.body?.wallet || "")).trim();
+  const w = (bodyWallet || sessionWallet || "").trim();
 
-  if (!w || !amt || !dur) {
+  const amt = Number(req.body?.amount || 0);
+  const dur = Number(req.body?.duration_days || 0);
+
+  // Make sure session exists and matches body wallet
+  if (!sessionWallet) {
+    return res.status(401).json({ error: "missing_or_invalid_session" });
+  }
+  if (!w || w.toLowerCase() !== sessionWallet.toLowerCase()) {
+    return res.status(403).json({ error: "wallet_session_mismatch" });
+  }
+
+  if (!amt || !dur) {
     return res
       .status(400)
       .json({ error: "wallet, amount, duration_days required" });
@@ -2213,6 +2380,14 @@ app.post("/api/staking/stake", requireSession, async (req, res) => {
         ends_at: endsAt.toISOString(),
         last_claim_at: now.toISOString(),
         claimed_total: 0,
+
+        // 🔹 NEW: integrity fields for random checks
+        is_void: false,
+        void_reason: null,
+        void_at: null,
+        last_check_at: null,
+        last_check_balance: null,
+        next_check_at: getRandomFutureTime(),
       })
       .select()
       .maybeSingle();
@@ -2229,15 +2404,23 @@ app.post("/api/staking/stake", requireSession, async (req, res) => {
   }
 });
 
+
 /* ---- /api/staking/claim ---- */
 /*
 POST /api/staking/claim
   { wallet }
 */
 app.post("/api/staking/claim", requireSession, async (req, res) => {
-  const { wallet } = req.body || {};
-  const w = String(wallet || "").trim();
-  if (!w) return res.status(400).json({ error: "wallet is required" });
+  const sessionWallet = req.sessionWallet;
+  const bodyWallet = String((req.body?.wallet || "")).trim();
+  const w = (bodyWallet || sessionWallet || "").trim();
+
+  if (!sessionWallet) {
+    return res.status(401).json({ error: "missing_or_invalid_session" });
+  }
+  if (!w || w.toLowerCase() !== sessionWallet.toLowerCase()) {
+    return res.status(403).json({ error: "wallet_session_mismatch" });
+  }
 
   try {
     const { data: stakeRows, error } = await supabase
@@ -2253,10 +2436,15 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
 
     const now = new Date();
     let totalClaimed = 0;
+    let requiredBalanceForClaims = 0;
     const updates = [];
     const claimRows = [];
 
+    // 🟡 First pass: decide which stakes are eligible & how much reward
     for (const row of stakeRows || []) {
+      // Skip void stakes entirely – they can never claim
+      if (row.is_void) continue;
+
       const { maxReward, unclaimed, matured } = computeStakeAccrual(
         row,
         now
@@ -2264,6 +2452,7 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
       if (!matured || unclaimed <= 0) continue;
 
       totalClaimed += unclaimed;
+      requiredBalanceForClaims += Number(row.amount || 0);
 
       const newClaimedTotal = +(
         Number(row.claimed_total || 0) + unclaimed
@@ -2292,6 +2481,21 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
 
     if (totalClaimed <= 0) {
       return res.json({ ok: true, amount_claimed: 0 });
+    }
+
+    // 🔴 Final live balance check for integrity
+    const currentBlackBalance = await getBlackcoinBalanceForWallet(
+      w,
+      "confirmed"
+    );
+
+    if (currentBlackBalance < requiredBalanceForClaims) {
+      return res.status(400).json({
+        error:
+          "Your current $BLACKCOIN balance is below the total amount of stakes you are trying to claim.",
+        currentBalance: currentBlackBalance,
+        required: requiredBalanceForClaims,
+      });
     }
 
     // Send FART from pool → user
@@ -2335,7 +2539,11 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
       err("[staking/claim] insert history error:", insErr.message);
     }
 
-    return res.json({ ok: true, amount_claimed: totalClaimed, tx: txSig });
+    return res.json({
+      ok: true,
+      amount_claimed: totalClaimed,
+      tx: txSig,
+    });
   } catch (e) {
     err("[staking/claim] exception:", e);
     return res.status(500).json({ error: "Internal error" });
@@ -2348,10 +2556,24 @@ POST /api/staking/unstake
   { wallet, stake_id }
 */
 app.post("/api/staking/unstake", requireSession, async (req, res) => {
-  const { wallet, stake_id } = req.body || {};
-  const w = String(wallet || "").trim();
+  const sessionWallet = req.sessionWallet;
+  const bodyWallet = String((req.body?.wallet || "")).trim();
+  const stakeId = req.body?.stake_id;
+  const w = (bodyWallet || sessionWallet || "").trim();
 
-  if (!w || !stake_id) {
+  if (!sessionWallet) {
+    return res
+      .status(401)
+      .json({ error: "missing_or_invalid_session" });
+  }
+
+  if (!w || w.toLowerCase() !== sessionWallet.toLowerCase()) {
+    return res
+      .status(403)
+      .json({ error: "wallet_session_mismatch" });
+  }
+
+  if (!stakeId) {
     return res
       .status(400)
       .json({ error: "wallet and stake_id required" });
@@ -2361,14 +2583,18 @@ app.post("/api/staking/unstake", requireSession, async (req, res) => {
     const { data: row, error } = await supabase
       .from("hub_stakes")
       .select("*")
-      .eq("id", stake_id)
+      .eq("id", stakeId)
       .eq("wallet", w)
       .maybeSingle();
 
     if (error || !row) {
-      err("[staking/unstake] select error:", error?.message || error);
+      err(
+        "[staking/unstake] select error:",
+        error?.message || error
+      );
       return res.status(404).json({ error: "Stake not found" });
     }
+
     if (row.status !== "active") {
       return res.status(400).json({ error: "Stake not active" });
     }
@@ -2389,11 +2615,14 @@ app.post("/api/staking/unstake", requireSession, async (req, res) => {
           ? row.ends_at || now.toISOString()
           : now.toISOString(),
       })
-      .eq("id", stake_id);
+      .eq("id", stakeId)
+      .eq("wallet", w);
 
     if (updErr) {
       err("[staking/unstake] update error:", updErr.message);
-      return res.status(500).json({ error: "Failed to update stake" });
+      return res
+        .status(500)
+        .json({ error: "Failed to update stake" });
     }
 
     return res.json({ ok: true, status: newStatus });
@@ -2599,9 +2828,11 @@ setInterval(() => {
   }
 }, 60_000);
 
+// 🔄 Start staking integrity checks (random balance snapshots)
+startStakeIntegrityLoop();
 
 server.listen(PORT, () => {
-  log(`BLACKCOIN OPERATOR HUB BACKEND v11.3 — LIVE ON PORT ${PORT}`);
+  log(`BLACKCOIN OPERATOR HUB BACKEND v11.5 — LIVE ON PORT ${PORT}`);
   log(`WebSocket: ws://localhost:${PORT}/ws`);
   log(`Frontend:  http://localhost:${PORT}/`);
 });
