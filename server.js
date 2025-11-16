@@ -2509,16 +2509,19 @@ function wsBroadcastAll(obj) {
 let rtChannel = null;
 function subscribeToBroadcasts() {
   try {
+    // Single channel for the life of the process; we don't keep
+    // tearing it down / recreating it on every status change.
     if (rtChannel) {
-      try {
-        supabase.removeChannel(rtChannel);
-      } catch {}
-      rtChannel = null;
+      log("[Realtime] hub_broadcasts channel already initialized.");
+      return;
     }
 
     rtChannel = supabase
       .channel("rt:hub_broadcasts", {
-        config: { broadcast: { ack: true }, presence: { key: "server" } },
+        config: {
+          broadcast: { ack: true },
+          presence: { key: "server" },
+        },
       })
       .on(
         "postgres_changes",
@@ -2564,21 +2567,19 @@ function subscribeToBroadcasts() {
         if (status === "SUBSCRIBED") {
           log("✅ Realtime subscribed: hub_broadcasts");
         } else if (status === "CHANNEL_ERROR") {
-          err("❌ Realtime CHANNEL_ERROR — retrying in 2s");
-          setTimeout(subscribeToBroadcasts, 2000);
+          err("❌ Realtime CHANNEL_ERROR (no auto-retry; check Supabase Realtime config).");
         } else if (status === "TIMED_OUT") {
-          warn("⚠️ Realtime TIMED_OUT — retrying in 2s");
-          setTimeout(subscribeToBroadcasts, 2000);
+          warn("⚠️ Realtime TIMED_OUT (supabase-js will handle reconnects).");
         } else if (status === "CLOSED") {
-          warn("⚠️ Realtime CLOSED — retrying in 2s");
-          setTimeout(subscribeToBroadcasts, 2000);
+          warn("⚠️ Realtime CLOSED (not force-resubscribing to avoid log spam).");
         }
       });
   } catch (e) {
     err("Realtime subscribe failed:", e?.message || e);
-    setTimeout(subscribeToBroadcasts, 2000);
+    // No recursive retry here; if this blows up at boot, fix config instead of hammering Realtime.
   }
 }
+
 subscribeToBroadcasts();
 
 /* ---------- Start ---------- */
