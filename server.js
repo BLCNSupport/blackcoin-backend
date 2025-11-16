@@ -38,6 +38,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Hide Express fingerprint header
+app.disable("x-powered-by");
+
 // --- Security middlewares: Helmet + rate limiting ---
 
 // Helmet: basic security headers. We disable CSP/COEP here because this
@@ -2790,6 +2793,21 @@ app.get("/api/fartcoin/pool-balance", async (req, res) => {
     return res.status(500).json({ error: "Internal error" });
   }
 });
+
+// ---------- Global error handler (last-resort) ----------
+app.use((error, req, res, next) => {
+  // Log full error server-side (includes stack)
+  err("Unhandled error:", error);
+
+  // If something already wrote headers, delegate to default handler
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  // Generic message to client – no stack, no secrets
+  res.status(500).json({ error: "internal_server_error" });
+});
+
 
 /* ---------- WebSocket + Realtime ---------- */
 const server = http.createServer(app);
