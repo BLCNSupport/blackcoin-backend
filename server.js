@@ -10,6 +10,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import multer from "multer";
@@ -35,6 +37,53 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// --- Security middlewares: Helmet + rate limiting ---
+
+// Helmet: basic security headers. We disable CSP/COEP here because this
+// server only serves JSON and we don't want surprise breakage.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+// Rate limiters for sensitive / heavier endpoints
+const authLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 60,                  // 60 auth calls per 5 min per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const rpcLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,             // 30 RPC calls per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const balancesLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const stakingLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Attach limiters BEFORE routes
+app.use("/api/auth", authLimiter);
+app.use("/api/rpc", rpcLimiter);
+app.use("/api/balances", balancesLimiter);
+app.use("/api/staking", stakingLimiter);
+
 
 // --- DEV wallets + in-memory auth session store ---
 
@@ -79,11 +128,35 @@ function requireSession(req, res, next) {
 }
 
 
-/* ---------- CORS ---------- */
-// Use cors() so all routes (/api/balances, /api/token-meta, etc.) are CORS-safe.
+/* ---------- CORS (tightened) ---------- */
+
+// ✅ Update this list to match your real domains + dev origins.
+// Include both Network Terminal + Operator/ Staking origins.
+const ALLOWED_ORIGINS = [
+  // Local dev
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+  "http://localhost:8080",
+  "http://127.0.0.1:8080",
+
+  // TODO: replace these with your actual production domains
+  "https://your-network-terminal-domain.com",
+  "https://your-operator-hub-domain.com",
+];
+
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, callback) => {
+      // Requests without an origin (curl, some mobile wallets) → allow
+      if (!origin) return callback(null, true);
+
+      if (ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn("[CORS] Blocked origin:", origin);
+      return callback(new Error("Not allowed by CORS"));
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
@@ -91,11 +164,13 @@ app.use(
       "X-Requested-With",
       "x-bc-session",
     ],
+    credentials: false, // you’re not using cookies
   })
 );
 
-// Handle preflight
+// Handle preflight using the same rules
 app.options("*", cors());
+
 
 // Body parsing + static files
 app.use(express.json({ limit: "10mb" }));
