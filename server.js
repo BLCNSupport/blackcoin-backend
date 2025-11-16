@@ -183,19 +183,23 @@ function requireSession(req, res, next) {
 
 /* ---------- CORS (tightened) ---------- */
 
-// ✅ Update this list to match your real domains + dev origins.
-// Include both Network Terminal + Operator/ Staking origins.
-const ALLOWED_ORIGINS = [
-  // Local dev
+// Local dev origins stay hard-coded
+const DEV_ORIGINS = [
   "http://localhost:4173",
   "http://127.0.0.1:4173",
   "http://localhost:8080",
   "http://127.0.0.1:8080",
-
-  // TODO: replace these with your actual production domains
-  "https://your-network-terminal-domain.com",
-  "https://your-operator-hub-domain.com",
 ];
+
+// Production origins come from env var FRONTEND_ORIGINS
+// Example (Render): FRONTEND_ORIGINS="https://blackcoin.network,https://operator.blackcoin.app,https://staking.blackcoin.app"
+const PROD_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+// Final allowlist = dev + prod
+const ALLOWED_ORIGINS = [...DEV_ORIGINS, ...PROD_ORIGINS];
 
 app.use(
   cors({
@@ -217,12 +221,13 @@ app.use(
       "X-Requested-With",
       "x-bc-session",
     ],
-    credentials: false, // you’re not using cookies
+    credentials: false, // no cookies in play
   })
 );
 
 // Handle preflight using the same rules
 app.options("*", cors());
+
 
 
 // Body parsing + static files
