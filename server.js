@@ -2059,12 +2059,14 @@ async function runStakeIntegrityCheckCycle() {
   try {
     const nowIso = new Date().toISOString();
 
-    // 1) Find active, non-void stakes that are due for a check
+       // 1) Find active, non-void stakes that are due for a check
+    //    🔹 Only check stakes that have NOT matured yet (ends_at > nowIso)
     const { data: stakes, error } = await supabase
       .from("hub_stakes")
-      .select("id, wallet, amount, next_check_at, is_void, status")
+      .select("id, wallet, amount, next_check_at, is_void, status, ends_at")
       .eq("status", "active")
       .eq("is_void", false)
+      .gt("ends_at", nowIso)
       .or(`next_check_at.lte.${nowIso},next_check_at.is.null`);
 
     if (error) {
@@ -2436,7 +2438,6 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
 
     const now = new Date();
     let totalClaimed = 0;
-    let requiredBalanceForClaims = 0;
     const updates = [];
     const claimRows = [];
 
@@ -2452,7 +2453,6 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
       if (!matured || unclaimed <= 0) continue;
 
       totalClaimed += unclaimed;
-      requiredBalanceForClaims += Number(row.amount || 0);
 
       const newClaimedTotal = +(
         Number(row.claimed_total || 0) + unclaimed
@@ -2483,20 +2483,9 @@ app.post("/api/staking/claim", requireSession, async (req, res) => {
       return res.json({ ok: true, amount_claimed: 0 });
     }
 
-    // 🔴 Final live balance check for integrity
-    const currentBlackBalance = await getBlackcoinBalanceForWallet(
-      w,
-      "confirmed"
-    );
-
-    if (currentBlackBalance < requiredBalanceForClaims) {
-      return res.status(400).json({
-        error:
-          "Your current $BLACKCOIN balance is below the total amount of stakes you are trying to claim.",
-        currentBalance: currentBlackBalance,
-        required: requiredBalanceForClaims,
-      });
-    }
+    // ✅ No live BLACK balance check here anymore:
+    //    if a stake survived pre-maturity integrity checks and matured,
+    //    the user can claim even after selling.
 
     // Send FART from pool → user
     let txSig;
