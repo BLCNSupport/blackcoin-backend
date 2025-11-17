@@ -702,34 +702,6 @@ const TTL_META = 6 * 60 * 60 * 1000;
 const TTL_SOL = 25_000;
 const TTL_JUP_V2 = 15 * 60 * 1000; // 15m for token search
 
-/* ---------- Jupiter Ultra Swap + Integrator Fee config ---------- */
-
-const JUP_ULTRA_BASE = "https://lite-api.jup.ag/ultra/v1";
-
-// This is the referralAccount you register in Jupiter’s Ultra Swap integration
-// dashboard. It’s a *public key* that receives your fee. :contentReference[oaicite:0]{index=0}
-const JUP_REFERRAL_ACCOUNT = process.env.JUP_REFERRAL_ACCOUNT || "";
-
-// Fee in basis points (50–255 bps allowed by Jupiter; 1% = 100 bps).
-// Jupiter keeps 20% of this; you receive 80%. :contentReference[oaicite:1]{index=1}
-const JUP_REFERRAL_FEE_BPS = Number(process.env.JUP_REFERRAL_FEE_BPS || "0");
-
-// Enable fees only when everything is valid
-const JUP_ENABLE_FEES =
-  !!JUP_REFERRAL_ACCOUNT &&
-  Number.isFinite(JUP_REFERRAL_FEE_BPS) &&
-  JUP_REFERRAL_FEE_BPS >= 50 &&
-  JUP_REFERRAL_FEE_BPS <= 255;
-
-
-const CACHE_LIMIT = 500;
-function setWithLimit(map, key, value) {
-  if (map.size >= CACHE_LIMIT) {
-    const firstKey = map.keys().next().value;
-    if (firstKey !== undefined) map.delete(firstKey);
-  }
-  map.set(key, value);
-}
 
 /* ---------- Token Meta Resolver (shared) ---------- */
 const META_TTL_MS = 6 * 60 * 60 * 1000; // 6h, applied against token_meta.updated_at
