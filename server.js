@@ -2065,6 +2065,347 @@ app.post("/api/swap/transaction", requireSession, async (req, res) => {
   }
 });
 
+// === Ultra-style swap "order" + "execute" used by OperatorHub swap panel ===
+// Design:
+// - /api/swap/order: take UI amount, build Jupiter quote + swapTransaction,
+//   return a single "order" object { transaction, requestId, inAmount, outAmount, ... }.
+// - /api/swap/execute: take signedTransaction from Phantom, broadcast via Helius RPC.
+
+async function buildUltraSwapOrderTx(opts) {
+  const {
+    wallet,
+    inputMint,
+    outputMint,
+    uiAmount,
+    slippageBps,
+  } = opts;
+
+  const amountFloat = Number(uiAmount);
+  if (!Number.isFinite(amountFloat) || amountFloat <= 0) {
+    throw new Error("Invalid UI amount");
+  }
+
+  // Look up decimals for input + output so we can convert base units and show outAmount nicely
+  const inMeta = await getTokenMeta(inputMint);
+  const outMeta = await getTokenMeta(outputMint);
+  const inDecimals =
+    typeof inMeta.decimals === "number" ? inMeta.decimals : 6;
+  const outDecimals =
+    typeof outMeta.decimals === "number" ? outMeta.decimals : 6;
+
+  const baseIn = Math.floor(amountFloat * Math.pow(10, inDecimals));
+  if (!Number.isFinite(baseIn) || baseIn <= 0) {
+    throw new Error("Invalid amount after applying decimals");
+  }
+
+  const safeSlippage = normalizeSlippageBps(slippageBps);
+  const params = new URLSearchParams({
+    inputMint: String(inputMint).trim(),
+    outputMint: String(outputMint).trim(),
+    amount: String(baseIn),
+    slippageBps: String(safeSlippage),
+    swapMode: "ExactIn",
+    onlyDirectRoutes: "false",
+    asLegacyTransaction: "true",
+  });
+
+  if (SWAP_FEE_BPS > 0) {
+    params.set("platformFeeBps", String(SWAP_FEE_BPS));
+  }
+
+  const quoteUrl = `${JUP_QUOTE_API}?${params.toString()}`;
+  log("[swap/order] quote →", quoteUrl);
+
+  const quoteRes = await fetch(quoteUrl, {
+    headers: {
+      accept: "application/json",
+      "Cache-Control": "no-cache",
+    },
+  });
+
+  const quoteText = await quoteRes.text();
+  if (!quoteRes.ok) {
+    warn(
+      "[swap/order] Jupiter quote HTTP",
+      quoteRes.status,
+      "body:",
+      quoteText.slice(0, 400)
+    );
+    throw new Error(`jupiter_quote_failed:${quoteRes.status}`);
+  }
+
+  let quote;
+  try {
+    quote = JSON.parse(quoteText);
+  } catch (e) {
+    err("[swap/order] quote JSON parse error:", e);
+    throw new Error("jupiter_quote_invalid_json");
+  }
+
+  // Best-effort outAmount extraction
+  let outAmountBase = 0;
+  if (quote && typeof quote === "object") {
+    if (quote.outAmount != null) {
+      outAmountBase = Number(quote.outAmount);
+    } else if (
+      Array.isArray(quote.routePlan) &&
+      quote.routePlan[0]?.swapInfo?.outAmount != null
+    ) {
+      outAmountBase = Number(quote.routePlan[0].swapInfo.outAmount);
+    }
+  }
+  if (!Number.isFinite(outAmountBase) || outAmountBase < 0) {
+    outAmountBase = 0;
+  }
+  const outAmountUi =
+    outAmountBase > 0
+      ? outAmountBase / Math.pow(10, outDecimals)
+      : 0;
+
+  // Build swap transaction from quote
+  const swapBody = {
+    quoteResponse: quote,
+    userPublicKey: wallet,
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true,
+    dynamicSlippage: false,
+  };
+
+  if (SWAP_FEE_BPS > 0) {
+    swapBody.platformFeeBps = SWAP_FEE_BPS;
+    if (SWAP_FEE_ACCOUNT) {
+      swapBody.feeAccount = SWAP_FEE_ACCOUNT;
+    }
+  }
+
+  log(
+    "[swap/order] building swap tx for wallet=",
+    wallet,
+    "feeBps=",
+    SWAP_FEE_BPS
+  );
+
+  const swapRes = await fetch(JUP_SWAP_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(swapBody),
+  });
+
+  const swapText = await swapRes.text();
+  if (!swapRes.ok) {
+    warn(
+      "[swap/order] Jupiter swap HTTP",
+      swapRes.status,
+      "body:",
+      swapText.slice(0, 400)
+    );
+    throw new Error(`jupiter_swap_failed:${swapRes.status}`);
+  }
+
+  let swapJson;
+  try {
+    swapJson = JSON.parse(swapText);
+  } catch (e) {
+    err("[swap/order] swap JSON parse error:", e);
+    throw new Error("jupiter_swap_invalid_json");
+  }
+
+  if (!swapJson?.swapTransaction) {
+    warn("[swap/order] missing swapTransaction in Jupiter response");
+    throw new Error("jupiter_swap_missing_transaction");
+  }
+
+  // Generate a simple requestId so frontend can log/track
+  const requestId =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex");
+
+  return {
+    requestId,
+    transaction: swapJson.swapTransaction,
+    inAmount: amountFloat,
+    outAmount: outAmountUi,
+    inputMint,
+    outputMint,
+    slippageBps: safeSlippage,
+  };
+}
+
+/**
+ * POST /api/swap/order
+ * Body:
+ *  {
+ *    taker: "<wallet>",
+ *    inputMint: "<mint>",
+ *    outputMint: "<mint>",
+ *    amount: "<UI amount string or number>",
+ *    slippageBps?: number
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: true,
+ *    order: {
+ *      requestId,
+ *      transaction,    // base64 swap tx (unsigned)
+ *      inAmount,       // UI input amount
+ *      outAmount,      // UI estimated output amount
+ *      inputMint,
+ *      outputMint,
+ *      slippageBps
+ *    }
+ *  }
+ */
+app.post("/api/swap/order", requireSession, async (req, res) => {
+  try {
+    const sessionWallet = req.sessionWallet;
+    const {
+      taker,
+      inputMint,
+      outputMint,
+      amount,
+      slippageBps,
+    } = req.body || {};
+
+    const wallet = String(taker || sessionWallet || "").trim();
+
+    if (
+      !sessionWallet ||
+      !wallet ||
+      wallet.toLowerCase() !== sessionWallet.toLowerCase()
+    ) {
+      return res
+        .status(403)
+        .json({ error: "wallet_session_mismatch" });
+    }
+
+    if (!inputMint || !outputMint || amount == null) {
+      return res.status(400).json({
+        error: "inputMint, outputMint and amount are required",
+      });
+    }
+
+    if (!HELIUS_KEY) {
+      return res.status(400).json({
+        error: "HELIUS_API_KEY not configured on backend",
+      });
+    }
+
+    const order = await buildUltraSwapOrderTx({
+      wallet,
+      inputMint,
+      outputMint,
+      uiAmount: amount,
+      slippageBps,
+    });
+
+    return res.json({
+      ok: true,
+      order: {
+        ...order,
+        platformFeeBps: SWAP_FEE_BPS,
+        feeAccount: SWAP_FEE_ACCOUNT || null,
+      },
+    });
+  } catch (e) {
+    err("[swap/order] exception:", e);
+    // If we threw a stringy message above, surface a small hint
+    return res.status(500).json({
+      error: "internal_error",
+      detail: String(e?.message || e),
+    });
+  }
+});
+
+/**
+ * POST /api/swap/execute
+ * Body:
+ *  {
+ *    wallet?: "<wallet>",
+ *    signedTransaction: "<base64>",
+ *    requestId?: "<id from /api/swap/order>"
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: true,
+ *    requestId,
+ *    result: {
+ *      signature: "<tx signature>"
+ *    }
+ *  }
+ */
+app.post("/api/swap/execute", requireSession, async (req, res) => {
+  try {
+    const sessionWallet = req.sessionWallet;
+    const {
+      wallet,
+      signedTransaction,
+      requestId,
+    } = req.body || {};
+
+    const effectiveWallet = String(wallet || sessionWallet || "").trim();
+    if (
+      !sessionWallet ||
+      !effectiveWallet ||
+      effectiveWallet.toLowerCase() !== sessionWallet.toLowerCase()
+    ) {
+      return res
+        .status(403)
+        .json({ error: "wallet_session_mismatch" });
+    }
+
+    if (
+      !signedTransaction ||
+      typeof signedTransaction !== "string"
+    ) {
+      return res
+        .status(400)
+        .json({ error: "signedTransaction_required" });
+    }
+
+    if (!HELIUS_KEY) {
+      return res.status(400).json({
+        error: "HELIUS_API_KEY not configured on backend",
+      });
+    }
+
+    log(
+      "[swap/execute] sending raw tx for wallet=",
+      effectiveWallet,
+      "requestId=",
+      requestId || "n/a"
+    );
+
+    let signature;
+    try {
+      // Helius RPC → sendRawTransaction(base64Tx, { skipPreflight: false, maxRetries: 3 })
+      signature = await rpc("sendRawTransaction", [
+        signedTransaction,
+        { skipPreflight: false, maxRetries: 3 },
+      ]);
+    } catch (sendErr) {
+      err("[swap/execute] sendRawTransaction error:", sendErr);
+      return res.status(502).json({
+        error: "send_raw_failed",
+        detail: String(sendErr?.message || sendErr),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      requestId: requestId || null,
+      result: {
+        signature: typeof signature === "string" ? signature : null,
+      },
+    });
+  } catch (e) {
+    err("[swap/execute] exception:", e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 /* ---------- Broadcasts (HTTP) ---------- */
 const hhmm = (iso) => {
