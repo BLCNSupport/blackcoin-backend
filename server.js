@@ -38,8 +38,12 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Behind Render's proxy, trust the first hop so express-rate-limit can read X-Forwarded-For
+app.set("trust proxy", 1);
+
 // Hide Express fingerprint header
 app.disable("x-powered-by");
+
 
 // --- Security middlewares: Helmet + rate limiting ---
 
@@ -682,10 +686,12 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 /* ---------- Jupiter v6 swap config (backend-only) ---------- */
 
 // Base URLs; override in Render if Jupiter ever changes them.
+// NOTE: quote-api.jup.ag/v6 has been sunset. Use lite-api.jup.ag/swap/v1 instead.
 const JUP_QUOTE_API =
-  process.env.JUP_QUOTE_API || "https://quote-api.jup.ag/v6/quote";
+  process.env.JUP_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
 const JUP_SWAP_API =
-  process.env.JUP_SWAP_API || "https://quote-api.jup.ag/v6/swap";
+  process.env.JUP_SWAP_API || "https://lite-api.jup.ag/swap/v1/swap";
+
 
 // Platform fee (basis points: 100 = 1%)
 // This is enforced ONLY on the backend; the frontend cannot change it.
