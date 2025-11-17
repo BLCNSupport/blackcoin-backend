@@ -81,11 +81,22 @@ const stakingLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+
+const swapLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,             // 30 swap calls per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+
 // Attach limiters BEFORE routes
 app.use("/api/auth", authLimiter);
 app.use("/api/rpc", rpcLimiter);
 app.use("/api/balances", balancesLimiter);
 app.use("/api/staking", stakingLimiter);
+app.use("/api/swap", swapLimiter);
+
 
 // --- CSP header (Report-Only for now, safe for local dev) ---
 const CSP_SUPABASE = process.env.SUPABASE_URL || "";
@@ -691,6 +702,26 @@ const TTL_META = 6 * 60 * 60 * 1000;
 const TTL_SOL = 25_000;
 const TTL_JUP_V2 = 15 * 60 * 1000; // 15m for token search
 
+/* ---------- Jupiter Ultra Swap + Integrator Fee config ---------- */
+
+const JUP_ULTRA_BASE = "https://lite-api.jup.ag/ultra/v1";
+
+// This is the referralAccount you register in Jupiter’s Ultra Swap integration
+// dashboard. It’s a *public key* that receives your fee. :contentReference[oaicite:0]{index=0}
+const JUP_REFERRAL_ACCOUNT = process.env.JUP_REFERRAL_ACCOUNT || "";
+
+// Fee in basis points (50–255 bps allowed by Jupiter; 1% = 100 bps).
+// Jupiter keeps 20% of this; you receive 80%. :contentReference[oaicite:1]{index=1}
+const JUP_REFERRAL_FEE_BPS = Number(process.env.JUP_REFERRAL_FEE_BPS || "0");
+
+// Enable fees only when everything is valid
+const JUP_ENABLE_FEES =
+  !!JUP_REFERRAL_ACCOUNT &&
+  Number.isFinite(JUP_REFERRAL_FEE_BPS) &&
+  JUP_REFERRAL_FEE_BPS >= 50 &&
+  JUP_REFERRAL_FEE_BPS <= 255;
+
+
 const CACHE_LIMIT = 500;
 function setWithLimit(map, key, value) {
   if (map.size >= CACHE_LIMIT) {
@@ -1028,6 +1059,139 @@ app.get("/api/jup/tokens/search", async (req, res) => {
     res.status(502).json({ error: "jupiter_v2_failed" });
   }
 });
+
+/* ---------- Jupiter Ultra Swap (Order + Execute, with optional fees) ---------- */
+
+/**
+ * POST /api/swap/order
+ * Body: { inputMint, outputMint, amount, taker }
+ *
+ * - amount = integer in raw token units (NOT UI decimals)
+ * - taker  = user wallet public key (Phantom signer)
+ *
+ * Returns Jupiter Ultra "order" JSON (includes transaction + requestId).
+ * We optionally attach referralAccount + referralFee here to earn fees. :contentReference[oaicite:5]{index=5}
+ */
+app.post("/api/swap/order", async (req, res) => {
+  try {
+    const { inputMint, outputMint, amount, taker } = req.body || {};
+
+    if (!inputMint || !outputMint || !taker) {
+      return res.status(400).json({
+        error: "inputMint, outputMint, taker are required",
+      });
+    }
+
+    // Normalise amount → string of digits
+    const rawAmount =
+      typeof amount === "string"
+        ? amount.trim()
+        : String(amount || "").trim();
+
+    if (!rawAmount || !/^[0-9]+$/.test(rawAmount)) {
+      return res.status(400).json({
+        error: "amount must be a positive integer (raw units)",
+      });
+    }
+
+    const url = new URL(JUP_ULTRA_BASE + "/order");
+    url.searchParams.set("inputMint", inputMint);
+    url.searchParams.set("outputMint", outputMint);
+    url.searchParams.set("amount", rawAmount);
+    url.searchParams.set("taker", taker);
+
+    // Optional: enable integrator fees when env is valid
+    if (JUP_ENABLE_FEES) {
+      url.searchParams.set("referralAccount", JUP_REFERRAL_ACCOUNT);
+      url.searchParams.set("referralFee", String(JUP_REFERRAL_FEE_BPS));
+    }
+
+    const jupRes = await fetch(url.toString(), {
+      headers: { accept: "application/json" },
+    });
+
+    let json = null;
+    try {
+      json = await jupRes.json();
+    } catch {
+      // ignore JSON parse failure; we'll still return something
+    }
+
+    if (!jupRes.ok) {
+      warn(
+        "[swap/order] Jupiter error",
+        jupRes.status,
+        JSON.stringify(json || {}, null, 2)
+      );
+      return res.status(jupRes.status).json({
+        error: "jupiter_order_failed",
+        status: jupRes.status,
+        detail: json,
+      });
+    }
+
+    // Forward Jupiter Ultra order response directly to the frontend.
+    // It contains: transaction (base64), requestId, route info, expected out amount, etc.
+    return res.json(json);
+  } catch (e) {
+    err("[swap/order] exception:", e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
+/**
+ * POST /api/swap/execute
+ * Body: { signedTransaction, requestId }
+ *
+ * - signedTransaction = base64 string of the transaction signed by the USER wallet
+ * - requestId         = requestId returned from /api/swap/order (Ultra Get Order) :contentReference[oaicite:6]{index=6}
+ *
+ * This simply proxies to Jupiter Ultra `/execute` so the frontend
+ * doesn’t need to call Jupiter directly from the browser.
+ */
+app.post("/api/swap/execute", async (req, res) => {
+  try {
+    const { signedTransaction, requestId } = req.body || {};
+
+    if (!signedTransaction || !requestId) {
+      return res.status(400).json({
+        error: "signedTransaction and requestId are required",
+      });
+    }
+
+    const jupRes = await fetch(JUP_ULTRA_BASE + "/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ signedTransaction, requestId }),
+    });
+
+    let json = null;
+    try {
+      json = await jupRes.json();
+    } catch {
+      // ignore JSON parse failure
+    }
+
+    if (!jupRes.ok) {
+      warn(
+        "[swap/execute] Jupiter error",
+        jupRes.status,
+        JSON.stringify(json || {}, null, 2)
+      );
+      return res.status(jupRes.status).json({
+        error: "jupiter_execute_failed",
+        status: jupRes.status,
+        detail: json,
+      });
+    }
+
+    return res.json(json);
+  } catch (e) {
+    err("[swap/execute] exception:", e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 // Generic RPC helper (Helius)
 async function rpc(method, params) {
@@ -1946,6 +2110,236 @@ app.post("/api/rpc", async (req, res) => {
     res.status(500).json({ error: "RPC proxy failed" });
   }
 });
+
+/* ======================================================================== */
+/* ======================  ULTRA SWAP (JUPITER)  ========================== */
+/* ======================================================================== */
+
+/**
+ * Jupiter Ultra Swap backend proxy
+ *
+ * Env vars (set these in Render):
+ * - JUP_ULTRA_REFERRAL_ACCOUNT   → your referral account pubkey (from referral.jup.ag)
+ * - JUP_ULTRA_REFERRAL_FEE_BPS   → integrator fee bps (50–255). Example: "75"
+ *
+ * If either is missing, swaps still work, but no integrator fee is taken
+ * (Ultra falls back to its default 5–10bps fee only).
+ */
+
+const JUP_ULTRA_BASE = process.env.JUP_ULTRA_BASE || "https://lite-api.jup.ag/ultra/v1";
+const JUP_ULTRA_REFERRAL_ACCOUNT = process.env.JUP_ULTRA_REFERRAL_ACCOUNT || "";
+const JUP_ULTRA_REFERRAL_FEE_BPS = Number(process.env.JUP_ULTRA_REFERRAL_FEE_BPS || "0");
+
+/**
+ * Convert a human UI amount (e.g. "1234.56789") into base units
+ * using token decimals. Returns a string BigInt (for Jupiter `amount`).
+ */
+function parseUiAmountToBaseUnits(uiAmount, decimals) {
+  if (decimals == null || Number.isNaN(decimals)) {
+    decimals = 6;
+  }
+  const d = Number(decimals);
+  if (!Number.isInteger(d) || d < 0 || d > 12) {
+    throw new Error(`Invalid decimals: ${decimals}`);
+  }
+
+  const mul = BigInt(10) ** BigInt(d);
+
+  const raw = String(uiAmount).trim();
+  if (!raw || !/^\d+(\.\d+)?$/.test(raw)) {
+    throw new Error("Invalid amount format");
+  }
+
+  const [intPartStr, fracPartRaw] = raw.split(".");
+  const intPart = BigInt(intPartStr || "0");
+  let fracStr = (fracPartRaw || "").padEnd(d, "0").slice(0, d);
+  if (!fracStr) fracStr = "0";
+  const fracPart = BigInt(fracStr);
+
+  const baseUnits = intPart * mul + fracPart;
+  if (baseUnits <= 0n) {
+    throw new Error("Amount must be > 0");
+  }
+  return baseUnits.toString();
+}
+
+/**
+ * POST /api/swap/order
+ *
+ * Body:
+ *  {
+ *    inputMint:  "<mint>",
+ *    outputMint: "<mint>",
+ *    amount:     "1234.56789",   // UI amount in input token
+ *    taker:      "<wallet pubkey>",
+ *    slippageBps?: number        // optional, default 50
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: true,
+ *    order: {
+ *      requestId,
+ *      transaction,   // base64
+ *      inAmount,
+ *      outAmount,
+ *      feeBps,
+ *      feeMint,
+ *      raw            // full Jupiter order JSON
+ *    }
+ *  }
+ */
+app.post("/api/swap/order", async (req, res) => {
+  try {
+    const { inputMint, outputMint, amount, taker, slippageBps } = req.body || {};
+
+    if (!inputMint || !outputMint || !taker || amount == null) {
+      return res.status(400).json({
+        error: "inputMint, outputMint, taker, amount required",
+      });
+    }
+
+    // Resolve decimals for the input mint (from your existing meta resolver)
+    let decimals = 6;
+    try {
+      const meta = await resolveTokenMetaCombined(String(inputMint).trim(), {
+        nocache: false,
+      });
+      if (meta && typeof meta.decimals === "number") {
+        decimals = meta.decimals;
+      }
+    } catch (e) {
+      warn("[swap/order] meta lookup failed (non-fatal):", e?.message || e);
+    }
+
+    let amountBaseUnits;
+    try {
+      amountBaseUnits = parseUiAmountToBaseUnits(amount, decimals);
+    } catch (e) {
+      return res.status(400).json({ error: "invalid_amount", detail: String(e.message || e) });
+    }
+
+    const params = new URLSearchParams({
+      inputMint: String(inputMint),
+      outputMint: String(outputMint),
+      amount: amountBaseUnits,
+      taker: String(taker),
+    });
+
+    const slip = Number(slippageBps);
+    if (Number.isFinite(slip) && slip > 0 && slip <= 500) {
+      params.set("slippageBps", String(Math.floor(slip)));
+    }
+
+    // Add integrator fee if configured
+    if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+      params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
+      params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
+    }
+
+    const url = `${JUP_ULTRA_BASE}/order?${params.toString()}`;
+    log("[swap/order] →", url.replace(amountBaseUnits, "<amount>"));
+
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+    });
+
+    const j = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+      err("[swap/order] Jupiter error:", r.status, j);
+      return res.status(502).json({
+        error: "jupiter_order_failed",
+        status: r.status,
+        detail: j,
+      });
+    }
+
+    const order = {
+      requestId: j.requestId || j.id || null,
+      transaction: j.transaction || j.tx || null,
+      inAmount: j.inAmount ?? null,
+      outAmount: j.outAmount ?? null,
+      feeBps: j.feeBps ?? null,
+      feeMint: j.feeMint ?? null,
+      raw: j,
+    };
+
+    if (!order.transaction || !order.requestId) {
+      warn("[swap/order] missing transaction or requestId in response");
+    }
+
+    // Log fee for sanity (you can remove later)
+    if (order.feeBps != null) {
+      log("[swap/order] feeBps=", order.feeBps, "feeMint=", order.feeMint);
+    }
+
+    return res.json({ ok: true, order });
+  } catch (e) {
+    err("[swap/order] exception:", e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
+/**
+ * POST /api/swap/execute
+ *
+ * Body:
+ *  {
+ *    signedTransaction: "<base64>",
+ *    requestId:         "<from /order>"
+ *  }
+ *
+ * We simply proxy to Jupiter Ultra /execute and bubble back the JSON.
+ */
+app.post("/api/swap/execute", async (req, res) => {
+  try {
+    const { signedTransaction, requestId } = req.body || {};
+    if (!signedTransaction || !requestId) {
+      return res.status(400).json({
+        error: "signedTransaction and requestId required",
+      });
+    }
+
+    const url = `${JUP_ULTRA_BASE}/execute`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        signedTransaction,
+        requestId,
+      }),
+    });
+
+    const j = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+      err("[swap/execute] Jupiter error:", r.status, j);
+      return res.status(502).json({
+        error: "jupiter_execute_failed",
+        status: r.status,
+        detail: j,
+      });
+    }
+
+    // Normal Ultra response shape includes status + signature, etc.
+    // Example: { status: "Success", signature: "...", ... }
+    log("[swap/execute] status=", j.status, "sig=", j.signature || j.txid);
+    return res.json({ ok: true, result: j });
+  } catch (e) {
+    err("[swap/execute] exception:", e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
+/* ======================================================================== */
+/* ====================  END ULTRA SWAP (JUPITER)  ======================== */
+/* ======================================================================== */
+
 
 // --- AUTH: nonce + verify (used by Staking + OperatorHub) ---
 
