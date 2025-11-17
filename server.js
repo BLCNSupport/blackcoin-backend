@@ -780,13 +780,21 @@ async function fetchDexscreenerMeta(mint) {
     const j = await r.json();
     const p = j?.pairs?.[0];
     if (!p) return null;
-    const holders = Number(p?.holders || 0);
-    return {
-      price_usd: Number(p?.priceUsd) || 0,
-      market_cap_usd:
-        Number(p?.fdv || p?.marketCap || 0),
-      holders: holders > 0 ? holders : null,
-    };
+const holders = Number(p?.holders || 0);
+
+// Try to pull 24h volume in USD from DexScreener
+const volUsd =
+  Number(p?.volumeUsd24h) ||
+  Number(p?.volume?.h24) ||
+  0;
+
+return {
+  price_usd: Number(p?.priceUsd) || 0,
+  market_cap_usd: Number(p?.fdv || p?.marketCap || 0),
+  volume_24h_usd: volUsd > 0 ? volUsd : undefined,
+  holders: holders > 0 ? holders : null,
+};
+
   } catch {
     return null;
   }
@@ -952,6 +960,16 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
     supply: Number(merged.supply || 0),
     price_usd: Number(merged.price_usd || 0),
     market_cap_usd: Number(merged.market_cap_usd || 0),
+
+
+  // 🔹 NEW: 24h volume in USD (from DexScreener or existing row)
+  volume_24h_usd:
+    merged.volume_24h_usd != null
+      ? Number(merged.volume_24h_usd) || 0
+      : existing?.volume_24h_usd != null
+      ? Number(existing.volume_24h_usd) || 0
+      : 0,
+
     holders:
       typeof merged.holders === "number" ? merged.holders : null,
 
