@@ -128,6 +128,7 @@ const CSP_HEADER_VALUE = [
   [
     "connect-src 'self'",
     "https://lite-api.jup.ag",
+    "https://api.jup.ag",
     "https://api.dexscreener.com",
     "https://api.coingecko.com",
     "https://mainnet.helius-rpc.com",
@@ -137,6 +138,7 @@ const CSP_HEADER_VALUE = [
     "ws:",
     "wss:;"
   ].filter(Boolean).join(" ")
+
 ].join(" ");
 
 app.use((req, res, next) => {
@@ -684,14 +686,6 @@ if (!HELIUS_KEY)
   );
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
-/* ---------- Jupiter v6 swap config (backend-only) ---------- */
-
-// Base URLs; override in Render if Jupiter ever changes them.
-// NOTE: quote-api.jup.ag/v6 has been sunset. Use lite-api.jup.ag/swap/v1 instead.
-const JUP_QUOTE_API =
-  process.env.JUP_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
-const JUP_SWAP_API =
-  process.env.JUP_SWAP_API || "https://lite-api.jup.ag/swap/v1/swap";
 
 /* ---------- Jupiter Ultra Swap API (order/execute) ---------- */
 
@@ -705,31 +699,23 @@ const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
 
 // Referral account + fee in bps (0–200) from the Ultra dashboard
 const JUP_ULTRA_REFERRAL_ACCOUNT = (process.env.JUP_ULTRA_REFERRAL_ACCOUNT || "").trim();
+
 const JUP_ULTRA_REFERRAL_FEE_BPS = (() => {
-  const raw = Number(process.env.JUP_ULTRA_REFERRAL_FEE_BPS || SWAP_FEE_BPS || "0");
+  // Ultra referral fee is configured directly via env; no tie to old v6 fee.
+  const raw = Number(process.env.JUP_ULTRA_REFERRAL_FEE_BPS || "0");
   if (!Number.isFinite(raw)) return 0;
   return Math.max(0, Math.min(200, raw));
 })();
 
 // Extra max slippage guard just for Ultra orders.
-// If not set, fall back to your existing MAX_SLIPPAGE_BPS.
 const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
+  // Independent from old v6 config; defaults to 300 bps (3%) if not set.
   const raw = Number(
-    process.env.JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS || MAX_SLIPPAGE_BPS || "200"
+    process.env.JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS || "300"
   );
-  if (!Number.isFinite(raw)) return MAX_SLIPPAGE_BPS;
+  if (!Number.isFinite(raw)) return 300;
   return Math.max(1, Math.min(1000, raw));
 })();
-
-
-function buildUltraHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  // Ultra docs use an API key header; this keeps it optional.
-  if (JUP_ULTRA_API_KEY) {
-    headers["x-jupiter-api-key"] = JUP_ULTRA_API_KEY;
-  }
-  return headers;
-}
 
 
 // Platform fee (basis points: 100 = 1%)
@@ -744,20 +730,6 @@ const SWAP_FEE_BPS = (() => {
 // IMPORTANT: this must be an associated token account whose mint
 // is either the input or output mint of the swap route.
 const SWAP_FEE_ACCOUNT = (process.env.SWAP_FEE_ACCOUNT || "").trim();
-
-// Slippage guardrails
-const DEFAULT_SLIPPAGE_BPS = (() => {
-  const raw = Number(process.env.SWAP_DEFAULT_SLIPPAGE_BPS || "50"); // 0.50%
-  if (!Number.isFinite(raw)) return 50;
-  return Math.max(1, Math.min(500, raw));
-})();
-
-const MAX_SLIPPAGE_BPS = (() => {
-  const raw = Number(process.env.SWAP_MAX_SLIPPAGE_BPS || "300"); // 3%
-  if (!Number.isFinite(raw)) return 300;
-  // never less than default, never more than 10%
-  return Math.max(DEFAULT_SLIPPAGE_BPS, Math.min(1000, raw));
-})();
 
 
 const TOKEN_PROGRAM_ID =
@@ -1820,300 +1792,44 @@ app.post("/api/balances", async (req, res) => {
   }
 });
 
-/* ---------- Swap via Jupiter v6 (backend-only, fee via env) ---------- */
+/* ---------- Swap config (slippage limits used by Ultra) ---------- */
 /*
   Design:
-  - All Jupiter calls run from the backend, not from OperatorHub.html.
-  - Fees (SWAP_FEE_BPS, SWAP_FEE_ACCOUNT) are driven by Render env vars only.
-  - Frontend cannot override fee, slippage caps, or endpoints.
-  - We use your existing session auth (requireSession) so the wallet
-    in the body must match the signed-in wallet.
+  - All live swaps now go through Jupiter Ultra (see /api/swap/order + /api/swap/execute).
+  - This block only defines slippage bounds that we enforce on every request.
 */
+
+// Default slippage in basis points (100 = 1%)
+const DEFAULT_SLIPPAGE_BPS = (() => {
+  const raw = Number(process.env.SWAP_DEFAULT_SLIPPAGE_BPS || "50"); // 0.50%
+  if (!Number.isFinite(raw)) return 50;
+  return Math.max(1, Math.min(500, raw));
+})();
+
+// Maximum slippage the backend will allow from any caller.
+const MAX_SLIPPAGE_BPS = (() => {
+  const raw = Number(process.env.SWAP_MAX_SLIPPAGE_BPS || "300"); // 3%
+  if (!Number.isFinite(raw)) return 300;
+  // never less than default, never more than 10%
+  return Math.max(DEFAULT_SLIPPAGE_BPS, Math.min(1000, raw));
+})();
 
 /**
  * Small helper to normalise and clamp slippage coming from the UI.
- * The frontend can *suggest* a slippage, but we will clamp it to
- * [1, MAX_SLIPPAGE_BPS] and never let it exceed your env limits.
+ * The frontend can *suggest* a slippage, but we clamp it to
+ * [1, min(MAX_SLIPPAGE_BPS, JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS)].
  */
 function normalizeSlippageBps(input) {
   const raw = Number(input);
   const base = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SLIPPAGE_BPS;
 
-  // Hard cap = min(global max, Ultra-specific max)
-  const hardCap = Math.min(MAX_SLIPPAGE_BPS, JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS);
+  const hardCap = Math.min(
+    MAX_SLIPPAGE_BPS,
+    JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS
+  );
 
   return Math.max(1, Math.min(hardCap, base));
 }
-
-
-/**
- * POST /api/swap/quote
- * Body:
- *  {
- *    wallet: "<user wallet>",
- *    inputMint: "<mint address>",
- *    outputMint: "<mint address>",
- *    amount: "<integer in base units>",  // already adjusted for decimals
- *    slippageBps?: number,
- *    swapMode?: "ExactIn" | "ExactOut",
- *    onlyDirectRoutes?: boolean
- *  }
- *
- * Returns Jupiter v6 quote JSON, plus a small _meta block.
- *
- * NOTE:
- *  - We require a valid session so we know which wallet this quote is for.
- *  - We ignore any fee fields from the client; only SWAP_FEE_BPS is used.
- */
-app.post("/api/swap/quote", requireSession, async (req, res) => {
-  try {
-    const sessionWallet = req.sessionWallet;
-    const {
-      wallet,
-      inputMint,
-      outputMint,
-      amount,
-      slippageBps,
-      swapMode,
-      onlyDirectRoutes,
-    } = req.body || {};
-
-    const effectiveWallet = String(wallet || sessionWallet || "").trim();
-    if (
-      !effectiveWallet ||
-      !sessionWallet ||
-      effectiveWallet.toLowerCase() !== sessionWallet.toLowerCase()
-    ) {
-      return res
-        .status(403)
-        .json({ error: "wallet_session_mismatch" });
-    }
-
-    if (!inputMint || !outputMint || !amount) {
-      return res.status(400).json({
-        error: "inputMint, outputMint, and amount are required",
-      });
-    }
-
-    // Jupiter expects amount in smallest units (integer string)
-    const amountStr = String(amount).trim();
-    if (!/^\d+$/.test(amountStr)) {
-      return res
-        .status(400)
-        .json({ error: "amount must be an integer string in base units" });
-    }
-
-    const safeSlippage = normalizeSlippageBps(slippageBps);
-    const mode =
-      swapMode === "ExactOut" ? "ExactOut" : "ExactIn";
-
-    const params = new URLSearchParams({
-      inputMint: String(inputMint).trim(),
-      outputMint: String(outputMint).trim(),
-      amount: amountStr,
-      slippageBps: String(safeSlippage),
-      swapMode: mode,
-      onlyDirectRoutes: String(Boolean(onlyDirectRoutes)),
-      asLegacyTransaction: "true",
-    });
-
-    // Apply platform fee if configured. Note: feeAccount is applied in /swap.
-    if (SWAP_FEE_BPS > 0) {
-      params.set("platformFeeBps", String(SWAP_FEE_BPS));
-    }
-
-    const url = `${JUP_QUOTE_API}?${params.toString()}`;
-    log("[swap/quote] →", url);
-
-    const r = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "Cache-Control": "no-cache",
-      },
-    });
-
-    const text = await r.text();
-    if (!r.ok) {
-      warn(
-        "[swap/quote] Jupiter HTTP",
-        r.status,
-        "body:",
-        text.slice(0, 400)
-      );
-      return res.status(502).json({
-        error: "jupiter_quote_failed",
-        status: r.status,
-        body: text.slice(0, 400),
-      });
-    }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      err("[swap/quote] JSON parse error:", e);
-      return res
-        .status(502)
-        .json({ error: "jupiter_quote_invalid_json" });
-    }
-
-    // Attach a small meta block so the UI knows what the backend enforced.
-    return res.json({
-      ...data,
-      _meta: {
-        wallet: effectiveWallet,
-        slippageBps: safeSlippage,
-        platformFeeBps: SWAP_FEE_BPS,
-        feeAccount: SWAP_FEE_ACCOUNT || null,
-      },
-    });
-  } catch (e) {
-    err("[swap/quote] exception:", e);
-    return res.status(500).json({ error: "internal_error" });
-  }
-});
-
-/**
- * POST /api/swap/transaction
- * Body:
- *  {
- *    wallet: "<user wallet>",
- *    quoteResponse: { ...Jupiter v6 quote JSON... },
- *    wrapAndUnwrapSol?: boolean,
- *    destinationTokenAccount?: string,
- *    prioritizationFeeLamports?: number // optional tip
- *  }
- *
- * Returns:
- *  {
- *    swapTransaction: "<base64>",
- *    platformFeeBps: number,
- *    feeAccount: string | null
- *  }
- *
- * Frontend is responsible for:
- *  - deserializing swapTransaction,
- *  - signing it with the user's wallet,
- *  - sending it to the cluster.
- */
-app.post("/api/swap/transaction", requireSession, async (req, res) => {
-  try {
-    const sessionWallet = req.sessionWallet;
-    const {
-      wallet,
-      quoteResponse,
-      wrapAndUnwrapSol,
-      destinationTokenAccount,
-      prioritizationFeeLamports,
-    } = req.body || {};
-
-    const effectiveWallet = String(wallet || sessionWallet || "").trim();
-    if (
-      !effectiveWallet ||
-      !sessionWallet ||
-      effectiveWallet.toLowerCase() !== sessionWallet.toLowerCase()
-    ) {
-      return res
-        .status(403)
-        .json({ error: "wallet_session_mismatch" });
-    }
-
-    if (!quoteResponse || typeof quoteResponse !== "object") {
-      return res.status(400).json({
-        error: "quoteResponse is required and must be an object",
-      });
-    }
-
-    // Build body for Jupiter /v6/swap
-    const body = {
-      quoteResponse,
-      userPublicKey: effectiveWallet,
-      wrapAndUnwrapSol: wrapAndUnwrapSol !== false,
-      dynamicComputeUnitLimit: true,
-      dynamicSlippage: false,
-    };
-
-    if (
-      typeof prioritizationFeeLamports === "number" &&
-      prioritizationFeeLamports > 0
-    ) {
-      // Jupiter v6 uses prioritizationFeeLamports for priority fee
-      body.prioritizationFeeLamports = Math.floor(
-        prioritizationFeeLamports
-      );
-    }
-
-    if (destinationTokenAccount) {
-      body.destinationTokenAccount = String(
-        destinationTokenAccount
-      ).trim();
-    }
-
-    // Enforce platform fee from env, not from client.
-    if (SWAP_FEE_BPS > 0) {
-      body.platformFeeBps = SWAP_FEE_BPS;
-
-      if (SWAP_FEE_ACCOUNT) {
-        body.feeAccount = SWAP_FEE_ACCOUNT;
-      }
-    }
-
-    log(
-      "[swap/tx] building swap for wallet=",
-      effectiveWallet,
-      "feeBps=",
-      SWAP_FEE_BPS
-    );
-
-    const r = await fetch(JUP_SWAP_API, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    const text = await r.text();
-    if (!r.ok) {
-      warn(
-        "[swap/tx] Jupiter HTTP",
-        r.status,
-        "body:",
-        text.slice(0, 400)
-      );
-      return res.status(502).json({
-        error: "jupiter_swap_failed",
-        status: r.status,
-        body: text.slice(0, 400),
-      });
-    }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      err("[swap/tx] JSON parse error:", e);
-      return res
-        .status(502)
-        .json({ error: "jupiter_swap_invalid_json" });
-    }
-
-    if (!data?.swapTransaction) {
-      warn("[swap/tx] missing swapTransaction in Jupiter response");
-      return res.status(502).json({
-        error: "jupiter_swap_missing_transaction",
-        raw: data,
-      });
-    }
-
-    return res.json({
-      swapTransaction: data.swapTransaction,
-      platformFeeBps: SWAP_FEE_BPS,
-      feeAccount: SWAP_FEE_ACCOUNT || null,
-    });
-  } catch (e) {
-    err("[swap/tx] exception:", e);
-    return res.status(500).json({ error: "internal_error" });
-  }
-});
 
 // === Ultra-style swap "order" + "execute" used by OperatorHub swap panel ===
 // Design:
@@ -2303,15 +2019,7 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
   }
 });
 
-/**
- * POST /api/swap/execute
- * Body:
- *  {
- *    wallet?: "<wallet>",
- *    signedTransaction: "<base64>",
- *    requestId?: "<id from /api/swap/order>"
- *  }
- *
+
  * Returns:
  *  {
  *    ok: true,
