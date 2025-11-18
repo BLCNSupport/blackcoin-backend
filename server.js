@@ -21,6 +21,9 @@ import nacl from "tweetnacl";
 import bs58 from "bs58";
 import crypto from "crypto";
 
+
+
+
 /* === NEW: Solana + SPL Token for staking payouts === */
 import * as web3 from "@solana/web3.js";
 import {
@@ -40,6 +43,7 @@ app.set("trust proxy", 1);
 
 // Hide Express fingerprint header
 app.disable("x-powered-by");
+
 
 // --- Security middlewares: Helmet + rate limiting ---
 
@@ -88,12 +92,14 @@ const swapLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+
 // Attach limiters BEFORE routes
 app.use("/api/auth", authLimiter);
 app.use("/api/rpc", rpcLimiter);
 app.use("/api/balances", balancesLimiter);
 app.use("/api/staking", stakingLimiter);
 app.use("/api/swap", swapLimiter);
+
 
 // --- CSP header (Report-Only for now, safe for local dev) ---
 const CSP_SUPABASE = process.env.SUPABASE_URL || "";
@@ -147,6 +153,7 @@ app.use((req, res, next) => {
   next();
 });
 
+
 // --- DEV wallets + in-memory auth session store ---
 
 // DEV_WALLETS should be set in Render as a comma-separated list:
@@ -188,6 +195,7 @@ function requireSession(req, res, next) {
   req.sessionWallet = wallet;
   next();
 }
+
 
 /* ---------- CORS (tightened) ---------- */
 
@@ -492,6 +500,8 @@ app.get("/api/chart", async (req, res) => {
   }
 });
 
+
+
 app.get("/api/latest", async (_req, res) => {
   try {
     let latest = memoryCache.at(-1);
@@ -667,6 +677,7 @@ app.post(
   }
 );
 
+
 /* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY)
@@ -684,7 +695,8 @@ const JUP_ULTRA_BASE = (
   process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra"
 ).replace(/\/+$/, "");
 
-// Optional API key from the Jupiter dev portal (Ultra tab)
+
+ // Optional API key from the Jupiter dev portal (Ultra tab)
 const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
 
 // Referral account + fee in bps (50–255) from the Ultra dashboard
@@ -722,6 +734,7 @@ const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
   if (!Number.isFinite(raw)) return 300;
   return Math.max(1, Math.min(1000, raw));
 })();
+
 
 // Platform fee (basis points: 100 = 1%)
 // This is enforced ONLY on the backend; the frontend cannot change it.
@@ -1215,6 +1228,7 @@ async function getTokenMeta(mint) {
   }
 }
 
+
 /* ---------- Price (Jupiter v3 primary, Dexscreener fallback) + WS tick ---------- */
 async function getTokenUsd(mint, { nocache = false } = {}) {
   const now = Date.now();
@@ -1363,6 +1377,7 @@ async function getBlackcoinBalanceForWallet(wallet, commitment = "confirmed") {
   const black = (tokens || []).find((t) => t.mint === TOKEN_MINT);
   return black ? Number(black.amount || 0) : 0;
 }
+
 
 /* === Small helper for homepage CTO / Utility wallets === */
 async function getWalletSnapshot(
@@ -1662,10 +1677,10 @@ app.get("/api/wallets", async (_req, res) => {
 //   mint,
 //   priceUsd,
 //   marketCapUsd,
-  // holders,
-  // supply,
+//   holders,
+//   supply,
 //   changePct24h,
-  // volume24h
+//   volume24h
 // }
 app.get("/api/home", async (_req, res) => {
   try {
@@ -1858,23 +1873,34 @@ async function buildClassicJupiterSwap(opts) {
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
-  // Step 1: Get quote
-  const quoteUrl = `https://quote-api.jup.ag/v6/quote?${new URLSearchParams({
-    inputMint: String(inputMint),
-    outputMint: String(outputMint),
-    amount: baseInStr,
-    slippageBps: safeSlippage,
-  })}`;
+  // Step 1: Get quote (with retry on DNS error)
+  let quoteRes;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?${new URLSearchParams({
+        inputMint: String(inputMint),
+        outputMint: String(outputMint),
+        amount: baseInStr,
+        slippageBps: safeSlippage,
+      })}`;
 
-  log("[swap/classic] Quote →", quoteUrl);
+      log("[swap/classic] Quote attempt", attempt, "→", quoteUrl);
 
-  const quoteRes = await fetch(quoteUrl);
-  const quoteText = await quoteRes.text();
-  if (!quoteRes.ok) {
-    warn("[swap/classic] Quote failed:", quoteRes.status, quoteText.slice(0, 300));
-    throw new Error(`classic_quote_failed:${quoteRes.status}`);
+      quoteRes = await fetch(quoteUrl);
+      if (quoteRes.ok) break;
+      warn("[swap/classic] Quote attempt", attempt, "failed:", quoteRes.status);
+    } catch (e) {
+      warn("[swap/classic] Quote attempt", attempt, "error:", e.message);
+      if (!e.message.includes("ENOTFOUND")) throw e;  // Non-DNS error, fail immediately
+    }
+    await new Promise(r => setTimeout(r, 1000 * attempt));  // Exponential backoff
   }
 
+  if (!quoteRes || !quoteRes.ok) {
+    throw new Error("classic_quote_failed after retries");
+  }
+
+  const quoteText = await quoteRes.text();
   let quoteJson;
   try {
     quoteJson = JSON.parse(quoteText);
@@ -1890,35 +1916,45 @@ async function buildClassicJupiterSwap(opts) {
 
   const selectedQuote = quoteJson;  // Use full quote (includes routes[0])
 
-  // Step 2: Get swap transaction
-  const swapUrl = "https://quote-api.jup.ag/v6/swap";
-  const swapBody = {
-    quoteResponse: selectedQuote,
-    userPublicKey: wallet,
-    wrapAndUnwrapSol: true,  // Auto-wrap SOL if needed
-    computeUnitPriceMicroLamports: 100000,  // ~0.0001 SOL priority fee (adjust as needed)
-  };
+  // Step 2: Get swap transaction (with retry)
+  let swapRes;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const swapUrl = "https://quote-api.jup.ag/v6/swap";
+      const swapBody = {
+        quoteResponse: selectedQuote,
+        userPublicKey: wallet,
+        wrapAndUnwrapSol: true,  // Auto-wrap SOL if needed
+        computeUnitPriceMicroLamports: 100000,  // ~0.0001 SOL priority fee (adjust as needed)
+      };
 
-  // Add referral fee (same as Ultra)
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS >= 50) {
-    swapBody.platformFeeBps = JUP_ULTRA_REFERRAL_FEE_BPS;
-    swapBody.feeAccount = JUP_ULTRA_REFERRAL_ACCOUNT;
+      // Add referral fee (same as Ultra)
+      if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS >= 50) {
+        swapBody.platformFeeBps = JUP_ULTRA_REFERRAL_FEE_BPS;
+        swapBody.feeAccount = JUP_ULTRA_REFERRAL_ACCOUNT;
+      }
+
+      log("[swap/classic] Swap tx attempt", attempt, "→ POST", swapUrl);
+
+      swapRes = await fetch(swapUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(swapBody),
+      });
+      if (swapRes.ok) break;
+      warn("[swap/classic] Swap attempt", attempt, "failed:", swapRes.status);
+    } catch (e) {
+      warn("[swap/classic] Swap attempt", attempt, "error:", e.message);
+      if (!e.message.includes("ENOTFOUND")) throw e;
+    }
+    await new Promise(r => setTimeout(r, 1000 * attempt));
   }
 
-  log("[swap/classic] Swap tx → POST", swapUrl);
-
-  const swapRes = await fetch(swapUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(swapBody),
-  });
+  if (!swapRes || !swapRes.ok) {
+    throw new Error("classic_swap_failed after retries");
+  }
 
   const swapText = await swapRes.text();
-  if (!swapRes.ok) {
-    warn("[swap/classic] Swap failed:", swapRes.status, swapText.slice(0, 300));
-    throw new Error(`classic_swap_failed:${swapRes.status}`);
-  }
-
   let swapJson;
   try {
     swapJson = JSON.parse(swapText);
@@ -1988,63 +2024,81 @@ async function buildUltraSwapOrderTx(opts) {
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
-  // NEW: Pre-check with v6 quote to ensure viability
+  // NEW: Pre-check with v6 quote to ensure viability (with retry on DNS)
   let viable = false;
-  try {
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;
-    const quoteRes = await fetch(quoteUrl);
-    const quote = await quoteRes.json();
-    viable = !quote.error && quote.routes && quote.routes.length > 0;
-    if (viable) {
-      const priceImpact = parseFloat(quote.routes[0].priceImpactPct || 0);
-      if (priceImpact > 10) {  // Too risky for Ultra
-        viable = false;
-        log("[swap/ultra] High impact, skipping Ultra:", priceImpact + "%");
-      } else {
-        log("[swap/ultra] Viable quote, proceeding");
+  let quote;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;
+      log("[swap/ultra] Pre-check attempt", attempt, "→", quoteUrl);
+      const quoteRes = await fetch(quoteUrl);
+      quote = await quoteRes.json();
+      viable = !quote.error && quote.routes && quote.routes.length > 0;
+      if (viable) {
+        const priceImpact = parseFloat(quote.routes[0].priceImpactPct || 0);
+        if (priceImpact > 10) {  // Too risky for Ultra
+          viable = false;
+          log("[swap/ultra] High impact, skipping Ultra:", priceImpact + "%");
+        } else {
+          log("[swap/ultra] Viable quote, proceeding");
+        }
       }
+      if (viable) break;
+    } catch (e) {
+      warn("[swap/ultra] Pre-check attempt", attempt, "failed:", e.message);
+      if (!e.message.includes("ENOTFOUND")) throw e;
     }
-  } catch (e) {
-    log("[swap/ultra] Pre-check failed:", e.message);
+    await new Promise(r => setTimeout(r, 1000 * attempt));
   }
 
   if (!viable) {
     throw new Error("ultra_unsuitable: falling back");  // Triggers fallback
   }
 
-  // Original Ultra v1 logic (GET /v1/order)
-  const params = new URLSearchParams({
-    inputMint: String(inputMint),
-    outputMint: String(outputMint),
-    amount: baseInStr,
-    taker: wallet,
-    slippageBps: String(safeSlippage),
-    swapMode: "ExactIn",
-  });
+  // Original Ultra v1 logic (GET /v1/order) with retry
+  let orderRes;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const params = new URLSearchParams({
+        inputMint: String(inputMint),
+        outputMint: String(outputMint),
+        amount: baseInStr,
+        taker: wallet,
+        slippageBps: String(safeSlippage),
+        swapMode: "ExactIn",
+      });
 
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
-    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
-    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
+      if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+        params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
+        params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
+      }
+
+      const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+      log("[swap/order] Ultra order attempt", attempt, "→", orderUrl);
+
+      const headers = {
+        accept: "application/json",
+        "Cache-Control": "no-cache",
+      };
+      if (JUP_ULTRA_API_KEY) {
+        headers["x-api-key"] = JUP_ULTRA_API_KEY;
+      }
+
+      orderRes = await fetch(orderUrl, { headers });
+      if (orderRes.ok) break;
+      warn("[swap/order] Ultra attempt", attempt, "failed:", orderRes.status);
+    } catch (e) {
+      warn("[swap/order] Ultra attempt", attempt, "error:", e.message);
+      if (!e.message.includes("ENOTFOUND")) throw e;
+    }
+    await new Promise(r => setTimeout(r, 1000 * attempt));
   }
 
-  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
-  log("[swap/order] Ultra order →", orderUrl);
-
-  const headers = {
-    accept: "application/json",
-    "Cache-Control": "no-cache",
-  };
-  if (JUP_ULTRA_API_KEY) {
-    headers["x-api-key"] = JUP_ULTRA_API_KEY;
+  if (!orderRes || !orderRes.ok) {
+    throw new Error("ultra_order_failed after retries");
   }
 
-  const orderRes = await fetch(orderUrl, { headers });
   const orderText = await orderRes.text();
-
-  if (!orderRes.ok) {
-    warn("[swap/order] Ultra order HTTP", orderRes.status, "body:", orderText.slice(0, 400));
-    throw new Error(`ultra_order_failed:${orderRes.status}`);
-  }
 
   let orderJson;
   try {
@@ -2341,26 +2395,28 @@ app.post("/api/swap/execute", requireSession, async (req, res) => {
       headers["x-api-key"] = JUP_ULTRA_API_KEY;
     }
 
-    const r = await fetch(executeUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+    let r;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        r = await fetch(executeUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        if (r.ok) break;
+        warn("[swap/execute] Attempt", attempt, "failed:", r.status);
+      } catch (e) {
+        warn("[swap/execute] Attempt", attempt, "error:", e.message);
+        if (!e.message.includes("ENOTFOUND")) throw e;
+      }
+      await new Promise(res => setTimeout(res, 1000 * attempt));
+    }
+
+    if (!r || !r.ok) {
+      throw new Error("ultra_execute_failed after retries");
+    }
 
     const text = await r.text();
-    if (!r.ok) {
-      warn(
-        "[swap/execute] Ultra HTTP",
-        r.status,
-        "body:",
-        text.slice(0, 400)
-      );
-      return res.status(502).json({
-        error: "ultra_execute_failed",
-        status: r.status,
-        body: text.slice(0, 400),
-      });
-    }
 
     let executeJson;
     try {
