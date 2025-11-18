@@ -2018,27 +2018,6 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
   }
 });
 
-
- * Returns:
- *  {
- *    ok: true,
- *    requestId,
- *    result: {
- *      signature: "<tx signature>"
- *    }
- *  }
- */
-/**
- * POST /api/swap/execute
- * Body:
- *  {
- *    wallet?: "<wallet>",
- *    signedTransaction: "<base64>",
- *    requestId?: "<id from /api/swap/order>"
- *  }
- *
- * We forward this to Jupiter Ultra's /execute endpoint.
- */
 app.post("/api/swap/execute", requireSession, async (req, res) => {
   try {
     const sessionWallet = req.sessionWallet;
