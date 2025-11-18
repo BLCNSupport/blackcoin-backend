@@ -21,9 +21,6 @@ import nacl from "tweetnacl";
 import bs58 from "bs58";
 import crypto from "crypto";
 
-
-
-
 /* === NEW: Solana + SPL Token for staking payouts === */
 import * as web3 from "@solana/web3.js";
 import {
@@ -43,7 +40,6 @@ app.set("trust proxy", 1);
 
 // Hide Express fingerprint header
 app.disable("x-powered-by");
-
 
 // --- Security middlewares: Helmet + rate limiting ---
 
@@ -92,14 +88,12 @@ const swapLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-
 // Attach limiters BEFORE routes
 app.use("/api/auth", authLimiter);
 app.use("/api/rpc", rpcLimiter);
 app.use("/api/balances", balancesLimiter);
 app.use("/api/staking", stakingLimiter);
 app.use("/api/swap", swapLimiter);
-
 
 // --- CSP header (Report-Only for now, safe for local dev) ---
 const CSP_SUPABASE = process.env.SUPABASE_URL || "";
@@ -153,7 +147,6 @@ app.use((req, res, next) => {
   next();
 });
 
-
 // --- DEV wallets + in-memory auth session store ---
 
 // DEV_WALLETS should be set in Render as a comma-separated list:
@@ -195,7 +188,6 @@ function requireSession(req, res, next) {
   req.sessionWallet = wallet;
   next();
 }
-
 
 /* ---------- CORS (tightened) ---------- */
 
@@ -500,8 +492,6 @@ app.get("/api/chart", async (req, res) => {
   }
 });
 
-
-
 app.get("/api/latest", async (_req, res) => {
   try {
     let latest = memoryCache.at(-1);
@@ -677,7 +667,6 @@ app.post(
   }
 );
 
-
 /* ---------- Balances (Helius RPC + Jupiter v3 price + DexScreener fallback) ---------- */
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 if (!HELIUS_KEY)
@@ -694,7 +683,6 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 const JUP_ULTRA_BASE = (
   process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra"
 ).replace(/\/+$/, "");
-
 
 // Optional API key from the Jupiter dev portal (Ultra tab)
 const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
@@ -734,7 +722,6 @@ const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
   if (!Number.isFinite(raw)) return 300;
   return Math.max(1, Math.min(1000, raw));
 })();
-
 
 // Platform fee (basis points: 100 = 1%)
 // This is enforced ONLY on the backend; the frontend cannot change it.
@@ -1228,7 +1215,6 @@ async function getTokenMeta(mint) {
   }
 }
 
-
 /* ---------- Price (Jupiter v3 primary, Dexscreener fallback) + WS tick ---------- */
 async function getTokenUsd(mint, { nocache = false } = {}) {
   const now = Date.now();
@@ -1377,7 +1363,6 @@ async function getBlackcoinBalanceForWallet(wallet, commitment = "confirmed") {
   const black = (tokens || []).find((t) => t.mint === TOKEN_MINT);
   return black ? Number(black.amount || 0) : 0;
 }
-
 
 /* === Small helper for homepage CTO / Utility wallets === */
 async function getWalletSnapshot(
@@ -1677,10 +1662,10 @@ app.get("/api/wallets", async (_req, res) => {
 //   mint,
 //   priceUsd,
 //   marketCapUsd,
-//   holders,
-//   supply,
+  // holders,
+  // supply,
 //   changePct24h,
-//   volume24h
+  // volume24h
 // }
 app.get("/api/home", async (_req, res) => {
   try {
@@ -1853,46 +1838,16 @@ function normalizeSlippageBps(input) {
   return Math.max(1, Math.min(hardCap, base));
 }
 
-// === Ultra-style swap "order" + "execute" used by OperatorHub swap panel ===
-// Design:
-// - /api/swap/order: take UI amount, build Jupiter Ultra order, return an object
-//   containing { transaction, requestId, inAmount, outAmount, ... }.
-// - /api/swap/execute: take signedTransaction from Phantom, broadcast via Ultra.
-
 /**
- * Build an Ultra order and return an object for the UI:
- * {
- *   requestId,
- *   transaction,    // base64 swap tx (unsigned)
- *   inAmount,       // UI input amount
- *   outAmount,      // UI estimated output amount
- *   inputMint,
- *   outputMint,
- *   slippageBps
- * }
+ * Fallback: Build swap using classic Jupiter v6 (quote → swapTransaction).
+ * Returns same shape as Ultra for easy drop-in.
  */
-/**
- * Build an Ultra order and return an object for the UI:
- * {
- *   requestId,
- *   transaction,    // base64 swap tx (unsigned)
- *   inAmount,       // UI input amount
- *   outAmount,      // UI estimated output amount
- *   inputMint,
- *   outputMint,
- *   slippageBps
- * }
- *
- * This now uses a 2-step Ultra flow:
- *  1) GET /v1/order → quote/route
- *  2) POST /v1/order → build swap transaction
- */
-async function buildUltraSwapOrderTx(opts) {
+async function buildClassicJupiterSwap(opts) {
   const {
     wallet,
     inputMint,
     outputMint,
-    amount,           // already in base units (string)
+    amount,  // base units (string/number)
     slippageBps,
   } = opts;
 
@@ -1903,76 +1858,225 @@ async function buildUltraSwapOrderTx(opts) {
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
+  // Step 1: Get quote
+  const quoteUrl = `https://quote-api.jup.ag/v6/quote?${new URLSearchParams({
+    inputMint: String(inputMint),
+    outputMint: String(outputMint),
+    amount: baseInStr,
+    slippageBps: safeSlippage,
+  })}`;
+
+  log("[swap/classic] Quote →", quoteUrl);
+
+  const quoteRes = await fetch(quoteUrl);
+  const quoteText = await quoteRes.text();
+  if (!quoteRes.ok) {
+    warn("[swap/classic] Quote failed:", quoteRes.status, quoteText.slice(0, 300));
+    throw new Error(`classic_quote_failed:${quoteRes.status}`);
+  }
+
+  let quoteJson;
+  try {
+    quoteJson = JSON.parse(quoteText);
+  } catch (e) {
+    err("[swap/classic] Quote JSON error:", quoteText.slice(0, 300));
+    throw new Error("classic_quote_invalid_json");
+  }
+
+  if (quoteJson.error || !quoteJson.routes || quoteJson.routes.length === 0) {
+    warn("[swap/classic] No routes:", quoteJson.error || "Empty routes");
+    throw new Error("classic_no_routes");
+  }
+
+  const selectedQuote = quoteJson;  // Use full quote (includes routes[0])
+
+  // Step 2: Get swap transaction
+  const swapUrl = "https://quote-api.jup.ag/v6/swap";
+  const swapBody = {
+    quoteResponse: selectedQuote,
+    userPublicKey: wallet,
+    wrapAndUnwrapSol: true,  // Auto-wrap SOL if needed
+    computeUnitPriceMicroLamports: 100000,  // ~0.0001 SOL priority fee (adjust as needed)
+  };
+
+  // Add referral fee (same as Ultra)
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS >= 50) {
+    swapBody.platformFeeBps = JUP_ULTRA_REFERRAL_FEE_BPS;
+    swapBody.feeAccount = JUP_ULTRA_REFERRAL_ACCOUNT;
+  }
+
+  log("[swap/classic] Swap tx → POST", swapUrl);
+
+  const swapRes = await fetch(swapUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(swapBody),
+  });
+
+  const swapText = await swapRes.text();
+  if (!swapRes.ok) {
+    warn("[swap/classic] Swap failed:", swapRes.status, swapText.slice(0, 300));
+    throw new Error(`classic_swap_failed:${swapRes.status}`);
+  }
+
+  let swapJson;
+  try {
+    swapJson = JSON.parse(swapText);
+  } catch (e) {
+    err("[swap/classic] Swap JSON error:", swapText.slice(0, 300));
+    throw new Error("classic_swap_invalid_json");
+  }
+
+  if (swapJson.error) {
+    warn("[swap/classic] Swap API error:", swapJson.error);
+    throw new Error(`classic_swap_error: ${swapJson.error}`);
+  }
+
+  const txBase64 = swapJson.swapTransaction;
+  if (!txBase64) {
+    throw new Error("classic_missing_transaction");
+  }
+
+  // Derive outAmount for UI (from best route)
   const outMeta = await getTokenMeta(outputMint);
   const outDecimals = typeof outMeta.decimals === "number" ? outMeta.decimals : 6;
+  let outAmountUi = 0;
+  try {
+    const outRaw = Number(selectedQuote.outAmount || 0);
+    if (outRaw > 0) outAmountUi = outRaw / Math.pow(10, outDecimals);
+  } catch {}
 
-  // ULTRA V2 ENDPOINT (this is the real fix)
-  const url = `${JUP_ULTRA_BASE}/v2/order`;
+  // Generate a fake requestId for compatibility (v6 doesn't have one)
+  const fakeRequestId = `classic-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  const body = {
+  return {
+    requestId: fakeRequestId,
+    transaction: txBase64,
+    inAmount: baseInStr,
+    outAmount: outAmountUi,
+    inputMint,
+    outputMint,
+    slippageBps: safeSlippage,
+  };
+}
+
+/**
+ * Build an Ultra order and return an object for the UI:
+ * {
+ *   requestId,
+ *   transaction,    // base64 swap tx (unsigned)
+ *   inAmount,       // UI input amount
+ *   outAmount,      // UI estimated output amount
+ *   inputMint,
+ *   outputMint,
+ *   slippageBps
+ * }
+ */
+async function buildUltraSwapOrderTx(opts) {
+  const {
+    wallet,
+    inputMint,
+    outputMint,
+    amount,
+    slippageBps,
+  } = opts;
+
+  const baseInStr = String(amount ?? "").trim();
+  if (!baseInStr || !/^[0-9]+$/.test(baseInStr) || /^0+$/.test(baseInStr)) {
+    throw new Error("Invalid amount");
+  }
+
+  const safeSlippage = normalizeSlippageBps(slippageBps);
+
+  // NEW: Pre-check with v6 quote to ensure viability
+  let viable = false;
+  try {
+    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;
+    const quoteRes = await fetch(quoteUrl);
+    const quote = await quoteRes.json();
+    viable = !quote.error && quote.routes && quote.routes.length > 0;
+    if (viable) {
+      const priceImpact = parseFloat(quote.routes[0].priceImpactPct || 0);
+      if (priceImpact > 10) {  // Too risky for Ultra
+        viable = false;
+        log("[swap/ultra] High impact, skipping Ultra:", priceImpact + "%");
+      } else {
+        log("[swap/ultra] Viable quote, proceeding");
+      }
+    }
+  } catch (e) {
+    log("[swap/ultra] Pre-check failed:", e.message);
+  }
+
+  if (!viable) {
+    throw new Error("ultra_unsuitable: falling back");  // Triggers fallback
+  }
+
+  // Original Ultra v1 logic (GET /v1/order)
+  const params = new URLSearchParams({
     inputMint: String(inputMint),
     outputMint: String(outputMint),
     amount: baseInStr,
     taker: wallet,
-    slippageBps: safeSlippage,
+    slippageBps: String(safeSlippage),
     swapMode: "ExactIn",
-  };
+  });
 
-  // Referral (your platform fee) — only include if you have both
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS >= 50) {
-    body.referralAccount = JUP_ULTRA_REFERRAL_ACCOUNT;
-    body.referralFeeBps = JUP_ULTRA_REFERRAL_FEE_BPS;  // note: Bps, not just fee
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
+    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
   }
 
-  log("[swap/order] Ultra v2 order → POST", url);
-  log("[swap/order] Body:", JSON.stringify(body).slice(0, 500));
+  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+  log("[swap/order] Ultra order →", orderUrl);
 
   const headers = {
-    "Content-Type": "application/json",
     accept: "application/json",
+    "Cache-Control": "no-cache",
   };
   if (JUP_ULTRA_API_KEY) {
     headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
+  const orderRes = await fetch(orderUrl, { headers });
+  const orderText = await orderRes.text();
 
-  const text = await res.text();
-  if (!res.ok) {
-    warn("[swap/order] Ultra v2 failed:", res.status, text.slice(0, 500));
-    throw new Error(`ultra_order_failed:${res.status}`);
+  if (!orderRes.ok) {
+    warn("[swap/order] Ultra order HTTP", orderRes.status, "body:", orderText.slice(0, 400));
+    throw new Error(`ultra_order_failed:${orderRes.status}`);
   }
 
-  let json;
+  let orderJson;
   try {
-    json = JSON.parse(text);
+    orderJson = JSON.parse(orderText);
   } catch (e) {
-    err("[swap/order] JSON parse error:", text.slice(0, 500));
+    err("[swap/order] Ultra JSON parse error:", e, "body:", orderText.slice(0, 400));
     throw new Error("ultra_order_invalid_json");
   }
 
-  const txBase64 = json.swapTransaction || json.transaction;
-  const requestId = json.requestId || json.id;
+  const txField = orderJson.transaction || orderJson.swapTransaction || orderJson.legacyTransaction || null;
+  const reqId = orderJson.requestId || orderJson.id || orderJson.orderId || null;
 
-  if (!txBase64) {
-    warn("[swap/order] No swapTransaction in response:", text.slice(0, 500));
-    throw new Error("ultra_missing_transaction");
+  if (!txField) {
+    warn("[swap/order] Ultra missing transaction. Body:", orderText.slice(0, 400));
+    throw new Error("ultra_order_missing_fields");
   }
 
-  // Try to extract outAmount for UI
+  const outMeta = await getTokenMeta(outputMint);
+  const outDecimals = typeof outMeta.decimals === "number" ? outMeta.decimals : 6;
   let outAmountUi = 0;
   try {
-    const outRaw = Number(json.outAmount || json.outputAmount || 0);
-    if (outRaw > 0) outAmountUi = outRaw / Math.pow(10, outDecimals);
-  } catch {}
+    const outBaseRaw = Number(orderJson.outAmount || orderJson.outputAmount || 0);
+    if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
+      outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+    }
+  } catch (e) {
+    warn("[swap/order] Failed to derive outAmount:", e);
+  }
 
   return {
-    requestId,
-    transaction: txBase64,
+    requestId: reqId,
+    transaction: txField,
     inAmount: baseInStr,
     outAmount: outAmountUi,
     inputMint,
@@ -2031,14 +2135,30 @@ app.post("/api/swap/quote", requireSession, async (req, res) => {
       });
     }
 
-const order = await buildUltraSwapOrderTx({
-  wallet,
-  inputMint,
-  outputMint,
-  amount,        // already base units from the frontend
-  slippageBps,
-});
-
+    let order;
+    try {
+      order = await buildUltraSwapOrderTx({
+        wallet,
+        inputMint,
+        outputMint,
+        amount,        // already base units from the frontend
+        slippageBps,
+      });
+      log("[swap] Ultra succeeded");
+    } catch (e) {
+      if (e.message.includes("ultra_order_failed") || e.message.includes("ultra_unsuitable")) {
+        log("[swap] Ultra failed, falling back to classic v6");
+        order = await buildClassicJupiterSwap({
+          wallet,
+          inputMint,
+          outputMint,
+          amount,
+          slippageBps,
+        });
+      } else {
+        throw e;  // Non-recoverable
+      }
+    }
 
     // Frontend can read either `res.quote` or `res.order`
     return res.json({
@@ -2113,13 +2233,30 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       });
     }
 
-const order = await buildUltraSwapOrderTx({
-  wallet,
-  inputMint,
-  outputMint,
-  amount,        // already base units from the frontend
-  slippageBps,
-});
+    let order;
+    try {
+      order = await buildUltraSwapOrderTx({
+        wallet,
+        inputMint,
+        outputMint,
+        amount,        // already base units from the frontend
+        slippageBps,
+      });
+      log("[swap] Ultra succeeded");
+    } catch (e) {
+      if (e.message.includes("ultra_order_failed") || e.message.includes("ultra_unsuitable")) {
+        log("[swap] Ultra failed, falling back to classic v6");
+        order = await buildClassicJupiterSwap({
+          wallet,
+          inputMint,
+          outputMint,
+          amount,
+          slippageBps,
+        });
+      } else {
+        throw e;  // Non-recoverable
+      }
+    }
 
     return res.json({
       ok: true,
@@ -2183,10 +2320,10 @@ app.post("/api/swap/execute", requireSession, async (req, res) => {
 
     const body = {
       signedTransaction,
-      requestId: requestId || undefined,
+      ...(requestId && { requestId }),  // Optional for v6 swaps
     };
 
-    const executeUrl = `${JUP_ULTRA_BASE}/v2/execute`;
+    const executeUrl = `${JUP_ULTRA_BASE}/v1/execute`;
     log(
       "[swap/execute] Ultra execute →",
       executeUrl,
