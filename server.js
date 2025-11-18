@@ -697,15 +697,23 @@ const JUP_ULTRA_BASE = (process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra"
 // Optional API key from the Jupiter dev portal (Ultra tab)
 const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
 
-// Referral account + fee in bps (0–200) from the Ultra dashboard
+// Referral account + fee in bps (50–255) from the Ultra dashboard
 const JUP_ULTRA_REFERRAL_ACCOUNT = (process.env.JUP_ULTRA_REFERRAL_ACCOUNT || "").trim();
 
 const JUP_ULTRA_REFERRAL_FEE_BPS = (() => {
-  // Ultra referral fee is configured directly via env; no tie to old v6 fee.
+  // Ultra requires referralFee between 50 and 255 (inclusive).
+  // We treat values below 50 as "no referral"; 50–255 are allowed.
   const raw = Number(process.env.JUP_ULTRA_REFERRAL_FEE_BPS || "0");
   if (!Number.isFinite(raw)) return 0;
-  return Math.max(0, Math.min(200, raw));
+
+  if (raw < 50) {
+    // Below 50 → don't send referralFee at all
+    return 0;
+  }
+
+  return Math.min(255, raw);
 })();
+
 
 // Extra max slippage guard just for Ultra orders.
 const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
@@ -1795,7 +1803,12 @@ app.post("/api/balances", async (req, res) => {
 /*
   Design:
   - All live swaps now go through Jupiter Ultra (see /api/swap/order + /api/swap/execute).
-  - This block only defines slippage bounds that we enforce on every request.
+  - This block defines slippage bounds enforced for every request and the helpers
+    used to build Ultra orders.
+
+  NOTE:
+  - JUP_ULTRA_BASE, JUP_ULTRA_API_KEY, JUP_ULTRA_REFERRAL_ACCOUNT,
+    JUP_ULTRA_REFERRAL_FEE_BPS are defined above.
 */
 
 // Default slippage in basis points (100 = 1%)
@@ -1832,10 +1845,22 @@ function normalizeSlippageBps(input) {
 
 // === Ultra-style swap "order" + "execute" used by OperatorHub swap panel ===
 // Design:
-// - /api/swap/order: take UI amount, build Jupiter quote + swapTransaction,
-//   return a single "order" object { transaction, requestId, inAmount, outAmount, ... }.
-// - /api/swap/execute: take signedTransaction from Phantom, broadcast via Helius RPC.
+// - /api/swap/order: take UI amount, build Jupiter Ultra order, return an object
+//   containing { transaction, requestId, inAmount, outAmount, ... }.
+// - /api/swap/execute: take signedTransaction from Phantom, broadcast via Ultra.
 
+/**
+ * Build an Ultra order and return an object for the UI:
+ * {
+ *   requestId,
+ *   transaction,    // base64 swap tx (unsigned)
+ *   inAmount,       // UI input amount
+ *   outAmount,      // UI estimated output amount
+ *   inputMint,
+ *   outputMint,
+ *   slippageBps
+ * }
+ */
 async function buildUltraSwapOrderTx(opts) {
   const {
     wallet,
@@ -1850,8 +1875,8 @@ async function buildUltraSwapOrderTx(opts) {
     throw new Error("Invalid UI amount");
   }
 
-  // Look up decimals for input + output so we can convert to base units
-  // (Ultra's `amount` expects base units)
+  // Look up decimals for input + output so we can convert to base units.
+  // Ultra's `amount` expects base units.
   const inMeta = await getTokenMeta(inputMint);
   const outMeta = await getTokenMeta(outputMint);
   const inDecimals =
@@ -1874,7 +1899,7 @@ async function buildUltraSwapOrderTx(opts) {
     slippageBps: String(safeSlippage),
   });
 
-  // Ultra referral settings (from your dev portal)
+  // Ultra referral settings (from your dev portal).
   if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
     params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
     params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
@@ -1893,9 +1918,6 @@ async function buildUltraSwapOrderTx(opts) {
 
   const orderRes = await fetch(orderUrl, { headers });
   const orderText = await orderRes.text();
-
-  // Always log the raw response (first 400 chars) for debugging
-  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
 
   if (!orderRes.ok) {
     warn(
@@ -1920,57 +1942,28 @@ async function buildUltraSwapOrderTx(opts) {
     throw new Error("ultra_order_invalid_json");
   }
 
-  const hasTx =
-    typeof orderJson.transaction === "string" &&
-    orderJson.transaction.length > 0;
-  const hasReqId =
-    typeof orderJson.requestId === "string" &&
-    orderJson.requestId.length > 0;
+  // TEMP: log the successful body so we can see what Ultra is sending.
+  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
 
-  // Detect the "quote-only" aggregator response:
-  //  - no transaction / requestId
-  //  - but has routePlan / inAmount / outAmount
-  const isAggregatorQuote =
-    !hasTx &&
-    !hasReqId &&
-    (
-      Array.isArray(orderJson.routePlan) ||
-      typeof orderJson.inAmount === "string" ||
-      typeof orderJson.outAmount === "string" ||
-      typeof orderJson.otherAmountThreshold === "string"
-    );
+  // Ultra *should* return a transaction + requestId. If not, we treat it
+  // as an error for now so the UI doesn't try to execute a broken swap.
+  const rawTx =
+    orderJson.transaction ||
+    orderJson.swapTransaction ||
+    null;
 
-  let outAmountUi = 0;
+  const requestId = orderJson.requestId || null;
 
-  if (isAggregatorQuote) {
-    const outBaseRaw = Number(orderJson.outAmount || 0);
-    if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
-      outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
-    }
-
-    // Quote-only object (perfectly fine for /api/swap/quote)
-    return {
-      requestId: null,
-      transaction: null,
-      inAmount: amountFloat,
-      outAmount: outAmountUi,
-      inputMint,
-      outputMint,
-      slippageBps: safeSlippage,
-      routePlan: orderJson.routePlan || null,
-      swapMode: orderJson.swapMode || "ExactIn",
-      isUltra: false, // mark this as "no tx, quote-only"
-    };
-  }
-
-  // If it's not a quote-only response, a real Ultra order MUST have tx + requestId
-  if (!hasTx || !hasReqId) {
+  if (!rawTx || !requestId) {
     warn(
-      "[swap/order] Ultra response missing transaction or requestId (no usable quote fields)"
+      "[swap/order] Ultra response missing transaction or requestId. Body:",
+      orderText.slice(0, 400)
     );
     throw new Error("ultra_order_missing_fields");
   }
 
+  // Try to derive a nice outAmount in UI units; fall back to 0 if not present.
+  let outAmountUi = 0;
   const outBaseRaw =
     Number(orderJson.outAmount) ||
     Number(orderJson.outputAmount) ||
@@ -1980,18 +1973,37 @@ async function buildUltraSwapOrderTx(opts) {
   }
 
   return {
-    requestId: orderJson.requestId,
-    transaction: orderJson.transaction,
+    requestId,
+    transaction: rawTx,
     inAmount: amountFloat,
     outAmount: outAmountUi,
     inputMint,
     outputMint,
     slippageBps: safeSlippage,
-    isUltra: true,
   };
 }
 
-
+/**
+ * POST /api/swap/quote
+ *
+ * Body:
+ *  {
+ *    taker: "<wallet>",
+ *    inputMint: "<mint>",
+ *    outputMint: "<mint>",
+ *    amount: "<UI amount string or number>",
+ *    slippageBps?: number
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: true,
+ *    quote: { ...order },
+ *    order: { ...order },
+ *    platformFeeBps,
+ *    feeAccount
+ *  }
+ */
 app.post("/api/swap/quote", requireSession, async (req, res) => {
   try {
     const sessionWallet = req.sessionWallet;
@@ -2067,7 +2079,9 @@ app.post("/api/swap/quote", requireSession, async (req, res) => {
  *      outAmount,      // UI estimated output amount
  *      inputMint,
  *      outputMint,
- *      slippageBps
+ *      slippageBps,
+ *      platformFeeBps,
+ *      feeAccount
  *    }
  *  }
  */
@@ -2108,16 +2122,6 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       slippageBps,
     });
 
-    // 🔒 If Ultra only returned a quote (no transaction), we can't execute.
-    if (!order.transaction) {
-      return res.status(502).json({
-        error: "ultra_transaction_unavailable",
-        detail:
-          "Jupiter Ultra returned a quote but no executable transaction for this pair/size. Try a smaller size or a different route.",
-        quote: order,
-      });
-    }
-
     return res.json({
       ok: true,
       order: {
@@ -2136,25 +2140,26 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
   }
 });
 
-
-    return res.json({
-      ok: true,
-      order: {
-        ...order,
-        // Informational for the UI
-        platformFeeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
-        feeAccount: JUP_ULTRA_REFERRAL_ACCOUNT || null,
-      },
-    });
-  } catch (e) {
-    err("[swap/order] exception:", e);
-    return res.status(500).json({
-      error: "internal_error",
-      detail: String(e?.message || e),
-    });
-  }
-});
-
+/**
+ * POST /api/swap/execute
+ *
+ * Body:
+ *  {
+ *    wallet: "<wallet>",          // optional, will be checked against session
+ *    signedTransaction: "<b64>",  // from Phantom or other wallet
+ *    requestId?: "<id from order>"
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: boolean,
+ *    requestId,
+ *    result: {
+ *      signature,
+ *      raw
+ *    }
+ *  }
+ */
 app.post("/api/swap/execute", requireSession, async (req, res) => {
   try {
     const sessionWallet = req.sessionWallet;
@@ -2252,7 +2257,6 @@ app.post("/api/swap/execute", requireSession, async (req, res) => {
     return res.status(500).json({ error: "internal_error" });
   }
 });
-
 
 /* ---------- Broadcasts (HTTP) ---------- */
 const hhmm = (iso) => {
