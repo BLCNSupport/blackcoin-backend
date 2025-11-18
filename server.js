@@ -1891,31 +1891,42 @@ async function buildUltraSwapOrderTx(opts) {
     headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  const orderRes = await fetch(orderUrl, { headers });
-  const orderText = await orderRes.text();
+const orderRes = await fetch(orderUrl, { headers });
+const orderText = await orderRes.text();
 
-  if (!orderRes.ok) {
-    warn(
-      "[swap/order] Ultra order HTTP",
-      orderRes.status,
-      "body:",
-      orderText.slice(0, 400)
-    );
-    throw new Error(`ultra_order_failed:${orderRes.status}`);
-  }
+if (!orderRes.ok) {
+  warn(
+    "[swap/order] Ultra order HTTP",
+    orderRes.status,
+    "body:",
+    orderText.slice(0, 400)
+  );
+  throw new Error(`ultra_order_failed:${orderRes.status}`);
+}
 
-  let orderJson;
-  try {
-    orderJson = JSON.parse(orderText);
-  } catch (e) {
-    err("[swap/order] Ultra JSON parse error:", e);
-    throw new Error("ultra_order_invalid_json");
-  }
+let orderJson;
+try {
+  orderJson = JSON.parse(orderText);
+} catch (e) {
+  err(
+    "[swap/order] Ultra JSON parse error:",
+    e,
+    "body:",
+    orderText.slice(0, 400)
+  );
+  throw new Error("ultra_order_invalid_json");
+}
 
-  if (!orderJson?.transaction || !orderJson?.requestId) {
-    warn("[swap/order] Ultra response missing transaction or requestId");
-    throw new Error("ultra_order_missing_fields");
-  }
+// TEMP: log the successful body so we can see what Ultra is sending
+log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
+
+if (!orderJson?.transaction || !orderJson?.requestId) {
+  warn(
+    "[swap/order] Ultra response missing transaction or requestId. Body:",
+    orderText.slice(0, 400)
+  );
+  throw new Error("ultra_order_missing_fields");
+}
 
   // Try to derive a nice outAmount in UI units; fallback to 0 if not present
   let outAmountUi = 0;
