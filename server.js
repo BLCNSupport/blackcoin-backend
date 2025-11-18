@@ -683,6 +683,7 @@ if (!HELIUS_KEY)
     "HELIUS_API_KEY missing — /api/balances and /api/wallets will 400 if called."
   );
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+
 /* ---------- Jupiter v6 swap config (backend-only) ---------- */
 
 // Base URLs; override in Render if Jupiter ever changes them.
@@ -691,6 +692,44 @@ const JUP_QUOTE_API =
   process.env.JUP_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
 const JUP_SWAP_API =
   process.env.JUP_SWAP_API || "https://lite-api.jup.ag/swap/v1/swap";
+
+/* ---------- Jupiter Ultra Swap API (order/execute) ---------- */
+
+// Recommended: set JUP_ULTRA_BASE="https://api.jup.ag/ultra"
+// (or "https://lite-api.jup.ag/ultra" to match docs exactly).
+const JUP_ULTRA_BASE = (process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra")
+  .replace(/\/+$/, "");
+
+// Optional API key from the Jupiter dev portal (Ultra tab)
+const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
+
+// Referral account + fee in bps (0–200) from the Ultra dashboard
+const JUP_ULTRA_REFERRAL_ACCOUNT = (process.env.JUP_ULTRA_REFERRAL_ACCOUNT || "").trim();
+const JUP_ULTRA_REFERRAL_FEE_BPS = (() => {
+  const raw = Number(process.env.JUP_ULTRA_REFERRAL_FEE_BPS || SWAP_FEE_BPS || "0");
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(200, raw));
+})();
+
+// Extra max slippage guard just for Ultra orders.
+// If not set, fall back to your existing MAX_SLIPPAGE_BPS.
+const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
+  const raw = Number(
+    process.env.JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS || MAX_SLIPPAGE_BPS || "200"
+  );
+  if (!Number.isFinite(raw)) return MAX_SLIPPAGE_BPS;
+  return Math.max(1, Math.min(1000, raw));
+})();
+
+
+function buildUltraHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  // Ultra docs use an API key header; this keeps it optional.
+  if (JUP_ULTRA_API_KEY) {
+    headers["x-jupiter-api-key"] = JUP_ULTRA_API_KEY;
+  }
+  return headers;
+}
 
 
 // Platform fee (basis points: 100 = 1%)
@@ -1798,9 +1837,14 @@ app.post("/api/balances", async (req, res) => {
  */
 function normalizeSlippageBps(input) {
   const raw = Number(input);
-  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_SLIPPAGE_BPS;
-  return Math.max(1, Math.min(MAX_SLIPPAGE_BPS, raw));
+  const base = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SLIPPAGE_BPS;
+
+  // Hard cap = min(global max, Ultra-specific max)
+  const hardCap = Math.min(MAX_SLIPPAGE_BPS, JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS);
+
+  return Math.max(1, Math.min(hardCap, base));
 }
+
 
 /**
  * POST /api/swap/quote
@@ -2091,7 +2135,8 @@ async function buildUltraSwapOrderTx(opts) {
     throw new Error("Invalid UI amount");
   }
 
-  // Look up decimals for input + output so we can convert base units and show outAmount nicely
+  // Look up decimals for input + output so we can convert to base units
+  // (Ultra's `amount` expects base units)
   const inMeta = await getTokenMeta(inputMint);
   const outMeta = await getTokenMeta(outputMint);
   const inDecimals =
@@ -2105,131 +2150,71 @@ async function buildUltraSwapOrderTx(opts) {
   }
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
+
   const params = new URLSearchParams({
     inputMint: String(inputMint).trim(),
     outputMint: String(outputMint).trim(),
     amount: String(baseIn),
+    taker: wallet,
     slippageBps: String(safeSlippage),
-    swapMode: "ExactIn",
-    onlyDirectRoutes: "false",
-    asLegacyTransaction: "true",
   });
 
-  if (SWAP_FEE_BPS > 0) {
-    params.set("platformFeeBps", String(SWAP_FEE_BPS));
+  // Ultra referral settings (from your dev portal)
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
+    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
   }
 
-  const quoteUrl = `${JUP_QUOTE_API}?${params.toString()}`;
-  log("[swap/order] quote →", quoteUrl);
+  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+  log("[swap/order] Ultra get-order →", orderUrl);
 
-  const quoteRes = await fetch(quoteUrl, {
-    headers: {
-      accept: "application/json",
-      "Cache-Control": "no-cache",
-    },
-  });
-
-  const quoteText = await quoteRes.text();
-  if (!quoteRes.ok) {
-    warn(
-      "[swap/order] Jupiter quote HTTP",
-      quoteRes.status,
-      "body:",
-      quoteText.slice(0, 400)
-    );
-    throw new Error(`jupiter_quote_failed:${quoteRes.status}`);
-  }
-
-  let quote;
-  try {
-    quote = JSON.parse(quoteText);
-  } catch (e) {
-    err("[swap/order] quote JSON parse error:", e);
-    throw new Error("jupiter_quote_invalid_json");
-  }
-
-  // Best-effort outAmount extraction
-  let outAmountBase = 0;
-  if (quote && typeof quote === "object") {
-    if (quote.outAmount != null) {
-      outAmountBase = Number(quote.outAmount);
-    } else if (
-      Array.isArray(quote.routePlan) &&
-      quote.routePlan[0]?.swapInfo?.outAmount != null
-    ) {
-      outAmountBase = Number(quote.routePlan[0].swapInfo.outAmount);
-    }
-  }
-  if (!Number.isFinite(outAmountBase) || outAmountBase < 0) {
-    outAmountBase = 0;
-  }
-  const outAmountUi =
-    outAmountBase > 0
-      ? outAmountBase / Math.pow(10, outDecimals)
-      : 0;
-
-  // Build swap transaction from quote
-  const swapBody = {
-    quoteResponse: quote,
-    userPublicKey: wallet,
-    wrapAndUnwrapSol: true,
-    dynamicComputeUnitLimit: true,
-    dynamicSlippage: false,
+  const headers = {
+    accept: "application/json",
+    "Cache-Control": "no-cache",
   };
-
-  if (SWAP_FEE_BPS > 0) {
-    swapBody.platformFeeBps = SWAP_FEE_BPS;
-    if (SWAP_FEE_ACCOUNT) {
-      swapBody.feeAccount = SWAP_FEE_ACCOUNT;
-    }
+  if (JUP_ULTRA_API_KEY) {
+    headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  log(
-    "[swap/order] building swap tx for wallet=",
-    wallet,
-    "feeBps=",
-    SWAP_FEE_BPS
-  );
+  const orderRes = await fetch(orderUrl, { headers });
+  const orderText = await orderRes.text();
 
-  const swapRes = await fetch(JUP_SWAP_API, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(swapBody),
-  });
-
-  const swapText = await swapRes.text();
-  if (!swapRes.ok) {
+  if (!orderRes.ok) {
     warn(
-      "[swap/order] Jupiter swap HTTP",
-      swapRes.status,
+      "[swap/order] Ultra order HTTP",
+      orderRes.status,
       "body:",
-      swapText.slice(0, 400)
+      orderText.slice(0, 400)
     );
-    throw new Error(`jupiter_swap_failed:${swapRes.status}`);
+    throw new Error(`ultra_order_failed:${orderRes.status}`);
   }
 
-  let swapJson;
+  let orderJson;
   try {
-    swapJson = JSON.parse(swapText);
+    orderJson = JSON.parse(orderText);
   } catch (e) {
-    err("[swap/order] swap JSON parse error:", e);
-    throw new Error("jupiter_swap_invalid_json");
+    err("[swap/order] Ultra JSON parse error:", e);
+    throw new Error("ultra_order_invalid_json");
   }
 
-  if (!swapJson?.swapTransaction) {
-    warn("[swap/order] missing swapTransaction in Jupiter response");
-    throw new Error("jupiter_swap_missing_transaction");
+  if (!orderJson?.transaction || !orderJson?.requestId) {
+    warn("[swap/order] Ultra response missing transaction or requestId");
+    throw new Error("ultra_order_missing_fields");
   }
 
-  // Generate a simple requestId so frontend can log/track
-  const requestId =
-    typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : crypto.randomBytes(16).toString("hex");
+  // Try to derive a nice outAmount in UI units; fallback to 0 if not present
+  let outAmountUi = 0;
+  const outBaseRaw =
+    Number(orderJson.outAmount) ||
+    Number(orderJson.outputAmount) ||
+    0;
+  if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
+    outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+  }
 
   return {
-    requestId,
-    transaction: swapJson.swapTransaction,
+    requestId: orderJson.requestId,
+    transaction: orderJson.transaction,
     inAmount: amountFloat,
     outAmount: outAmountUi,
     inputMint,
@@ -2292,12 +2277,6 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       });
     }
 
-    if (!HELIUS_KEY) {
-      return res.status(400).json({
-        error: "HELIUS_API_KEY not configured on backend",
-      });
-    }
-
     const order = await buildUltraSwapOrderTx({
       wallet,
       inputMint,
@@ -2310,13 +2289,13 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       ok: true,
       order: {
         ...order,
-        platformFeeBps: SWAP_FEE_BPS,
-        feeAccount: SWAP_FEE_ACCOUNT || null,
+        // Informational for the UI
+        platformFeeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
+        feeAccount: JUP_ULTRA_REFERRAL_ACCOUNT || null,
       },
     });
   } catch (e) {
     err("[swap/order] exception:", e);
-    // If we threw a stringy message above, surface a small hint
     return res.status(500).json({
       error: "internal_error",
       detail: String(e?.message || e),
@@ -2342,14 +2321,21 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
  *    }
  *  }
  */
+/**
+ * POST /api/swap/execute
+ * Body:
+ *  {
+ *    wallet?: "<wallet>",
+ *    signedTransaction: "<base64>",
+ *    requestId?: "<id from /api/swap/order>"
+ *  }
+ *
+ * We forward this to Jupiter Ultra's /execute endpoint.
+ */
 app.post("/api/swap/execute", requireSession, async (req, res) => {
   try {
     const sessionWallet = req.sessionWallet;
-    const {
-      wallet,
-      signedTransaction,
-      requestId,
-    } = req.body || {};
+    const { wallet, signedTransaction, requestId } = req.body || {};
 
     const effectiveWallet = String(wallet || sessionWallet || "").trim();
     if (
@@ -2362,48 +2348,80 @@ app.post("/api/swap/execute", requireSession, async (req, res) => {
         .json({ error: "wallet_session_mismatch" });
     }
 
-    if (
-      !signedTransaction ||
-      typeof signedTransaction !== "string"
-    ) {
+    if (!signedTransaction || typeof signedTransaction !== "string") {
       return res
         .status(400)
         .json({ error: "signedTransaction_required" });
     }
 
-    if (!HELIUS_KEY) {
-      return res.status(400).json({
-        error: "HELIUS_API_KEY not configured on backend",
-      });
-    }
+    const body = {
+      signedTransaction,
+      requestId: requestId || undefined,
+    };
 
+    const executeUrl = `${JUP_ULTRA_BASE}/v1/execute`;
     log(
-      "[swap/execute] sending raw tx for wallet=",
+      "[swap/execute] Ultra execute →",
+      executeUrl,
+      "wallet=",
       effectiveWallet,
       "requestId=",
       requestId || "n/a"
     );
 
-    let signature;
-    try {
-      // Helius RPC → sendRawTransaction(base64Tx, { skipPreflight: false, maxRetries: 3 })
-      signature = await rpc("sendRawTransaction", [
-        signedTransaction,
-        { skipPreflight: false, maxRetries: 3 },
-      ]);
-    } catch (sendErr) {
-      err("[swap/execute] sendRawTransaction error:", sendErr);
+    const headers = {
+      "Content-Type": "application/json",
+      accept: "application/json",
+    };
+    if (JUP_ULTRA_API_KEY) {
+      headers["x-api-key"] = JUP_ULTRA_API_KEY;
+    }
+
+    const r = await fetch(executeUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const text = await r.text();
+    if (!r.ok) {
+      warn(
+        "[swap/execute] Ultra HTTP",
+        r.status,
+        "body:",
+        text.slice(0, 400)
+      );
       return res.status(502).json({
-        error: "send_raw_failed",
-        detail: String(sendErr?.message || sendErr),
+        error: "ultra_execute_failed",
+        status: r.status,
+        body: text.slice(0, 400),
       });
     }
 
+    let executeJson;
+    try {
+      executeJson = JSON.parse(text);
+    } catch (e) {
+      err("[swap/execute] Ultra JSON parse error:", e);
+      return res
+        .status(502)
+        .json({ error: "ultra_execute_invalid_json" });
+    }
+
+    const status = executeJson.status || executeJson.state || "Unknown";
+    const signature =
+      typeof executeJson.signature === "string"
+        ? executeJson.signature
+        : typeof executeJson.txid === "string"
+        ? executeJson.txid
+        : null;
+
     return res.json({
-      ok: true,
-      requestId: requestId || null,
+      ok: status === "Success",
+      requestId: executeJson.requestId || requestId || null,
       result: {
-        signature: typeof signature === "string" ? signature : null,
+        signature,
+        raw: executeJson,
       },
     });
   } catch (e) {
