@@ -1938,6 +1938,60 @@ async function buildUltraSwapOrderTx(opts) {
   };
 }
 
+app.post("/api/swap/quote", requireSession, async (req, res) => {
+  try {
+    const sessionWallet = req.sessionWallet;
+    const {
+      taker,
+      inputMint,
+      outputMint,
+      amount,
+      slippageBps,
+    } = req.body || {};
+
+    const wallet = String(taker || sessionWallet || "").trim();
+
+    if (
+      !sessionWallet ||
+      !wallet ||
+      wallet.toLowerCase() !== sessionWallet.toLowerCase()
+    ) {
+      return res
+        .status(403)
+        .json({ error: "wallet_session_mismatch" });
+    }
+
+    if (!inputMint || !outputMint || amount == null) {
+      return res.status(400).json({
+        error: "inputMint, outputMint and amount are required",
+      });
+    }
+
+    const order = await buildUltraSwapOrderTx({
+      wallet,
+      inputMint,
+      outputMint,
+      uiAmount: amount,
+      slippageBps,
+    });
+
+    // Frontend can read either `res.quote` or `res.order`
+    return res.json({
+      ok: true,
+      quote: order,
+      order,
+      platformFeeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
+      feeAccount: JUP_ULTRA_REFERRAL_ACCOUNT || null,
+    });
+  } catch (e) {
+    err("[swap/quote] exception:", e);
+    return res.status(500).json({
+      error: "internal_error",
+      detail: String(e?.message || e),
+    });
+  }
+});
+
 /**
  * POST /api/swap/order
  * Body:
