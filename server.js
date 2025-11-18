@@ -716,6 +716,14 @@ const JUP_ULTRA_REFERRAL_FEE_BPS = (() => {
   return Math.min(255, raw);
 })();
 
+// Log Ultra config once at boot so we can confirm env wiring in logs
+log(
+  "[swap/config] Ultra base=%s hasApiKey=%s referralAccount=%s feeBps=%s",
+  JUP_ULTRA_BASE,
+  JUP_ULTRA_API_KEY ? "yes" : "no",
+  JUP_ULTRA_REFERRAL_ACCOUNT || "none",
+  JUP_ULTRA_REFERRAL_FEE_BPS
+);
 
 // Extra max slippage guard just for Ultra orders.
 const JUP_ULTRA_REFERRAL_MAX_SLIPPAGE_BPS = (() => {
