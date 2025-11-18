@@ -1892,134 +1892,94 @@ async function buildUltraSwapOrderTx(opts) {
     wallet,
     inputMint,
     outputMint,
-    amount,       // already in base units (string or number)
+    amount,           // already in base units (string)
     slippageBps,
   } = opts;
 
   const baseInStr = String(amount ?? "").trim();
-
-  // Expect a positive integer string in base units (lamports / smallest units)
   if (!baseInStr || !/^[0-9]+$/.test(baseInStr) || /^0+$/.test(baseInStr)) {
-    throw new Error("Invalid amount (must be positive base units)");
+    throw new Error("Invalid amount");
   }
-
-  // We still need output decimals so we can show a nice UI outAmount later
-  const outMeta = await getTokenMeta(outputMint);
-  const outDecimals =
-    typeof outMeta.decimals === "number" && outMeta.decimals >= 0
-      ? outMeta.decimals
-      : 6;
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
-  // 🔹 Build Ultra GET /v1/order params (this is what your curl did)
-  const params = new URLSearchParams({
-    inputMint: String(inputMint).trim(),
-    outputMint: String(outputMint).trim(),
-    amount: baseInStr,                // base units (lamports / smallest units)
-    taker: wallet,
-    slippageBps: String(safeSlippage),
-    swapMode: "ExactIn",              // ✅ match working curl
-  });
+  const outMeta = await getTokenMeta(outputMint);
+  const outDecimals = typeof outMeta.decimals === "number" ? outMeta.decimals : 6;
 
-  // Ultra referral settings (your platform fee)
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
-    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
-    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
+  // ULTRA V2 ENDPOINT (this is the real fix)
+  const url = `${JUP_ULTRA_BASE}/v2/order`;
+
+  const body = {
+    inputMint: String(inputMint),
+    outputMint: String(outputMint),
+    amount: baseInStr,
+    taker: wallet,
+    slippageBps: safeSlippage,
+    swapMode: "ExactIn",
+  };
+
+  // Referral (your platform fee) — only include if you have both
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS >= 50) {
+    body.referralAccount = JUP_ULTRA_REFERRAL_ACCOUNT;
+    body.referralFeeBps = JUP_ULTRA_REFERRAL_FEE_BPS;  // note: Bps, not just fee
   }
 
-  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
-  log("[swap/order] Ultra order →", orderUrl);
+  log("[swap/order] Ultra v2 order → POST", url);
+  log("[swap/order] Body:", JSON.stringify(body).slice(0, 500));
 
   const headers = {
+    "Content-Type": "application/json",
     accept: "application/json",
-    "Cache-Control": "no-cache",
   };
   if (JUP_ULTRA_API_KEY) {
     headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  const orderRes = await fetch(orderUrl, { headers });
-  const orderText = await orderRes.text();
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
 
-  if (!orderRes.ok) {
-    warn(
-      "[swap/order] Ultra order HTTP",
-      orderRes.status,
-      "body:",
-      orderText.slice(0, 400)
-    );
-    throw new Error(`ultra_order_failed:${orderRes.status}`);
+  const text = await res.text();
+  if (!res.ok) {
+    warn("[swap/order] Ultra v2 failed:", res.status, text.slice(0, 500));
+    throw new Error(`ultra_order_failed:${res.status}`);
   }
 
-  let orderJson;
+  let json;
   try {
-    orderJson = JSON.parse(orderText);
+    json = JSON.parse(text);
   } catch (e) {
-    err(
-      "[swap/order] Ultra JSON parse error:",
-      e,
-      "body:",
-      orderText.slice(0, 400)
-    );
+    err("[swap/order] JSON parse error:", text.slice(0, 500));
     throw new Error("ultra_order_invalid_json");
   }
 
-  // log a snippet + keys for debugging
-  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
-  try {
-    const keys = Object.keys(orderJson || {});
-    log("[swap/order] Ultra response keys:", keys.join(", "));
-  } catch (_) {}
+  const txBase64 = json.swapTransaction || json.transaction;
+  const requestId = json.requestId || json.id;
 
-  const txField =
-    orderJson.transaction ||
-    orderJson.swapTransaction ||
-    orderJson.legacyTransaction ||
-    null;
-
-  const reqId =
-    orderJson.requestId ||
-    orderJson.id ||
-    orderJson.orderId ||
-    null;
-
-  if (!txField) {
-    warn(
-      "[swap/order] Ultra response missing transaction. Body:",
-      orderText.slice(0, 400)
-    );
-    throw new Error("ultra_order_missing_fields");
+  if (!txBase64) {
+    warn("[swap/order] No swapTransaction in response:", text.slice(0, 500));
+    throw new Error("ultra_missing_transaction");
   }
 
-  // Derive an estimated outAmount in UI units for the frontend
+  // Try to extract outAmount for UI
   let outAmountUi = 0;
   try {
-    const outBaseRaw =
-      Number(orderJson.outAmount) ||
-      Number(orderJson.outputAmount) ||
-      (Array.isArray(orderJson.routePlan) &&
-        Number(orderJson.routePlan[0]?.swapInfo?.outAmount)) ||
-      0;
-
-    if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
-      outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
-    }
-  } catch (e) {
-    warn("[swap/order] failed to derive outAmount from Ultra response:", e);
-  }
+    const outRaw = Number(json.outAmount || json.outputAmount || 0);
+    if (outRaw > 0) outAmountUi = outRaw / Math.pow(10, outDecimals);
+  } catch {}
 
   return {
-    requestId: reqId,
-    transaction: txField,    // base64 unsigned transaction for the wallet to sign
-    inAmount: baseInStr,     // base units you sent in
-    outAmount: outAmountUi,  // best-effort UI estimate
+    requestId,
+    transaction: txBase64,
+    inAmount: baseInStr,
+    outAmount: outAmountUi,
     inputMint,
     outputMint,
     slippageBps: safeSlippage,
   };
 }
-
 
 /**
  * POST /api/swap/quote
@@ -2226,7 +2186,7 @@ app.post("/api/swap/execute", requireSession, async (req, res) => {
       requestId: requestId || undefined,
     };
 
-    const executeUrl = `${JUP_ULTRA_BASE}/v1/execute`;
+    const executeUrl = `${JUP_ULTRA_BASE}/v2/execute`;
     log(
       "[swap/execute] Ultra execute →",
       executeUrl,
