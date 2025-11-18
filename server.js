@@ -1884,133 +1884,57 @@ async function buildUltraSwapOrderTx(opts) {
     wallet,
     inputMint,
     outputMint,
-    uiAmount,
+    amount,       // already in base units (string or number)
     slippageBps,
   } = opts;
 
-  const amountFloat = Number(uiAmount);
-  if (!Number.isFinite(amountFloat) || amountFloat <= 0) {
-    throw new Error("Invalid UI amount");
+  const baseInStr = String(amount ?? "").trim();
+
+  // Expect a positive integer string in base units (lamports / smallest units)
+  if (!baseInStr || !/^[0-9]+$/.test(baseInStr) || /^0+$/.test(baseInStr)) {
+    throw new Error("Invalid amount (must be positive base units)");
   }
 
-  // 1) Resolve decimals so we can go from UI → base units.
-  const inMeta = await getTokenMeta(inputMint);
+  // We still need output decimals so we can show a nice UI outAmount later
   const outMeta = await getTokenMeta(outputMint);
-  const inDecimals =
-    typeof inMeta.decimals === "number" ? inMeta.decimals : 6;
   const outDecimals =
-    typeof outMeta.decimals === "number" ? outMeta.decimals : 6;
-
-  const baseIn = Math.floor(amountFloat * Math.pow(10, inDecimals));
-  if (!Number.isFinite(baseIn) || baseIn <= 0) {
-    throw new Error("Invalid amount after applying decimals");
-  }
+    typeof outMeta.decimals === "number" && outMeta.decimals >= 0
+      ? outMeta.decimals
+      : 6;
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
-  // ---------------------------------------------------------
-  // STEP 1 — Ultra "quote": ask Ultra to build the route/plan
-  // ---------------------------------------------------------
   const params = new URLSearchParams({
     inputMint: String(inputMint).trim(),
     outputMint: String(outputMint).trim(),
-    amount: String(baseIn),
+    amount: baseInStr,              // <-- send base units directly to Ultra
+    taker: wallet,
     slippageBps: String(safeSlippage),
-    swapMode: "ExactIn",
   });
 
-  // taker is optional for quote, but nice to include
-  if (wallet) params.set("taker", wallet);
+  // Ultra referral settings (your platform fee)
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
+    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
+  }
 
-  const quoteUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
-  log("[swap/order] Ultra quote →", quoteUrl);
+  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+  log("[swap/order] Ultra order →", orderUrl);
 
-  const commonHeaders = {
+  const headers = {
     accept: "application/json",
     "Cache-Control": "no-cache",
   };
   if (JUP_ULTRA_API_KEY) {
-    commonHeaders["x-api-key"] = JUP_ULTRA_API_KEY;
+    headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  const quoteRes = await fetch(quoteUrl, { headers: commonHeaders });
-  const quoteText = await quoteRes.text();
-
-  if (!quoteRes.ok) {
-    warn(
-      "[swap/order] Ultra quote HTTP",
-      quoteRes.status,
-      "body:",
-      quoteText.slice(0, 400)
-    );
-    throw new Error(`ultra_quote_failed:${quoteRes.status}`);
-  }
-
-  let quoteJson;
-  try {
-    quoteJson = JSON.parse(quoteText);
-  } catch (e) {
-    err(
-      "[swap/order] Ultra quote JSON parse error:",
-      e,
-      "body:",
-      quoteText.slice(0, 400)
-    );
-    throw new Error("ultra_quote_invalid_json");
-  }
-
-  // Log a small snippet for debugging
-  try {
-    const keys = Object.keys(quoteJson || {});
-    log("[swap/order] Ultra quote keys:", keys.join(", "));
-  } catch (_) {}
-
-  // Derive estimated output in UI units from the quote
-  let outAmountUi = 0;
-  const outBaseRaw =
-    Number(quoteJson.outAmount) ||
-    Number(quoteJson.outputAmount) ||
-    Number(quoteJson.otherAmount) ||
-    0;
-  if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
-    outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
-  }
-
-  // ---------------------------------------------------------
-  // STEP 2 — Ultra "get order": build swap transaction to sign
-  // ---------------------------------------------------------
-  const orderBody = {
-    taker: wallet,
-    slippageBps: safeSlippage,
-    // Ultra expects the original quote/route as quoteResponse
-    quoteResponse: quoteJson,
-  };
-
-  // Integrator / referral config (if you set these in env)
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
-    orderBody.integrator = {
-      account: JUP_ULTRA_REFERRAL_ACCOUNT,
-      feeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
-    };
-  }
-
-  const orderUrl = `${JUP_ULTRA_BASE}/v1/order`;
-  log("[swap/order] Ultra build-order (POST) →", orderUrl);
-
-  const orderRes = await fetch(orderUrl, {
-    method: "POST",
-    headers: {
-      ...commonHeaders,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(orderBody),
-  });
-
+  const orderRes = await fetch(orderUrl, { headers });
   const orderText = await orderRes.text();
 
   if (!orderRes.ok) {
     warn(
-      "[swap/order] Ultra build-order HTTP",
+      "[swap/order] Ultra order HTTP",
       orderRes.status,
       "body:",
       orderText.slice(0, 400)
@@ -2023,13 +1947,20 @@ async function buildUltraSwapOrderTx(opts) {
     orderJson = JSON.parse(orderText);
   } catch (e) {
     err(
-      "[swap/order] Ultra build-order JSON parse error:",
+      "[swap/order] Ultra JSON parse error:",
       e,
       "body:",
       orderText.slice(0, 400)
     );
     throw new Error("ultra_order_invalid_json");
   }
+
+  // log a snippet + keys for debugging
+  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
+  try {
+    const keys = Object.keys(orderJson || {});
+    log("[swap/order] Ultra response keys:", keys.join(", "));
+  } catch (_) {}
 
   const txField =
     orderJson.transaction ||
@@ -2045,19 +1976,36 @@ async function buildUltraSwapOrderTx(opts) {
 
   if (!txField) {
     warn(
-      "[swap/order] Ultra build-order response missing transaction. Body:",
+      "[swap/order] Ultra response missing transaction. Body:",
       orderText.slice(0, 400)
     );
-    throw new Error("ultra_order_missing_transaction");
+    throw new Error("ultra_order_missing_fields");
+  }
+
+  // Derive an estimated outAmount in UI units for the frontend
+  let outAmountUi = 0;
+  try {
+    const outBaseRaw =
+      Number(orderJson.outAmount) ||
+      Number(orderJson.outputAmount) ||
+      (Array.isArray(orderJson.routePlan) &&
+        Number(orderJson.routePlan[0]?.swapInfo?.outAmount)) ||
+      0;
+
+    if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
+      outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+    }
+  } catch (e) {
+    warn("[swap/order] failed to derive outAmount from Ultra response:", e);
   }
 
   return {
-    requestId: reqId || null,
-    transaction: txField,
+    requestId: reqId,
+    transaction: txField,    // base64 unsigned transaction for the wallet to sign
+    inAmount: baseInStr,     // base units you sent in
+    outAmount: outAmountUi,  // best-effort UI estimate
     inputMint,
     outputMint,
-    inAmount: amountFloat,
-    outAmount: outAmountUi,
     slippageBps: safeSlippage,
   };
 }
@@ -2113,13 +2061,14 @@ app.post("/api/swap/quote", requireSession, async (req, res) => {
       });
     }
 
-    const order = await buildUltraSwapOrderTx({
-      wallet,
-      inputMint,
-      outputMint,
-      uiAmount: amount,
-      slippageBps,
-    });
+const order = await buildUltraSwapOrderTx({
+  wallet,
+  inputMint,
+  outputMint,
+  amount,        // already base units from the frontend
+  slippageBps,
+});
+
 
     // Frontend can read either `res.quote` or `res.order`
     return res.json({
@@ -2194,13 +2143,13 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       });
     }
 
-    const order = await buildUltraSwapOrderTx({
-      wallet,
-      inputMint,
-      outputMint,
-      uiAmount: amount,
-      slippageBps,
-    });
+const order = await buildUltraSwapOrderTx({
+  wallet,
+  inputMint,
+  outputMint,
+  amount,        // already base units from the frontend
+  slippageBps,
+});
 
     return res.json({
       ok: true,
