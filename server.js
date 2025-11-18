@@ -689,10 +689,10 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 /* ---------- Jupiter Ultra Swap API (order/execute) ---------- */
 
-// Recommended: set JUP_ULTRA_BASE="https://lite-api.jup.ag/ultra"
-// (this matches the official Ultra docs and Get Order examples).
+// Recommended: set JUP_ULTRA_BASE="https://api.jup.ag/ultra"
+// (Ultra dynamic tier base URL from the Jupiter docs).
 const JUP_ULTRA_BASE = (
-  process.env.JUP_ULTRA_BASE || "https://lite-api.jup.ag/ultra"
+  process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra"
 ).replace(/\/+$/, "");
 
 
