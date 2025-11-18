@@ -1891,45 +1891,86 @@ async function buildUltraSwapOrderTx(opts) {
     headers["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-const orderRes = await fetch(orderUrl, { headers });
-const orderText = await orderRes.text();
+  const orderRes = await fetch(orderUrl, { headers });
+  const orderText = await orderRes.text();
 
-if (!orderRes.ok) {
-  warn(
-    "[swap/order] Ultra order HTTP",
-    orderRes.status,
-    "body:",
-    orderText.slice(0, 400)
-  );
-  throw new Error(`ultra_order_failed:${orderRes.status}`);
-}
+  // Always log the raw response (first 400 chars) for debugging
+  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
 
-let orderJson;
-try {
-  orderJson = JSON.parse(orderText);
-} catch (e) {
-  err(
-    "[swap/order] Ultra JSON parse error:",
-    e,
-    "body:",
-    orderText.slice(0, 400)
-  );
-  throw new Error("ultra_order_invalid_json");
-}
+  if (!orderRes.ok) {
+    warn(
+      "[swap/order] Ultra order HTTP",
+      orderRes.status,
+      "body:",
+      orderText.slice(0, 400)
+    );
+    throw new Error(`ultra_order_failed:${orderRes.status}`);
+  }
 
-// TEMP: log the successful body so we can see what Ultra is sending
-log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
+  let orderJson;
+  try {
+    orderJson = JSON.parse(orderText);
+  } catch (e) {
+    err(
+      "[swap/order] Ultra JSON parse error:",
+      e,
+      "body:",
+      orderText.slice(0, 400)
+    );
+    throw new Error("ultra_order_invalid_json");
+  }
 
-if (!orderJson?.transaction || !orderJson?.requestId) {
-  warn(
-    "[swap/order] Ultra response missing transaction or requestId. Body:",
-    orderText.slice(0, 400)
-  );
-  throw new Error("ultra_order_missing_fields");
-}
+  const hasTx =
+    typeof orderJson.transaction === "string" &&
+    orderJson.transaction.length > 0;
+  const hasReqId =
+    typeof orderJson.requestId === "string" &&
+    orderJson.requestId.length > 0;
 
-  // Try to derive a nice outAmount in UI units; fallback to 0 if not present
+  // Detect the "quote-only" aggregator response:
+  //  - no transaction / requestId
+  //  - but has routePlan / inAmount / outAmount
+  const isAggregatorQuote =
+    !hasTx &&
+    !hasReqId &&
+    (
+      Array.isArray(orderJson.routePlan) ||
+      typeof orderJson.inAmount === "string" ||
+      typeof orderJson.outAmount === "string" ||
+      typeof orderJson.otherAmountThreshold === "string"
+    );
+
   let outAmountUi = 0;
+
+  if (isAggregatorQuote) {
+    const outBaseRaw = Number(orderJson.outAmount || 0);
+    if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
+      outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+    }
+
+    // Quote-only object (perfectly fine for /api/swap/quote)
+    return {
+      requestId: null,
+      transaction: null,
+      inAmount: amountFloat,
+      outAmount: outAmountUi,
+      inputMint,
+      outputMint,
+      slippageBps: safeSlippage,
+      routePlan: orderJson.routePlan || null,
+      swapMode: orderJson.swapMode || "ExactIn",
+      isUltra: false, // mark this as "no tx, quote-only"
+    };
+  }
+
+  // If it's not a quote-only response, a real Ultra order MUST have tx + requestId
+  if (!hasTx || !hasReqId) {
+    warn(
+      "[swap/order] Ultra response missing transaction or requestId (no usable quote fields)"
+    );
+    throw new Error("ultra_order_missing_fields");
+  }
+
   const outBaseRaw =
     Number(orderJson.outAmount) ||
     Number(orderJson.outputAmount) ||
@@ -1946,8 +1987,10 @@ if (!orderJson?.transaction || !orderJson?.requestId) {
     inputMint,
     outputMint,
     slippageBps: safeSlippage,
+    isUltra: true,
   };
 }
+
 
 app.post("/api/swap/quote", requireSession, async (req, res) => {
   try {
@@ -2064,6 +2107,35 @@ app.post("/api/swap/order", requireSession, async (req, res) => {
       uiAmount: amount,
       slippageBps,
     });
+
+    // 🔒 If Ultra only returned a quote (no transaction), we can't execute.
+    if (!order.transaction) {
+      return res.status(502).json({
+        error: "ultra_transaction_unavailable",
+        detail:
+          "Jupiter Ultra returned a quote but no executable transaction for this pair/size. Try a smaller size or a different route.",
+        quote: order,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      order: {
+        ...order,
+        // Informational for the UI
+        platformFeeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
+        feeAccount: JUP_ULTRA_REFERRAL_ACCOUNT || null,
+      },
+    });
+  } catch (e) {
+    err("[swap/order] exception:", e);
+    return res.status(500).json({
+      error: "internal_error",
+      detail: String(e?.message || e),
+    });
+  }
+});
+
 
     return res.json({
       ok: true,
