@@ -689,10 +689,12 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 /* ---------- Jupiter Ultra Swap API (order/execute) ---------- */
 
-// Recommended: set JUP_ULTRA_BASE="https://api.jup.ag/ultra"
-// (or "https://lite-api.jup.ag/ultra" to match docs exactly).
-const JUP_ULTRA_BASE = (process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra")
-  .replace(/\/+$/, "");
+// Recommended: set JUP_ULTRA_BASE="https://lite-api.jup.ag/ultra"
+// (this matches the official Ultra docs and Get Order examples).
+const JUP_ULTRA_BASE = (
+  process.env.JUP_ULTRA_BASE || "https://lite-api.jup.ag/ultra"
+).replace(/\/+$/, "");
+
 
 // Optional API key from the Jupiter dev portal (Ultra tab)
 const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
@@ -1861,6 +1863,22 @@ function normalizeSlippageBps(input) {
  *   slippageBps
  * }
  */
+/**
+ * Build an Ultra order and return an object for the UI:
+ * {
+ *   requestId,
+ *   transaction,    // base64 swap tx (unsigned)
+ *   inAmount,       // UI input amount
+ *   outAmount,      // UI estimated output amount
+ *   inputMint,
+ *   outputMint,
+ *   slippageBps
+ * }
+ *
+ * This now uses a 2-step Ultra flow:
+ *  1) GET /v1/order → quote/route
+ *  2) POST /v1/order → build swap transaction
+ */
 async function buildUltraSwapOrderTx(opts) {
   const {
     wallet,
@@ -1875,8 +1893,7 @@ async function buildUltraSwapOrderTx(opts) {
     throw new Error("Invalid UI amount");
   }
 
-  // Look up decimals for input + output so we can convert to base units.
-  // Ultra's `amount` expects base units.
+  // 1) Resolve decimals so we can go from UI → base units.
   const inMeta = await getTokenMeta(inputMint);
   const outMeta = await getTokenMeta(outputMint);
   const inDecimals =
@@ -1891,37 +1908,109 @@ async function buildUltraSwapOrderTx(opts) {
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
+  // ---------------------------------------------------------
+  // STEP 1 — Ultra "quote": ask Ultra to build the route/plan
+  // ---------------------------------------------------------
   const params = new URLSearchParams({
     inputMint: String(inputMint).trim(),
     outputMint: String(outputMint).trim(),
     amount: String(baseIn),
-    taker: wallet,
     slippageBps: String(safeSlippage),
+    swapMode: "ExactIn",
   });
 
-  // Ultra referral settings (from your dev portal).
-  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
-    params.set("referralAccount", JUP_ULTRA_REFERRAL_ACCOUNT);
-    params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
-  }
+  // taker is optional for quote, but nice to include
+  if (wallet) params.set("taker", wallet);
 
-  const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
-  log("[swap/order] Ultra get-order →", orderUrl);
+  const quoteUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+  log("[swap/order] Ultra quote →", quoteUrl);
 
-  const headers = {
+  const commonHeaders = {
     accept: "application/json",
     "Cache-Control": "no-cache",
   };
   if (JUP_ULTRA_API_KEY) {
-    headers["x-api-key"] = JUP_ULTRA_API_KEY;
+    commonHeaders["x-api-key"] = JUP_ULTRA_API_KEY;
   }
 
-  const orderRes = await fetch(orderUrl, { headers });
+  const quoteRes = await fetch(quoteUrl, { headers: commonHeaders });
+  const quoteText = await quoteRes.text();
+
+  if (!quoteRes.ok) {
+    warn(
+      "[swap/order] Ultra quote HTTP",
+      quoteRes.status,
+      "body:",
+      quoteText.slice(0, 400)
+    );
+    throw new Error(`ultra_quote_failed:${quoteRes.status}`);
+  }
+
+  let quoteJson;
+  try {
+    quoteJson = JSON.parse(quoteText);
+  } catch (e) {
+    err(
+      "[swap/order] Ultra quote JSON parse error:",
+      e,
+      "body:",
+      quoteText.slice(0, 400)
+    );
+    throw new Error("ultra_quote_invalid_json");
+  }
+
+  // Log a small snippet for debugging
+  try {
+    const keys = Object.keys(quoteJson || {});
+    log("[swap/order] Ultra quote keys:", keys.join(", "));
+  } catch (_) {}
+
+  // Derive estimated output in UI units from the quote
+  let outAmountUi = 0;
+  const outBaseRaw =
+    Number(quoteJson.outAmount) ||
+    Number(quoteJson.outputAmount) ||
+    Number(quoteJson.otherAmount) ||
+    0;
+  if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
+    outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+  }
+
+  // ---------------------------------------------------------
+  // STEP 2 — Ultra "get order": build swap transaction to sign
+  // ---------------------------------------------------------
+  const orderBody = {
+    taker: wallet,
+    slippageBps: safeSlippage,
+    // Ultra expects the original quote/route as quoteResponse
+    quoteResponse: quoteJson,
+  };
+
+  // Integrator / referral config (if you set these in env)
+  if (JUP_ULTRA_REFERRAL_ACCOUNT && JUP_ULTRA_REFERRAL_FEE_BPS > 0) {
+    orderBody.integrator = {
+      account: JUP_ULTRA_REFERRAL_ACCOUNT,
+      feeBps: JUP_ULTRA_REFERRAL_FEE_BPS,
+    };
+  }
+
+  const orderUrl = `${JUP_ULTRA_BASE}/v1/order`;
+  log("[swap/order] Ultra build-order (POST) →", orderUrl);
+
+  const orderRes = await fetch(orderUrl, {
+    method: "POST",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(orderBody),
+  });
+
   const orderText = await orderRes.text();
 
   if (!orderRes.ok) {
     warn(
-      "[swap/order] Ultra order HTTP",
+      "[swap/order] Ultra build-order HTTP",
       orderRes.status,
       "body:",
       orderText.slice(0, 400)
@@ -1934,7 +2023,7 @@ async function buildUltraSwapOrderTx(opts) {
     orderJson = JSON.parse(orderText);
   } catch (e) {
     err(
-      "[swap/order] Ultra JSON parse error:",
+      "[swap/order] Ultra build-order JSON parse error:",
       e,
       "body:",
       orderText.slice(0, 400)
@@ -1942,46 +2031,37 @@ async function buildUltraSwapOrderTx(opts) {
     throw new Error("ultra_order_invalid_json");
   }
 
-  // TEMP: log the successful body so we can see what Ultra is sending.
-  log("[swap/order] Ultra raw response:", orderText.slice(0, 400));
-
-  // Ultra *should* return a transaction + requestId. If not, we treat it
-  // as an error for now so the UI doesn't try to execute a broken swap.
-  const rawTx =
+  const txField =
     orderJson.transaction ||
     orderJson.swapTransaction ||
+    orderJson.legacyTransaction ||
     null;
 
-  const requestId = orderJson.requestId || null;
+  const reqId =
+    orderJson.requestId ||
+    orderJson.id ||
+    orderJson.orderId ||
+    null;
 
-  if (!rawTx || !requestId) {
+  if (!txField) {
     warn(
-      "[swap/order] Ultra response missing transaction or requestId. Body:",
+      "[swap/order] Ultra build-order response missing transaction. Body:",
       orderText.slice(0, 400)
     );
-    throw new Error("ultra_order_missing_fields");
-  }
-
-  // Try to derive a nice outAmount in UI units; fall back to 0 if not present.
-  let outAmountUi = 0;
-  const outBaseRaw =
-    Number(orderJson.outAmount) ||
-    Number(orderJson.outputAmount) ||
-    0;
-  if (Number.isFinite(outBaseRaw) && outBaseRaw > 0) {
-    outAmountUi = outBaseRaw / Math.pow(10, outDecimals);
+    throw new Error("ultra_order_missing_transaction");
   }
 
   return {
-    requestId,
-    transaction: rawTx,
-    inAmount: amountFloat,
-    outAmount: outAmountUi,
+    requestId: reqId || null,
+    transaction: txField,
     inputMint,
     outputMint,
+    inAmount: amountFloat,
+    outAmount: outAmountUi,
     slippageBps: safeSlippage,
   };
 }
+
 
 /**
  * POST /api/swap/quote
