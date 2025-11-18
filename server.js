@@ -1653,18 +1653,17 @@ app.get("/api/wallets", async (_req, res) => {
   }
 });
 
-/* ---------- Home dashboard summary (for Terminal Hub hero card) ---------- */
-/* Returns:
- * {
- *   mint,
- *   priceUsd,
- *   marketCapUsd,
- *   holders,
- *   supply,
- *   changePct24h,
- *   volume24h
- * }
- */
+// ---------- Home dashboard summary (for Terminal Hub hero card) ----------
+// Returns:
+// {
+//   mint,
+//   priceUsd,
+//   marketCapUsd,
+//   holders,
+//   supply,
+//   changePct24h,
+//   volume24h
+// }
 app.get("/api/home", async (_req, res) => {
   try {
     const [meta, latest] = await Promise.all([
