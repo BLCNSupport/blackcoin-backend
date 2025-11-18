@@ -2034,7 +2034,7 @@ async function buildUltraSwapOrderTx(opts) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       // In buildUltraSwapOrderTx pre-check: prepend PROXY to quoteUrl
-const quoteUrl = `${PROXY}https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;&slippageBps=${safeSlippage}`;
+const quoteUrl = `${PROXY}https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;slippageBps=${safeSlippage}`;
       log("[swap/ultra] Pre-check attempt", attempt, "→", quoteUrl);
       const quoteRes = await fetch(quoteUrl);
       quote = await quoteRes.json();
