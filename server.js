@@ -38,6 +38,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Temporary proxy for Jupiter calls (add at top of server.js, near other consts)
+const PROXY = 'https://cors-anywhere.herokuapp.com/';
+
 // Behind Render's proxy, trust the first hop so express-rate-limit can read X-Forwarded-For
 app.set("trust proxy", 1);
 
@@ -770,6 +773,7 @@ const TTL_PRICE = 15_000; // 15s prices
 const TTL_META = 6 * 60 * 60 * 1000;
 const TTL_SOL = 25_000;
 const TTL_JUP_V2 = 15 * 60 * 1000; // 15m for token search
+
 
 const CACHE_LIMIT = 500;
 function setWithLimit(map, key, value) {
@@ -1877,7 +1881,7 @@ async function buildClassicJupiterSwap(opts) {
   let quoteRes;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const quoteUrl = `https://quote-api.jup.ag/v6/quote?${new URLSearchParams({
+      const quoteUrl = `${PROXY}https://quote-api.jup.ag/v6/quote?${new URLSearchParams({
         inputMint: String(inputMint),
         outputMint: String(outputMint),
         amount: baseInStr,
@@ -1920,7 +1924,7 @@ async function buildClassicJupiterSwap(opts) {
   let swapRes;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const swapUrl = "https://quote-api.jup.ag/v6/swap";
+      const swapUrl = `${PROXY}https://quote-api.jup.ag/v6/swap`;
       const swapBody = {
         quoteResponse: selectedQuote,
         userPublicKey: wallet,
@@ -2029,7 +2033,8 @@ async function buildUltraSwapOrderTx(opts) {
   let quote;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;
+      // In buildUltraSwapOrderTx pre-check: prepend PROXY to quoteUrl
+const quoteUrl = `${PROXY}https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${baseInStr}&slippageBps=${safeSlippage}`;&slippageBps=${safeSlippage}`;
       log("[swap/ultra] Pre-check attempt", attempt, "→", quoteUrl);
       const quoteRes = await fetch(quoteUrl);
       quote = await quoteRes.json();
@@ -2073,7 +2078,8 @@ async function buildUltraSwapOrderTx(opts) {
         params.set("referralFee", String(JUP_ULTRA_REFERRAL_FEE_BPS));
       }
 
-      const orderUrl = `${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
+      // In buildUltraSwapOrderTx main call: prepend PROXY to orderUrl
+const orderUrl = `${PROXY}${JUP_ULTRA_BASE}/v1/order?${params.toString()}`;
       log("[swap/order] Ultra order attempt", attempt, "→", orderUrl);
 
       const headers = {
