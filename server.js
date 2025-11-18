@@ -1912,12 +1912,14 @@ async function buildUltraSwapOrderTx(opts) {
 
   const safeSlippage = normalizeSlippageBps(slippageBps);
 
+  // 🔹 Build Ultra GET /v1/order params (this is what your curl did)
   const params = new URLSearchParams({
     inputMint: String(inputMint).trim(),
     outputMint: String(outputMint).trim(),
-    amount: baseInStr,              // <-- send base units directly to Ultra
+    amount: baseInStr,                // base units (lamports / smallest units)
     taker: wallet,
     slippageBps: String(safeSlippage),
+    swapMode: "ExactIn",              // ✅ match working curl
   });
 
   // Ultra referral settings (your platform fee)
