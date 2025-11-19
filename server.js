@@ -1081,93 +1081,19 @@ async function resolveTokenMetaCombined(mint, { nocache = false } = {}) {
 /* ---------- /api/token-meta HTTP ---------- */
 app.get("/api/token-meta", async (req, res) => {
   try {
-    // Accept either ?mint= or ?search= (plus ?nocache=, which we safely ignore here)
-    const mintParam = String(req.query.mint || "").trim();
-    const searchParam = String(req.query.search || "").trim();
-
-    const q = mintParam || searchParam;
-
-    if (!q) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing mint or search query",
-      });
-    }
-
-    // Use Jupiter Tokens API v2 "search" endpoint so we can resolve
-    // by mint, symbol, or name (USDC, TROLL, etc.)
-    const jupUrl = `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(
-      q
-    )}`;
-
-    const jupRes = await fetch(jupUrl, {
-      headers: { accept: "application/json" },
-    });
-
-    if (!jupRes.ok) {
-      const text = await jupRes.text().catch(() => "");
-      warn("[token-meta] Jupiter V2 error", jupRes.status, text.slice(0, 200));
-      return res.status(502).json({
-        ok: false,
-        error: "Upstream Jupiter Tokens V2 request failed",
-        status: jupRes.status,
-      });
-    }
-
-    const arr = await jupRes.json().catch(() => null);
-
-    if (!Array.isArray(arr) || arr.length === 0) {
-      // Soft "no results" so the frontend doesn't spam 400s
-      return res.json({
-        ok: false,
-        error: "No tokens found for that query",
-        _jupTokensV2Results: [],
-      });
-    }
-
-    // Prefer an exact mint match if the query looks like a mint;
-    // otherwise use the first Jupiter result.
-    let primary = arr[0];
-    const exact = arr.find(
-      (t) =>
-        t.id === q ||
-        (t.mint && t.mint === q)
-    );
-    if (exact) primary = exact;
-
-    const meta = {
-      ok: true,
-      mint: primary.id,
-      symbol: primary.symbol,
-      name: primary.name,
-      decimals:
-        typeof primary.decimals === "number" ? primary.decimals : 9,
-      icon: primary.icon || primary.logoURI || null,
-      isVerified: !!primary.isVerified,
-      tags: primary.tags || [],
-      organicScore: primary.organicScore,
-      usdPrice:
-        typeof primary.usdPrice === "number" ? primary.usdPrice : null,
-      holderCount:
-        typeof primary.holderCount === "number"
-          ? primary.holderCount
-          : null,
-
-      // Raw Jupiter payloads if you ever want them in the UI/dev tools
-      _jupToken: primary,
-      _jupTokensV2Results: arr,
-    };
-
-    return res.json(meta);
+    const mint = String(req.query.mint || "").trim();
+    if (!mint) return res.status(400).json({ error: "mint required" });
+    const nocache =
+      String(req.query.nocache || "").toLowerCase() === "true";
+    const payload = await resolveTokenMetaCombined(mint, { nocache });
+    res.json(payload);
   } catch (e) {
-    err("[token-meta] Internal error", e);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal error in /api/token-meta",
-    });
+    err("token-meta error:", e);
+    res
+      .status(500)
+      .json({ error: "meta_failed", detail: String(e?.message || e) });
   }
 });
-
 
 /* ---------- Jupiter v2 proxy (for UI search/autocomplete, optional) ---------- */
 app.get("/api/jup/tokens/search", async (req, res) => {
