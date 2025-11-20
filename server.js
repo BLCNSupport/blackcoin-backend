@@ -279,8 +279,9 @@ app.get("/healthz", (_req, res) =>
 const TOKEN_MINT = "J3rYdme789g1zAysfbH9oP4zjagvfVM2PX7KJgFDpump";
 
 // Homepage “vaults” (same as in your HTML)
-const CTO_WALLET = "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3";
-const UTILITY_WALLET = "8XuN2RbJHKbkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
+const CTO_WALLET    = "6ssbYRD3yWy11XNSQXNgTzvmyoUPZcLMyTFMj8mcyC3";
+const UTILITY_WALLET = "8XuN2RbJHKHkj4tRDxc2seG1YnCgEYnkxYXAq3FzXzf1";
+
 
 // Wallet that actually performs burns:
 const BURN_WALLET = "ALx2adVFnWK5oBmEMnUzS2drjbrLJYiFML2YctUkaUy";
