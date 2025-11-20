@@ -689,15 +689,15 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 
 /* ---------- Jupiter Ultra Swap API (order/execute) ---------- */
 
-// Recommended: set JUP_ULTRA_BASE="https://lite-api.jup.ag/ultra"
-// (Ultra dynamic tier base URL through the Lite endpoint).
+// Recommended: set
+// Ultra dynamic tier base URL (api.jup.ag/ultra with optional override)
 const JUP_ULTRA_BASE = (
-  process.env.JUP_ULTRA_BASE || "https://lite-api.jup.ag/ultra"
+  process.env.JUP_ULTRA_BASE || "https://api.jup.ag/ultra"
 ).replace(/\/+$/, "");
-
 
 // Optional API key from the Jupiter dev portal (Ultra tab)
 const JUP_ULTRA_API_KEY = process.env.JUP_ULTRA_API_KEY || "";
+
 
 // Referral account + fee in bps (50–255) from the Ultra dashboard
 const JUP_ULTRA_REFERRAL_ACCOUNT = (process.env.JUP_ULTRA_REFERRAL_ACCOUNT || "").trim();
