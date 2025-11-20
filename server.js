@@ -1139,8 +1139,26 @@ async function rpc(method, params) {
 
 async function getSolUsd() {
   const now = Date.now();
-  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL_SOL)
+
+  // If we have a recent cached value, just use it
+  if (SOL_CACHE.priceUsd && now - SOL_CACHE.ts < TTL_SOL) {
     return SOL_CACHE.priceUsd;
+  }
+
+  // 1) Primary: use the same Jupiter price pipeline as any SPL token
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  try {
+    const pJup = await getTokenUsd(SOL_MINT, { nocache: true });
+    if (pJup > 0) {
+      SOL_CACHE.priceUsd = pJup;
+      SOL_CACHE.ts = now;
+      return pJup;
+    }
+  } catch (e) {
+    // ignore, fall through to Coingecko
+  }
+
+  // 2) Fallback: Coingecko simple price
   try {
     const r = await fetch(
       "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=false"
@@ -1152,9 +1170,14 @@ async function getSolUsd() {
       SOL_CACHE.ts = now;
       return p;
     }
-  } catch {}
+  } catch (e) {
+    // swallow, use last cached if any
+  }
+
+  // 3) Last resort: reuse last known non-zero or 0
   return SOL_CACHE.priceUsd ?? 0;
 }
+
 
 
 /* ---------- Server-side getTokenMeta uses local resolver (no HTTP) ---------- */
