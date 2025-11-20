@@ -1634,26 +1634,58 @@ async function getLatestBurnTx() {
 
   // Hard throttle: only refresh at most once per TTL
   if (now - BURN_CACHE.ts < BURN_CACHE_TTL) {
-    return BURN_CACHE.payload; // may be null
+    return BURN_CACHE.payload ?? null; // may be null
   }
 
+  let payload = null;
+
+  // 1) Try live RPC scan first (newest burns on-chain)
   try {
-    const payload = await fetchLatestBurnFromRpc();
-
-    // mark that we attempted a fetch
-    BURN_CACHE.ts = now;
-
-    // if we actually found a burn, remember it
-    if (payload) {
-      BURN_CACHE.payload = payload;
-    }
+    payload = await fetchLatestBurnFromRpc();
   } catch (e) {
-    warn("getLatestBurnTx() failed:", e?.message || e);
-    // still respect TTL because we already updated BURN_CACHE.ts
+    warn("getLatestBurnTx() RPC path failed:", e?.message || e);
   }
 
-  // return last known burn (or null if none yet)
-  return BURN_CACHE.payload;
+  // 2) If RPC found nothing (e.g. burn older than BURN_SEARCH_LIMIT),
+  //    fall back to the DB log (hub_burns).
+  if (!payload) {
+    try {
+      const { data, error } = await supabase
+        .from("hub_burns")
+        .select("amount, timestamp, signature")
+        .eq("wallet", BURN_WALLET)
+        .eq("token", TOKEN_MINT)
+        .order("timestamp", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && data) {
+        const amountUi = Number(data.amount) || 0;
+        const ts = data.timestamp;
+
+        payload = {
+          amount: amountUi,
+          amountDisplay: `${amountUi.toLocaleString()} BlackCoin`,
+          timestamp: ts,
+          date: ts,
+          signature: data.signature,
+          tx: data.signature,
+          explorer: `https://solscan.io/tx/${data.signature}`,
+        };
+      }
+    } catch (e) {
+      warn("getLatestBurnTx() DB fallback failed:", e?.message || e);
+    }
+  }
+
+  // 3) Update cache timestamp + payload
+  BURN_CACHE.ts = now;
+  if (payload) {
+    BURN_CACHE.payload = payload;
+  }
+
+  // return last known burn (from RPC or DB), or null if truly none
+  return BURN_CACHE.payload ?? null;
 }
 
 
