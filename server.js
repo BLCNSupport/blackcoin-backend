@@ -623,6 +623,27 @@ app.post("/api/profile", requireSession, async (req, res) => {
   }
 });
 
+/* ===== Profile stats: total "Synced Operators" ===== */
+app.get("/api/profile/stats", async (_req, res) => {
+  try {
+    // Count all rows in hub_profiles (one per synced wallet)
+    const { error, count } = await supabase
+      .from("hub_profiles")
+      .select("wallet", { count: "exact", head: true });
+
+    if (error) {
+      err("[/api/profile/stats] count error:", error.message);
+      return res.status(500).json({ error: "profiles_count_failed" });
+    }
+
+    res.json({
+      total_profiles: count || 0, // frontend will show this as "Synced Operators"
+    });
+  } catch (e) {
+    err("[/api/profile/stats] exception:", e?.message || e);
+    res.status(500).json({ error: "profiles_count_failed" });
+  }
+});
 
 const upload = multer({ storage: multer.memoryStorage() });
 
