@@ -2091,12 +2091,40 @@ async function buildUltraSwapOrderTx(opts) {
     null;
 
   if (!txField) {
+    // If Ultra included an explicit error in the response, surface that
+    // as a user-facing error instead of a generic 500.
+    const ultraMsg =
+      (orderJson &&
+        typeof orderJson.error === "object" &&
+        orderJson.error &&
+        (orderJson.error.message || orderJson.error.msg)) ||
+      (orderJson && typeof orderJson.error === "string" ? orderJson.error : null) ||
+      (orderJson && typeof orderJson.errorMessage === "string" ? orderJson.errorMessage : null) ||
+      (orderJson && typeof orderJson.errorCode === "string" ? orderJson.errorCode : null) ||
+      null;
+
+    if (ultraMsg) {
+      const err = new Error(ultraMsg);
+      err.name = "UltraOrderError";
+      err.ultra = {
+        code:
+          (orderJson &&
+            orderJson.error &&
+            (orderJson.error.code || orderJson.error.type)) ||
+          (orderJson && orderJson.errorCode) ||
+          null,
+      };
+      throw err;
+    }
+
+    // No explicit Ultra error, keep the existing generic behaviour
     warn(
       "[swap/order] Ultra response missing transaction. Body:",
       orderText.slice(0, 400)
     );
     throw new Error("ultra_order_missing_fields");
   }
+
 
   // Derive an estimated outAmount in UI units for the frontend
   let outAmountUi = 0;
@@ -2196,12 +2224,25 @@ const order = await buildUltraSwapOrderTx({
     });
   } catch (e) {
     err("[swap/quote] exception:", e);
+
+    // If Jupiter Ultra gave a user-facing error (e.g. not enough SOL for gas),
+    // bubble that back to the frontend as a soft error instead of a 500.
+    if (e && e.name === "UltraOrderError") {
+      return res.json({
+        ok: false,
+        error: "ultra_error",
+        detail: e.message,
+        ultra: e.ultra || null,
+      });
+    }
+
     return res.status(500).json({
       error: "internal_error",
       detail: String(e?.message || e),
     });
   }
 });
+
 
 /**
  * POST /api/swap/order
@@ -2278,12 +2319,24 @@ const order = await buildUltraSwapOrderTx({
     });
   } catch (e) {
     err("[swap/order] exception:", e);
+
+    // Surface Ultra user-facing errors as a soft error to the UI
+    if (e && e.name === "UltraOrderError") {
+      return res.json({
+        ok: false,
+        error: "ultra_error",
+        detail: e.message,
+        ultra: e.ultra || null,
+      });
+    }
+
     return res.status(500).json({
       error: "internal_error",
       detail: String(e?.message || e),
     });
   }
 });
+
 
 /**
  * POST /api/swap/execute
