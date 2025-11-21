@@ -602,8 +602,14 @@ app.post("/api/profile", requireSession, async (req, res) => {
           .json({ error: "update_failed", detail: error.message });
       }
       return res.json({ success: true, profile: data });
-    } else {
-      const insertRow = { wallet, ...patch };
+} else {
+      // New profile: give them a starting xp of 1 so they count as "Synced Operator"
+      const insertRow = {
+        wallet,
+        xp: 1,
+        ...patch,
+      };
+
       const { data, error } = await supabase
         .from("hub_profiles")
         .insert(insertRow)
@@ -626,24 +632,35 @@ app.post("/api/profile", requireSession, async (req, res) => {
 /* ===== Profile stats: total "Synced Operators" ===== */
 app.get("/api/profile/stats", async (_req, res) => {
   try {
-    // Count all rows in hub_profiles (one per synced wallet)
-    const { error, count } = await supabase
+    // Count only profiles with xp > 0 (active/synced operators)
+    const { count, error } = await supabase
       .from("hub_profiles")
-      .select("wallet", { count: "exact", head: true });
+      .select("wallet", { count: "exact", head: true })
+      .gt("xp", 0); // ⬅️ require xp > 0
 
     if (error) {
-      err("[/api/profile/stats] count error:", error.message);
-      return res.status(500).json({ error: "profiles_count_failed" });
+      err("[/api/profile/stats] count error:", error.message || error);
+      return res.status(500).json({
+        error: "profiles_count_failed",
+        details: error.message || String(error),
+      });
     }
 
-    res.json({
-      total_profiles: count || 0, // frontend will show this as "Synced Operators"
+    const total = count ?? 0;
+
+    return res.json({
+      total_profiles: total, // existing key
+      total,                 // extra alias, in case frontend reads `data.total`
     });
   } catch (e) {
     err("[/api/profile/stats] exception:", e?.message || e);
-    res.status(500).json({ error: "profiles_count_failed" });
+    return res.status(500).json({
+      error: "profiles_count_failed",
+      details: e?.message || String(e),
+    });
   }
 });
+
 
 const upload = multer({ storage: multer.memoryStorage() });
 
