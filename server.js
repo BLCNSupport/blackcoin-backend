@@ -629,28 +629,39 @@ app.post("/api/profile", requireSession, async (req, res) => {
   }
 });
 
-/* ===== Profile stats: total "Synced Operators" ===== */
+/* ===== Profile stats: total "Synced Operators" (XP-based) ===== */
 app.get("/api/profile/stats", async (_req, res) => {
   try {
-    // Count only profiles with xp > 0 (active/synced operators)
-    const { count, error } = await supabase
+    // Pull xp column for all profiles
+    const { data, error } = await supabase
       .from("hub_profiles")
-      .select("wallet", { count: "exact", head: true })
-      .gt("xp", 0); // ⬅️ require xp > 0
+      .select("xp");
 
     if (error) {
-      err("[/api/profile/stats] count error:", error.message || error);
+      err("[/api/profile/stats] select error:", error.message || error);
       return res.status(500).json({
         error: "profiles_count_failed",
         details: error.message || String(error),
       });
     }
 
-    const total = count ?? 0;
+    let xpTotal = 0;
+    let xpRows = 0;
 
+    for (const row of data || []) {
+      const n = Number(row.xp ?? 0);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      xpTotal += n;
+      xpRows += 1;
+    }
+
+    // xpTotal is what you'll show under "Synced Operators"
+    // (since you're using xp=1 per profile, xpTotal === number of synced operators)
     return res.json({
-      total_profiles: total, // existing key
-      total,                 // extra alias, in case frontend reads `data.total`
+      total_profiles: xpTotal, // existing key that OperatorHub already expects
+      total: xpTotal,          // alias
+      xp_total: xpTotal,       // explicit XP sum
+      xp_rows: xpRows,         // how many rows have xp > 0
     });
   } catch (e) {
     err("[/api/profile/stats] exception:", e?.message || e);
@@ -660,6 +671,7 @@ app.get("/api/profile/stats", async (_req, res) => {
     });
   }
 });
+
 
 
 const upload = multer({ storage: multer.memoryStorage() });
